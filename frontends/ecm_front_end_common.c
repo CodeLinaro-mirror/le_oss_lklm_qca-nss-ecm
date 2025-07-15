@@ -71,6 +71,14 @@
 #endif
 #endif
 
+#ifdef ECM_FRONT_END_IPA_ENABLE
+#include "ecm_ipa_ipv4.h"
+#include "ecm_ipa_ipv6.h"
+#include "ecm_ipa_common.h"
+#include "ecm_ipa_ported_ipv4.h"
+#include "ecm_ipa_ported_ipv6.h"
+#endif
+
 #ifdef ECM_FRONT_END_SFE_ENABLE
 #include <sfe_api.h>
 #include "ecm_sfe_ipv4.h"
@@ -222,6 +230,13 @@ struct ecm_ae_precedence ae_precedence[ECM_AE_PRECEDENCE_MAX + 1];
 void ecm_front_end_set_ae_alloc_methods(struct ecm_ae_precedence *precedence)
 {
 	switch (precedence->ae_type) {
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_FRONT_END_ENGINE_IPA:
+		precedence->ported_ipv4_alloc = ecm_ipa_ported_ipv4_connection_instance_alloc;
+		precedence->ported_ipv6_alloc = ecm_ipa_ported_ipv6_connection_instance_alloc;
+		break;
+#endif
+
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_FRONT_END_ENGINE_SFE:
 		precedence->ported_ipv4_alloc = ecm_sfe_ported_ipv4_connection_instance_alloc;
@@ -397,6 +412,14 @@ bool ecm_front_end_common_feature_check(enum ecm_front_end_engine ae_type,
 					bool is_routed)
 {
 	switch (ae_type) {
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_FRONT_END_ENGINE_IPA:
+		if (!ecm_ipa_feature_check(skb, iph, is_routed)) {
+			return false;
+		}
+
+		return true;
+#endif
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_FRONT_END_ENGINE_SFE:
 		if (!ecm_sfe_feature_check(skb, iph, is_routed)) {
@@ -1479,6 +1502,11 @@ static void ecm_front_end_ported_ipv4_connection_update(struct ecm_front_end_con
 		ecm_ppe_ported_ipv4_connection_set(feci, feci->fe_info.front_end_flags);
 		break;
 #endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_FRONT_END_ENGINE_IPA:
+		ecm_ipa_ported_ipv4_connection_set(feci, feci->fe_info.front_end_flags);
+		break;
+#endif
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_FRONT_END_ENGINE_SFE:
 		ecm_sfe_ported_ipv4_connection_set(feci, feci->fe_info.front_end_flags);
@@ -2085,6 +2113,7 @@ bool ecm_front_end_is_ae_type_feature_supported(ecm_ae_classifier_result_t ae_ty
 		break;
 #endif
 #ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_AE_CLASSIFIER_RESULT_IPA:
 		if ((ecm_front_end_feature_check(skb, iph)) &&
 					(ecm_front_end_is_feature_supported(ECM_FE_FEATURE_IPA))) {
 			return true;

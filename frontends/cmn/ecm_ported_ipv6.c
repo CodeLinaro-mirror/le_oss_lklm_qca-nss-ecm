@@ -88,6 +88,10 @@
 #include "ecm_sfe_ported_ipv6.h"
 #include "ecm_sfe_common.h"
 #endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+#include "ecm_ipa_ported_ipv6.h"
+#include "ecm_ipa_common.h"
+#endif
 #ifdef ECM_FRONT_END_PPE_ENABLE
 #include "ecm_ppe_ported_ipv6.h"
 #include "ecm_ppe_common.h"
@@ -482,14 +486,15 @@ unsigned int ecm_ported_ipv6_process(struct net_device *out_dev, struct net_devi
 		/*
 		 * Which AE can be used for this flow.
 		 * 1. If NSS, allocate NSS ipv6 ported connection instance
-		 * 2. If SFE, allocate SFE ipv6 ported connection instance
-		 * 3. If PPE/PPE-VP/PPE-DS, allocate PPE ipv6 ported connection instance
-		 * 4. If NOT_YET, the connection will not be allocated in the database and the next flow will be
+		 * 2. If IPA, allocate IPA ipv6 ported connection instance
+		 * 3. If SFE, allocate SFE ipv6 ported connection instance
+		 * 4. If PPE/PPE-VP/PPE-DS, allocate PPE ipv6 ported connection instance
+		 * 5. If NOT_YET, the connection will not be allocated in the database and the next flow will be
 		 *    re-evaluated.
-		 * 5. If NONE, allocate ported connection instance based on the precedence array with
+		 * 6. If NONE, allocate ported connection instance based on the precedence array with
 		 *    can_accel flag set to false. By doing this we will not try to re-evaluate this flow again.
-		 * 6. If DONT_CARE, select the AE from the precdence array which is in the highest priority index.
-		 * 7. If any other type, return NF_ACCEPT.
+		 * 7. If DONT_CARE, select the AE from the precdence array which is in the highest priority index.
+		 * 8. If any other type, return NF_ACCEPT.
 		 */
 		switch (ae_result) {
 #ifdef ECM_FRONT_END_NSS_ENABLE
@@ -503,6 +508,18 @@ unsigned int ecm_ported_ipv6_process(struct net_device *out_dev, struct net_devi
 			feci = ecm_nss_ported_ipv6_connection_instance_alloc(flags, protocol, &nci);
 			goto feci_alloc_check;
 #endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+		case ECM_AE_CLASSIFIER_RESULT_IPA:
+			if (!ecm_ipa_feature_check(skb, iph, is_routed)) {
+				DEBUG_WARN("Unsupported feature found for IPA acceleration\n");
+				ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_PORTED, ECM_STATS_V6_EXCEPTION_PORTED_IPA_ACCEL_NOT_SUPPORTED);
+				return NF_ACCEPT;
+			}
+
+			feci = ecm_ipa_ported_ipv6_connection_instance_alloc(flags, protocol, &nci);
+			goto feci_alloc_check;
+#endif
+
 #ifdef ECM_FRONT_END_SFE_ENABLE
 		case ECM_AE_CLASSIFIER_RESULT_SFE:
 			if (!ecm_sfe_feature_check(skb, iph, is_routed)) {
@@ -610,7 +627,7 @@ precedence_alloc:
 			goto feci_alloc_done;
 		}
 
-#if defined(ECM_FRONT_END_NSS_ENABLE) || defined(ECM_FRONT_END_SFE_ENABLE) || defined(ECM_FRONT_END_PPE_ENABLE)
+#if defined(ECM_FRONT_END_NSS_ENABLE) || defined(ECM_FRONT_END_SFE_ENABLE) || defined(ECM_FRONT_END_PPE_ENABLE) || defined(ECM_FRONT_END_IPA_ENABLE)
 feci_alloc_check:
 		if (!feci) {
 			ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_PORTED, ECM_STATS_V6_EXCEPTION_PORTED_FRONTEND_ALLOC_FAIL);

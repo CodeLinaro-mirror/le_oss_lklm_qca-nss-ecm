@@ -85,6 +85,19 @@ static inline void ecm_ppe_ipv4_exit(void)
 }
 #endif
 
+#ifdef ECM_FRONT_END_IPA_ENABLE
+#include "ecm_ipa_ipv4.h"
+#else
+static inline int ecm_ipa_ipv4_init(struct dentry *dentry)
+{
+	return 0;
+}
+static inline void ecm_ipa_ipv4_exit(void)
+{
+	return;
+}
+#endif
+
 /*
  * IPv4 rule sync reasons.
  */

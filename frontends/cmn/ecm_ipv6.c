@@ -2406,6 +2406,14 @@ int ecm_ipv6_init(struct dentry *dentry)
 		goto ppe_ipv6_failed;
 	}
 #endif
+#if defined(ECM_FRONT_END_IPA_ENABLE) && defined(ECM_IPV6_ENABLE)
+	result = ecm_ipa_ipv6_init(dentry);
+	if (result < 0) {
+		DEBUG_ERROR("Can't initialize IPA ipv6\n");
+		goto ipa_ipv6_failed;
+	}
+#endif
+
 	result = ecm_sfe_ipv6_init(dentry);
 	if (result < 0) {
 		DEBUG_ERROR("Can't initialize SFE ipv6\n");
@@ -2456,6 +2464,10 @@ nf_register_failed_1:
 	ecm_sfe_ipv6_exit();
 
 sfe_ipv6_failed:
+#if defined(ECM_FRONT_END_IPA_ENABLE) && defined(ECM_IPV6_ENABLE)
+	ecm_ipa_ipv6_exit();
+ipa_ipv6_failed:
+#endif
 #if defined(ECM_FRONT_END_PPE_ENABLE) && defined(ECM_IPV6_ENABLE)
 	ecm_ppe_ipv6_exit();
 ppe_ipv6_failed:
@@ -2499,6 +2511,9 @@ void ecm_ipv6_exit(void)
 #endif
 
 	ecm_sfe_ipv6_exit();
+#if defined(ECM_FRONT_END_IPA_ENABLE) && defined(ECM_IPV6_ENABLE)
+	ecm_ipa_ipv6_exit();
+#endif
 #if defined(ECM_FRONT_END_PPE_ENABLE) && defined(ECM_IPV6_ENABLE)
 	ecm_ppe_ipv6_exit();
 #endif

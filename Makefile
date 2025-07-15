@@ -99,6 +99,16 @@ ecm-$(ECM_FRONT_END_PPE_ENABLE) += frontends/ppe/ecm_ppe_stats_v4.o
 ccflags-$(ECM_FRONT_END_PPE_ENABLE) += -DECM_FRONT_END_PPE_ENABLE
 
 # #############################################################################
+# Define ECM_FRONT_END_IPA_ENABLE=y in order to select
+# ipa as ECM's front end.
+# #############################################################################
+ecm-$(ECM_FRONT_END_IPA_ENABLE) += frontends/ipa/ecm_ipa_common.o
+ecm-$(ECM_FRONT_END_IPA_ENABLE) += frontends/ipa/ecm_ipa_ipv4.o
+ecm-$(ECM_FRONT_END_IPA_ENABLE) += frontends/ipa/ecm_ipa_ported_ipv4.o
+ecm-$(ECM_FRONT_END_IPA_ENABLE) += frontends/ipa/ecm_ipa_stats_v4.o
+ccflags-$(ECM_FRONT_END_IPA_ENABLE) += -DECM_FRONT_END_IPA_ENABLE
+
+# #############################################################################
 # Define ECM_FRONT_END_PPE_QOS_ENABLE=y in order to enable PPE QoS
 # #############################################################################
 ccflags-$(ECM_FRONT_END_PPE_QOS_ENABLE) += -DECM_FRONT_END_PPE_QOS_ENABLE
@@ -273,6 +283,13 @@ ecm-$(ECM_IPV6_ENABLE) += frontends/ppe/ecm_ppe_ipv6.o
 ecm-$(ECM_IPV6_ENABLE) += frontends/ppe/ecm_ppe_ported_ipv6.o
 ecm-$(ECM_IPV6_ENABLE) += frontends/ppe/ecm_ppe_stats_v6.o
 endif
+
+ifeq ($(ECM_FRONT_END_IPA_ENABLE), y)
+ecm-$(ECM_IPV6_ENABLE) += frontends/ipa/ecm_ipa_ipv6.o
+ecm-$(ECM_IPV6_ENABLE) += frontends/ipa/ecm_ipa_ported_ipv6.o
+ecm-$(ECM_IPV6_ENABLE) += frontends/ipa/ecm_ipa_stats_v6.o
+endif
+
 
 # #############################################################################
 # Define ECM_CLASSIFIER_OVS_ENABLE=y in order to enable ovs classifier.
@@ -500,6 +517,11 @@ ccflags-y += -DECM_PPE_NON_PORTED_IPV4_DEBUG_LEVEL=1
 ccflags-y += -DECM_PPE_IPV6_DEBUG_LEVEL=1
 ccflags-y += -DECM_PPE_PORTED_IPV6_DEBUG_LEVEL=1
 ccflags-y += -DECM_PPE_NON_PORTED_IPV6_DEBUG_LEVEL=1
+ccflags-y += -DECM_IPA_COMMON_DEBUG_LEVEL=1
+ccflags-y += -DECM_IPA_IPV4_DEBUG_LEVEL=1
+ccflags-y += -DECM_IPA_PORTED_IPV4_DEBUG_LEVEL=1
+ccflags-y += -DECM_IPA_IPV6_DEBUG_LEVEL=1
+ccflags-y += -DECM_IPA_PORTED_IPV6_DEBUG_LEVEL=1
 ccflags-y += -DECM_CONNTRACK_NOTIFIER_DEBUG_LEVEL=1
 ccflags-y += -DECM_TRACKER_DEBUG_LEVEL=1
 ccflags-y += -DECM_TRACKER_DATAGRAM_DEBUG_LEVEL=1
@@ -515,10 +537,14 @@ ccflags-y += -DECM_STATS_DEBUG_LEVEL=1
 ccflags-y += -DECM_CLASSIFIER_WIFI_DEBUG_LEVEL=1
 ccflags-y += -DECM_SFE_STATS_DEBUG_LEVEL=1
 ccflags-y += -DECM_PPE_STATS_DEBUG_LEVEL=1
+ccflags-y += -DECM_IPA_STATS_DEBUG_LEVEL=1
 ccflags-y += -DECM_SDX_PCC_DEBUG_LEVEL=1
 
 ccflags-y += -I$(obj)/ -I$(obj)/ecm_db -I$(obj)/frontends/include -I$(obj)/frontends/nss -I$(obj)/frontends/sfe -I$(obj)/frontends/cmn -I$(obj)/exports
 
+ifeq ($(ECM_FRONT_END_IPA_ENABLE), y)
+	ccflags-y += -I$(obj)/frontends/ipa
+endif
 ifeq ($(ECM_FRONT_END_PPE_ENABLE), y)
 	ccflags-y += -I$(obj)/frontends/ppe
 ifeq ($(SoC),$(filter $(SoC), ipq53xx_32 ipq53xx ipq54xx_32 ipq54xx))
