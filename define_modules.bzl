@@ -70,6 +70,7 @@ def define_modules(target, variant):
             "-DECM_DB_ADVANCED_STATS_ENABLE=y",
             "-DECM_FRONT_END_CONN_LIMIT_ENABLE=y",
             "-DECM_FRONT_END_SFE_ENABLE=y",
+            "-DECM_FRONT_END_IPA_ENABLE=y",
             "-DECM_STATE_OUTPUT_ENABLE=y",
             "-DECM_DB_XREF_ENABLE=y",
             "-DECM_IPV6_ENABLE=y",

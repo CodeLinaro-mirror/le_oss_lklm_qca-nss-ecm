@@ -200,6 +200,17 @@ uint32_t ecm_fe_feature_list[ECM_FRONT_END_TYPE_MAX] = {
 	ECM_FE_FEATURE_OVS_BRIDGE | ECM_FE_FEATURE_OVS_VLAN | ECM_FE_FEATURE_BRIDGE |
 	ECM_FE_FEATURE_BONDING | ECM_FE_FEATURE_PPE | ECM_FE_FEATURE_MULTICAST | ECM_FE_FEATURE_SRC_IF_CHECK,
 #endif
+	/* IPA type */
+	ECM_FE_FEATURE_IPA | ECM_FE_FEATURE_CONN_LIMIT |
+	ECM_FE_FEATURE_BRIDGE | ECM_FE_FEATURE_SRC_IF_CHECK,
+
+	/* IPA_SFE type */
+	ECM_FE_FEATURE_IPA | ECM_FE_FEATURE_CONN_LIMIT | ECM_FE_FEATURE_BRIDGE |
+	ECM_FE_FEATURE_SFE | ECM_FE_FEATURE_SRC_IF_CHECK,
+
+	/* SFE_IPA type */
+	ECM_FE_FEATURE_SFE | ECM_FE_FEATURE_CONN_LIMIT | ECM_FE_FEATURE_BRIDGE |
+	ECM_FE_FEATURE_IPA | ECM_FE_FEATURE_SRC_IF_CHECK,
 };
 
 struct ecm_ae_precedence ae_precedence[ECM_AE_PRECEDENCE_MAX + 1];
@@ -1497,6 +1508,18 @@ bool ecm_front_end_connection_limit_reached(enum ecm_front_end_engine ae_type, i
 		}
 		break;
 #endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_FRONT_END_ENGINE_IPA:
+		if (ip_version == 4) {
+			return true;
+		}
+
+		if (ip_version == 6) {
+			return true;
+		}
+		break;
+#endif
+
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_FRONT_END_ENGINE_SFE:
 		if (ip_version == 4 && ecm_sfe_ipv4_is_conn_limit_reached()) {
@@ -2061,6 +2084,13 @@ bool ecm_front_end_is_ae_type_feature_supported(ecm_ae_classifier_result_t ae_ty
 		}
 		break;
 #endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+		if ((ecm_front_end_feature_check(skb, iph)) &&
+					(ecm_front_end_is_feature_supported(ECM_FE_FEATURE_IPA))) {
+			return true;
+		}
+		break;
+#endif
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_AE_CLASSIFIER_RESULT_SFE:
 		if ((ecm_front_end_feature_check(skb, iph)) &&
@@ -2099,6 +2129,10 @@ enum ecm_front_end_engine ecm_front_end_ae_type_to_supported_ae_engine(uint32_t 
 	case ECM_AE_CLASSIFIER_RESULT_NSS:
 		return ECM_FRONT_END_ENGINE_NSS;
 #endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_AE_CLASSIFIER_RESULT_IPA:
+		return ECM_FRONT_END_ENGINE_IPA;
+#endif
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_AE_CLASSIFIER_RESULT_SFE:
 		return ECM_FRONT_END_ENGINE_SFE;
@@ -2129,6 +2163,10 @@ ecm_ae_classifier_result_t ecm_front_end_accel_engine_to_ae_type(enum ecm_front_
 #ifdef ECM_FRONT_END_NSS_ENABLE
 	case ECM_FRONT_END_ENGINE_NSS:
 		return ECM_AE_CLASSIFIER_RESULT_NSS;
+#endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_FRONT_END_ENGINE_IPA:
+		return ECM_AE_CLASSIFIER_RESULT_IPA;
 #endif
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_FRONT_END_ENGINE_SFE:

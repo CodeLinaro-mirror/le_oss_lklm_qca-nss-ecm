@@ -52,6 +52,7 @@ typedef enum /** @cond */ ecm_ae_classifier_result /** @endcond */ {
 	ECM_AE_CLASSIFIER_RESULT_NONE,		/**< Do not accelerate the flow */
 	ECM_AE_CLASSIFIER_RESULT_NOT_YET,	/**< Acceleration engine hasn't been decided yet */
 	ECM_AE_CLASSIFIER_RESULT_DONT_CARE,	/**< External module doesn't care about the selected AE */
+	ECM_AE_CLASSIFIER_RESULT_IPA,		/**< Accelerate the flow in IPA */
 } ecm_ae_classifier_result_t;
 
 /**

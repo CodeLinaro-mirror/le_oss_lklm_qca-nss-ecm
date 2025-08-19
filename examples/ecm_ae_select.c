@@ -297,7 +297,7 @@ static ssize_t ecm_ae_select_test_rule_write(struct file *file,
 	/*
 	 * buf is formed as:
 	 * [0]           [1]     [2]        [3]        [4]         [5]         [6]
-	 * <0=del,1=add>/<proto>/<src_addr>/<src_port>/<dest_addr>/<dest_port>/<2= ECM_AE_CLASSIFIER_RESULT_SFE, 3= ECM_AE_CLASSIFIER_RESULT_PPE_VP, 4= ECM_AE_CLASSIFIER_RESULT_PPE_DS, 5= ECM_AE_CLASSIFIER_RESULT_NONE 7= ECM_AE_CLASSIFIER_RESULT_DONT_CARE>
+	 * <0=del,1=add>/<proto>/<src_addr>/<src_port>/<dest_addr>/<dest_port>/<2= ECM_AE_CLASSIFIER_RESULT_SFE, 3= ECM_AE_CLASSIFIER_RESULT_PPE_VP, 4= ECM_AE_CLASSIFIER_RESULT_PPE_DS, 5= ECM_AE_CLASSIFIER_RESULT_NONE 7= ECM_AE_CLASSIFIER_RESULT_DONT_CARE,  8= ECM_AE_CLASSIFIER_RESULT_IPA>
 	 * e.g.:
 	 * echo "1/17/192.168.1.254/1235/192.168.1.251/1234/2" > /sys/kernel/debug/ecm_ae_select_test/rule
 	 * cat /sys/kernel/debug/ecm_ae_select_test/rule (shows all rules)
@@ -347,6 +347,7 @@ static ssize_t ecm_ae_select_test_rule_write(struct file *file,
 	case ECM_AE_CLASSIFIER_RESULT_PPE_DS:
 	case ECM_AE_CLASSIFIER_RESULT_NONE:
 	case ECM_AE_CLASSIFIER_RESULT_DONT_CARE:
+	case ECM_AE_CLASSIFIER_RESULT_IPA:
 		break;
 	default:
 		pr_info("Unsupported selection: %u\n", accel);

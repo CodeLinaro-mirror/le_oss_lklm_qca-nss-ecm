@@ -126,6 +126,7 @@ static const char* ecm_stats_v6_exception_ported_name_str[] = {
     "v6_ported_src_nat_ip_changed",
     "v6_ported_db_conn_timer_expired",
     "v6_ported_drop_by_classifier",
+    "v6_ported_ipa_accel_not_supported",
 };
 
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE

@@ -199,6 +199,8 @@ enum ecm_stats_v6_exception_ported_events {
 			/* Number of IPv6 packets ignored in ported flow as bridge DB connection timer expired */
 	ECM_STATS_V6_EXCEPTION_PORTED_DROP_BY_CLASSIFIER,
 			/* Number of IPv6 packets ignored in ported flow as dropped by classifier */
+	ECM_STATS_V6_EXCEPTION_PORTED_IPA_ACCEL_NOT_SUPPORTED,
+			/* Number of IPv6 packets ignored in ported flow as IPA accelaration is not supported */
 	ECM_STATS_V6_EXCEPTION_PORTED_MAX
 			/*Maximum ported exceptions for IPv6 flows*/
 };

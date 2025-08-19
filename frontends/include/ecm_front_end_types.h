@@ -73,6 +73,7 @@ enum ecm_front_end_engine {
 	ECM_FRONT_END_ENGINE_NSS,
 	ECM_FRONT_END_ENGINE_PPE,
 	ECM_FRONT_END_ENGINE_SFE,
+	ECM_FRONT_END_ENGINE_IPA,
 	ECM_FRONT_END_ENGINE_MAX
 };
 
@@ -108,6 +109,9 @@ enum ecm_front_end_engine_flag {
  * ECM_FRONT_END_TYPE_PPE: select PPE front end.
  * ECM_FRONT_END_TYPE_NSS_SFE: Both NSS and SFE can be selected.
  * ECM_FRONT_END_TYPE_PPE_SFE: Both PPE and SFE can be selected.
+ * ECM_FRONT_END_TYPE_IPA: select IPA front end.
+ * ECM_FRONT_END_TYPE_IPA_SFE: Both IPA and SFE can be selected.
+ * ECM_FRONT_END_TYPE_SFE_IPA: Both SFE and IPA can be selected.
  */
 enum ecm_front_end_type {
 	ECM_FRONT_END_TYPE_AUTO,
@@ -117,6 +121,9 @@ enum ecm_front_end_type {
 	ECM_FRONT_END_TYPE_NSS_SFE,
 	ECM_FRONT_END_TYPE_PPE_SFE,
 	ECM_FRONT_END_TYPE_SFE_PPE,
+	ECM_FRONT_END_TYPE_IPA,
+	ECM_FRONT_END_TYPE_IPA_SFE,
+	ECM_FRONT_END_TYPE_SFE_IPA,
 	ECM_FRONT_END_TYPE_MAX
 };
 
@@ -147,6 +154,7 @@ enum ecm_fe_feature {
 	ECM_FE_FEATURE_OVS_BRIDGE	= (1 << 11),
 	ECM_FE_FEATURE_OVS_VLAN		= (1 << 12),
 	ECM_FE_FEATURE_PPE		= (1 << 13),
+	ECM_FE_FEATURE_IPA		= (1 << 14),
 };
 
 /*
@@ -488,9 +496,25 @@ static inline enum ecm_front_end_type ecm_front_end_type_select(void)
 	}
 #endif
 
-#ifdef ECM_FRONT_END_SFE_ENABLE
+#if defined(ECM_FRONT_END_IPA_ENABLE) && defined(ECM_FRONT_END_SFE_ENABLE)
 	if ((front_end_selection == ECM_FRONT_END_TYPE_AUTO) ||
-	    (front_end_selection == ECM_FRONT_END_TYPE_SFE)) {
+	    (front_end_selection == ECM_FRONT_END_TYPE_IPA_SFE)) {
+		return ECM_FRONT_END_TYPE_IPA_SFE;
+	}
+
+	if (front_end_selection == ECM_FRONT_END_TYPE_SFE_IPA) {
+		return ECM_FRONT_END_TYPE_SFE_IPA;
+	}
+#endif
+
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	if(front_end_selection == ECM_FRONT_END_TYPE_IPA) {
+		return ECM_FRONT_END_TYPE_IPA;
+	}
+#endif
+
+#ifdef ECM_FRONT_END_SFE_ENABLE
+	if (front_end_selection == ECM_FRONT_END_TYPE_SFE) {
 		return ECM_FRONT_END_TYPE_SFE;
 	}
 #endif
@@ -528,6 +552,14 @@ static inline bool ecm_front_end_set_ae_precendence_array(enum ecm_front_end_typ
 		ae_precedence[ECM_AE_PRECEDENCE_1].ae_type = ECM_FRONT_END_ENGINE_MAX;
 		break;
 #endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_FRONT_END_TYPE_IPA:
+		ae_precedence[ECM_AE_PRECEDENCE_0].ae_type = ECM_FRONT_END_ENGINE_IPA;
+		ecm_front_end_set_ae_alloc_methods(&ae_precedence[ECM_AE_PRECEDENCE_0]);
+
+		ae_precedence[ECM_AE_PRECEDENCE_1].ae_type = ECM_FRONT_END_ENGINE_MAX;
+		break;
+#endif
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_FRONT_END_TYPE_SFE:
 		ae_precedence[ECM_AE_PRECEDENCE_0].ae_type = ECM_FRONT_END_ENGINE_SFE;
@@ -550,6 +582,27 @@ static inline bool ecm_front_end_set_ae_precendence_array(enum ecm_front_end_typ
 		ecm_front_end_set_ae_alloc_methods(&ae_precedence[ECM_AE_PRECEDENCE_0]);
 
 		ae_precedence[ECM_AE_PRECEDENCE_1].ae_type = ECM_FRONT_END_ENGINE_SFE;
+		ecm_front_end_set_ae_alloc_methods(&ae_precedence[ECM_AE_PRECEDENCE_1]);
+
+		ae_precedence[ECM_AE_PRECEDENCE_MAX].ae_type = ECM_FRONT_END_ENGINE_MAX;
+		break;
+#endif
+#if defined(ECM_FRONT_END_IPA_ENABLE) && defined(ECM_FRONT_END_SFE_ENABLE)
+	case ECM_FRONT_END_TYPE_IPA_SFE:
+		ae_precedence[ECM_AE_PRECEDENCE_0].ae_type = ECM_FRONT_END_ENGINE_IPA;
+		ecm_front_end_set_ae_alloc_methods(&ae_precedence[ECM_AE_PRECEDENCE_0]);
+
+		ae_precedence[ECM_AE_PRECEDENCE_1].ae_type = ECM_FRONT_END_ENGINE_SFE;
+		ecm_front_end_set_ae_alloc_methods(&ae_precedence[ECM_AE_PRECEDENCE_1]);
+
+		ae_precedence[ECM_AE_PRECEDENCE_MAX].ae_type = ECM_FRONT_END_ENGINE_MAX;
+		break;
+
+	case ECM_FRONT_END_TYPE_SFE_IPA:
+		ae_precedence[ECM_AE_PRECEDENCE_0].ae_type = ECM_FRONT_END_ENGINE_SFE;
+		ecm_front_end_set_ae_alloc_methods(&ae_precedence[ECM_AE_PRECEDENCE_0]);
+
+		ae_precedence[ECM_AE_PRECEDENCE_1].ae_type = ECM_FRONT_END_ENGINE_IPA;
 		ecm_front_end_set_ae_alloc_methods(&ae_precedence[ECM_AE_PRECEDENCE_1]);
 
 		ae_precedence[ECM_AE_PRECEDENCE_MAX].ae_type = ECM_FRONT_END_ENGINE_MAX;
