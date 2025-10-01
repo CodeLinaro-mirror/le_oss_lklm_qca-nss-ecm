@@ -25,6 +25,10 @@ ifeq ($(EXAMPLES_BUILD_OVS),y)
 obj-m += examples/ecm_ovs.o
 endif
 
+ifeq ($(EXAMPLES_BUILD_SDX),y)
+obj-m +=examples/ecm_sdx_pcc.o
+endif
+
 ecm-y := \
 	 frontends/cmn/ecm_ae_classifier.o \
 	 frontends/cmn/ecm_ipv4.o \
@@ -117,7 +121,6 @@ ccflags-$(ECM_INTERFACE_BOND_ENABLE) += -DECM_INTERFACE_BOND_ENABLE
 # Define ECM_INTERFACE_PPPOE_ENABLE=y in order
 # to enable support for PPPoE acceleration.
 # #############################################################################
-ECM_INTERFACE_PPPOE_ENABLE=y
 ccflags-$(ECM_INTERFACE_PPPOE_ENABLE) += -DECM_INTERFACE_PPPOE_ENABLE
 
 # #############################################################################
@@ -142,14 +145,6 @@ ccflags-$(ECM_INTERFACE_PPTP_ENABLE) += -DECM_INTERFACE_PPTP_ENABLE
 # if pppoe, l2tpv2, pptp acceleration is enabled, ppp should
 # be enabled automatically
 # #############################################################################
-ECM_INTERFACE_PPP_ENABLE=y
-ifeq "$(ECM_INTERFACE_PPPOE_ENABLE)" "n"
-ifeq "$(ECM_INTERFACE_L2TPV2_ENABLE)" "n"
-ifeq "$(ECM_INTERFACE_PPTP_ENABLE)" "n"
-ECM_INTERFACE_PPP_ENABLE=n
-endif
-endif
-endif
 ccflags-$(ECM_INTERFACE_PPP_ENABLE) += -DECM_INTERFACE_PPP_ENABLE
 
 # #############################################################################
@@ -365,6 +360,13 @@ ifeq ($(ECM_IPV6_ENABLE), y)
 ecm-$(ECM_NON_PORTED_SUPPORT_ENABLE) += frontends/ppe/ecm_ppe_non_ported_ipv6.o
 endif
 endif
+
+# #############################################################################
+# Define ECM_SDX_STATS_ENABLE=y in order to support packet_stats feature in ECM.
+# #############################################################################
+ccflags-$(ECM_SDX_STATS_ENABLE) += -DECM_SDX_STATS_ENABLE
+ecm-$(ECM_SDX_STATS_ENABLE) += ecm_sdx/ecm_sdx_stats.o
+ecm-$(ECM_SDX_STATS_ENABLE) += ecm_sdx/ecm_sdx.o
 
 ccflags-$(ECM_NON_PORTED_SUPPORT_ENABLE) += -DECM_NON_PORTED_SUPPORT_ENABLE
 
