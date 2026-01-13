@@ -8,6 +8,7 @@
 #ifndef ECM_TYPES_H_
 #define ECM_TYPES_H_
 
+#include <linux/version.h>
 #include <linux/printk.h>
 #include <linux/debugfs.h>
 
@@ -530,3 +531,14 @@ static inline bool ecm_debugfs_create_u32(const char *name, umode_t mode,
 #endif
 #endif
 #endif
+
+
+/* Linux 6.11 made the first argument of proc_handler 'const'.
+ * Define a macro to handle this difference.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+#define ECM_CTL_TABLE_CONST const
+#else
+#define ECM_CTL_TABLE_CONST
+#endif
+

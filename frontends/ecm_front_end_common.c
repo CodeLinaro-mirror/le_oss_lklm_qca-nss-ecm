@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2015, 2016, 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -40,6 +29,7 @@
 #endif
 #include <linux/hashtable.h>
 #include <net/sch_generic.h>
+#include <linux/vmalloc.h>
 #ifdef ECM_FRONT_END_PPE_ENABLE
 #include <ppe_drv.h>
 #endif
@@ -933,7 +923,7 @@ uint64_t ecm_front_end_get_slow_packet_count(struct ecm_front_end_connection_ins
  * ecm_front_end_ppe_fse_enable_limit_handler()
  *	Sysctl to enable/disable FSE programming through PPE.
  */
-int ecm_front_end_ppe_fse_enable_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+int ecm_front_end_ppe_fse_enable_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret;
 
@@ -968,7 +958,7 @@ int ecm_front_end_ppe_fse_enable_handler(struct ctl_table *ctl, int write, void 
  * ecm_front_end_db_conn_limit_handler()
  *	Database connection limit sysctl node handler.
  */
-int ecm_front_end_db_conn_limit_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_front_end_db_conn_limit_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret;
 	int current_value;
@@ -1187,7 +1177,7 @@ static int ecm_front_end_denied_ports_handler(int write, void *buffer, size_t *l
  * ecm_front_end_udp_denied_ports_handler()
  *	Proc handler function for UDP denied ports read/write operation.
  */
-static int ecm_front_end_udp_denied_ports_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_front_end_udp_denied_ports_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	/*
 	 * Usage:
@@ -1207,7 +1197,7 @@ static int ecm_front_end_udp_denied_ports_handler(struct ctl_table *ctl, int wri
  * ecm_front_end_tcp_denied_ports_handler()
  *	Proc handler function for TCP denied ports read/write operation.
  */
-static int ecm_front_end_tcp_denied_ports_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_front_end_tcp_denied_ports_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	/*
 	 * Usage:
@@ -1254,7 +1244,6 @@ static struct ctl_table ecm_front_end_sysctl_tbl[] = {
 		.mode		= 0644,
 		.proc_handler	= &ecm_front_end_tcp_denied_ports_handler,
 	},
-	{}
 };
 
 /*
@@ -1853,11 +1842,12 @@ bool ecm_front_end_common_intf_ingress_qdisc_check(int32_t interface_num)
 	return false;
 }
 
+#ifdef ECM_FRONT_END_PPE_QOS_ENABLE
 /*
  * ecm_front_end_common_check_if_vap
  *	Returns true if the dev is VAP.
  */
-bool ecm_front_end_common_check_if_vap(int32_t interface_num)
+static bool ecm_front_end_common_check_if_vap(int32_t interface_num)
 {
 	struct net_device *vap_dev = dev_get_by_index(&init_net, interface_num);
 	if (!vap_dev) {
@@ -1877,7 +1867,6 @@ bool ecm_front_end_common_check_if_vap(int32_t interface_num)
 	return true;
 }
 
-#ifdef ECM_FRONT_END_PPE_QOS_ENABLE
 /*
  * ecm_front_end_common_check_dl_vp_qdisc
  *	Returns true if the interface is part of DL VP qdisc

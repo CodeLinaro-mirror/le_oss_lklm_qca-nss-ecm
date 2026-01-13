@@ -133,3 +133,9 @@ void ecm_interface_vlan_filter_stats_update(struct ecm_db_connection_instance *c
 uint32_t ecm_interface_vxlan_type_get(struct sk_buff *skb, struct vxlan_dev *vxlan_tun);
 __be32 ecm_interface_vxlan_gpe_get_vni_remote_ip_from_inner(struct net_device *dev, const struct sk_buff *skb, union vxlan_addr *remote_ip);
 #endif
+
+void ecm_interface_node_connections_defunct_by_type_sta_join(uint8_t *mac);
+void ecm_interface_defunct_qm_connections(uint8_t *mac, uint8_t wifi_qm_type, uint8_t wifi_qm_id);
+void ecm_interface_node_connections_defunct_by_mac_addr(uint8_t *mac);
+int ecm_interface_init(void);
+void ecm_interface_exit(void);
