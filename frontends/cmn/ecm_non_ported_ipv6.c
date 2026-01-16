@@ -1,20 +1,9 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- **************************************************************************
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
+ ***************************************************************************
  */
 
 #include <linux/version.h>
@@ -55,7 +44,6 @@
 #include <net/netfilter/ipv6/nf_conntrack_ipv6.h>
 #include <net/netfilter/ipv6/nf_defrag_ipv6.h>
 #ifdef ECM_INTERFACE_VLAN_ENABLE
-#include <linux/../../net/8021q/vlan.h>
 #include <linux/if_vlan.h>
 #endif
 
@@ -170,7 +158,7 @@ unsigned int ecm_non_ported_ipv6_process(struct net_device *out_dev,
 	/*
 	 * NAT acceleration is not supported for 3-tuple
 	 */
-	if (unlikely(ecm_dir == ECM_DB_DIRECTION_EGRESS_NAT) || unlikely(ecm_dir == ECM_DB_DIRECTION_INGRESS_NAT)) {
+	if (unlikely(ecm_dir == ECM_DB_DIRECTION_EGRESS_NAT) || unlikely(ecm_dir == ECM_DB_DIRECTION_INGRESS_NAT) || unlikely(ecm_dir == ECM_DB_DIRECTION_HAIRPIN_NAT)) {
 		DEBUG_TRACE("%px: Non-ported ipv6 NAT acceleration is not supported\n", skb);
 		ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_NON_PORTED, ECM_STATS_V6_EXCEPTION_NON_PORTED_NAT_ACCEL_NOT_SUPPORTED);
 		return NF_ACCEPT;
@@ -621,8 +609,10 @@ done:
 	 */
 	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_FROM, match_addr);
 	if (ECM_IP_ADDR_MATCH(ip_src_addr, match_addr)) {
+		DEBUG_TRACE("%px: sender is SRC relative to ci direction\n", ci);
 		sender = ECM_TRACKER_SENDER_TYPE_SRC;
 	} else {
+		DEBUG_TRACE("%px: sender is DEST relative to ci direction\n", ci);
 		sender = ECM_TRACKER_SENDER_TYPE_DEST;
 	}
 

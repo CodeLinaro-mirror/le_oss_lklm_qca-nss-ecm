@@ -121,6 +121,7 @@ static char *ecm_db_interface_type_names[ECM_DB_IFACE_TYPE_COUNT] = {
 	"MACVLAN",
 	"L2TPv3",
 	"OVS_INTERNAL"
+	"DSA"
 };
 
 /*
@@ -328,6 +329,37 @@ static int ecm_db_iface_ethernet_state_get(struct ecm_db_iface_instance *ii, str
 
 	return ecm_state_prefix_remove(sfi);
 }
+
+#ifdef ECM_INTERFACE_DSA_ENABLE
+/*
+ * ecm_db_iface_dsa_state_get()
+ * 	Return interface type specific state
+ */
+static int ecm_db_iface_dsa_state_get(struct ecm_db_iface_instance *ii, struct ecm_state_file_instance *sfi)
+{
+	int result;
+	uint8_t address[ETH_ALEN];
+
+	DEBUG_CHECK_MAGIC(ii, ECM_DB_IFACE_INSTANCE_MAGIC, "%px: magic failed\n", ii);
+	spin_lock_bh(&ecm_db_lock);
+	memcpy(address, ii->type_info.dsa.address, ETH_ALEN);
+	spin_unlock_bh(&ecm_db_lock);
+
+	if ((result = ecm_state_prefix_add(sfi, "dsa"))) {
+		return result;
+	}
+
+	if ((result = ecm_db_iface_state_get_base(ii, sfi))) {
+		return result;
+	}
+
+	if ((result = ecm_state_write(sfi, "address", "%pM", address))) {
+		return result;
+	}
+
+	return ecm_state_prefix_remove(sfi);
+}
+#endif
 
 #ifdef ECM_INTERFACE_BOND_ENABLE
 /*
@@ -1328,6 +1360,19 @@ static inline ecm_db_iface_hash_t ecm_db_iface_generate_hash_index_ethernet(uint
 	return (ecm_db_iface_hash_t)(hash_val & (ECM_DB_IFACE_HASH_SLOTS - 1));
 }
 
+#ifdef ECM_INTERFACE_DSA_ENABLE
+/*
+ * ecm_db_iface_generate_hash_index_dsa()
+ * 	Calculate the hash index for DSA interface.
+ */
+static inline ecm_db_iface_hash_t ecm_db_iface_generate_hash_index_dsa(uint8_t *address)
+{
+	uint32_t hash_val;
+	hash_val = (uint32_t)jhash(address, 6, ecm_db_jhash_rnd);
+	return (ecm_db_iface_hash_t)(hash_val & (ECM_DB_IFACE_HASH_SLOTS - 1));
+}
+#endif
+
 #ifdef ECM_INTERFACE_PPPOE_ENABLE
 /*
  * ecm_db_iface_generate_hash_index_pppoe()
@@ -1684,6 +1729,73 @@ struct ecm_db_iface_instance *ecm_db_iface_ifidx_find_and_ref_ethernet(uint8_t *
 }
 EXPORT_SYMBOL(ecm_db_iface_ifidx_find_and_ref_ethernet);
 
+#ifdef ECM_INTERFACE_DSA_ENABLE
+/*
+ * ecm_db_iface_dsa_address_get()
+ *	Obtain the ethernet address for a DSA interface
+ */
+void ecm_db_iface_dsa_address_get(struct ecm_db_iface_instance *ii, uint8_t *address)
+{
+	DEBUG_CHECK_MAGIC(ii, ECM_DB_IFACE_INSTANCE_MAGIC, "%px: magic failed", ii);
+	spin_lock_bh(&ecm_db_lock);
+	DEBUG_ASSERT(ii->type == ECM_DB_IFACE_TYPE_DSA, "%px: Bad type, expected DSA, actual: %d\n", ii, ii->type);
+	ether_addr_copy(address, ii->type_info.dsa.address);
+	spin_unlock_bh(&ecm_db_lock);
+}
+
+/*
+ * ecm_db_iface_dsa_info_get()
+ *	Get DSA interface specific information
+ */
+void ecm_db_iface_dsa_info_get(struct ecm_db_iface_instance *ii, struct ecm_db_interface_info_dsa *dsa_info)
+{
+	DEBUG_CHECK_MAGIC(ii, ECM_DB_IFACE_INSTANCE_MAGIC, "%px: magic failed", ii);
+	spin_lock_bh(&ecm_db_lock);
+	DEBUG_ASSERT(ii->type == ECM_DB_IFACE_TYPE_DSA, "%px: Bad type, expected DSA, actual: %d\n", ii, ii->type);
+	ether_addr_copy(dsa_info->address, ii->type_info.dsa.address);
+	spin_unlock_bh(&ecm_db_lock);
+}
+
+/*
+ * ecm_db_iface_find_and_ref_dsa()
+ *	Lookup and return a iface reference if any
+ */
+struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_dsa(int32_t interface_identifier, uint8_t *address)
+{
+	ecm_db_iface_hash_t hash_index;
+	struct ecm_db_iface_instance *ii;
+
+	DEBUG_TRACE("Lookup dsa iface with addr %pM\n", address);
+
+	/*
+	 * Compute the hash chain index and prepare to walk the chain
+	 */
+	hash_index = ecm_db_iface_generate_hash_index_dsa(address);
+
+	/*
+	 * Iterate the chain looking for a host with matching details
+	 */
+	spin_lock_bh(&ecm_db_lock);
+	ii = ecm_db_iface_table[hash_index];
+	while (ii) {
+		if ((ii->type != ECM_DB_IFACE_TYPE_DSA)
+				|| (ii->interface_identifier != interface_identifier)
+				|| memcmp(ii->type_info.dsa.address, address, ETH_ALEN)) {
+			ii = ii->hash_next;
+			continue;
+		}
+
+		_ecm_db_iface_ref(ii);
+		spin_unlock_bh(&ecm_db_lock);
+		DEBUG_TRACE("DSA iface found %px\n", ii);
+		return ii;
+	}
+	spin_unlock_bh(&ecm_db_lock);
+	DEBUG_TRACE("DSA iface not found\n");
+	return NULL;
+}
+#endif
+
 #ifdef ECM_INTERFACE_VLAN_ENABLE
 /*
  * ecm_db_iface_vlan_info_get()
@@ -2035,7 +2147,7 @@ EXPORT_SYMBOL(ecm_db_iface_pppoe_session_info_get);
  * ecm_db_iface_find_and_ref_pppoe()
  *	Lookup and return a iface reference if any
  */
-struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_pppoe(uint16_t pppoe_session_id, uint8_t *remote_mac)
+struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_pppoe(uint16_t pppoe_session_id, uint8_t *remote_mac, int32_t if_num)
 {
 	ecm_db_iface_hash_t hash_index;
 	struct ecm_db_iface_instance *ii;
@@ -2055,6 +2167,7 @@ struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_pppoe(uint16_t pppoe_ses
 	while (ii) {
 		if ((ii->type != ECM_DB_IFACE_TYPE_PPPOE)
 				|| (ii->type_info.pppoe.pppoe_session_id != pppoe_session_id)
+				|| (ii->interface_identifier != if_num)
 				|| memcmp(ii->type_info.pppoe.remote_mac, remote_mac, ETH_ALEN)) {
 			ii = ii->hash_next;
 			continue;
@@ -2765,12 +2878,64 @@ static inline void ecm_db_iface_add_to_db(struct ecm_db_iface_instance *ii,  ecm
  * ecm_db_iface_add_ethernet()
  *	Add a iface instance into the database
  */
-void ecm_db_iface_add_ethernet(struct ecm_db_iface_instance *ii, uint8_t *address, char *name, int32_t mtu,
+void ecm_db_iface_add_ethernet(struct ecm_db_iface_instance *ii, uint8_t *address, struct net_device *dev, int32_t mtu,
+					int32_t ae_interface_identifier, ecm_db_iface_final_callback_t final, void *arg)
+{
+	ecm_db_iface_hash_t hash_index;
+	struct ecm_db_interface_info_ethernet *type_info;
+
+	spin_lock_bh(&ecm_db_lock);
+	DEBUG_CHECK_MAGIC(ii, ECM_DB_IFACE_INSTANCE_MAGIC, "%px: magic failed\n", ii);
+	DEBUG_ASSERT(address, "%px: address null\n", ii);
+#ifdef ECM_DB_XREF_ENABLE
+	DEBUG_ASSERT((ii->nodes == NULL) && (ii->node_count == 0), "%px: nodes not null\n", ii);
+#endif
+	DEBUG_ASSERT(!(ii->flags & ECM_DB_IFACE_FLAGS_INSERTED), "%px: inserted\n", ii);
+	DEBUG_ASSERT(dev->name, "%px: no name given\n", ii);
+	spin_unlock_bh(&ecm_db_lock);
+
+	/*
+	 * Record general info
+	 */
+	ii->type = ECM_DB_IFACE_TYPE_ETHERNET;
+#ifdef ECM_STATE_OUTPUT_ENABLE
+	ii->state_get = ecm_db_iface_ethernet_state_get;
+#endif
+	ii->arg = arg;
+	ii->final = final;
+	strlcpy(ii->name, dev->name, IFNAMSIZ);
+	ii->mtu = mtu;
+	ii->interface_identifier = dev->ifindex;
+	ii->ae_interface_identifier = ae_interface_identifier;
+
+	/*
+	 * Type specific info
+	 */
+	type_info = &ii->type_info.ethernet;
+	memcpy(type_info->address, address, ETH_ALEN);
+	type_info->dev = dev;
+
+	/*
+	 * Compute hash chain for insertion
+	 */
+	hash_index = ecm_db_iface_generate_hash_index_ethernet(address);
+
+	ecm_db_iface_add_to_db(ii, hash_index);
+
+}
+EXPORT_SYMBOL(ecm_db_iface_add_ethernet);
+
+#ifdef ECM_INTERFACE_DSA_ENABLE
+/*
+ * ecm_db_iface_add_dsa()
+ *	Add a DSA iface instance into the database
+ */
+void ecm_db_iface_add_dsa(struct ecm_db_iface_instance *ii, uint8_t *address, char *name, int32_t mtu,
 					int32_t interface_identifier, int32_t ae_interface_identifier,
 					ecm_db_iface_final_callback_t final, void *arg)
 {
 	ecm_db_iface_hash_t hash_index;
-	struct ecm_db_interface_info_ethernet *type_info;
+	struct ecm_db_interface_info_dsa *type_info;
 
 	spin_lock_bh(&ecm_db_lock);
 	DEBUG_CHECK_MAGIC(ii, ECM_DB_IFACE_INSTANCE_MAGIC, "%px: magic failed\n", ii);
@@ -2785,9 +2950,9 @@ void ecm_db_iface_add_ethernet(struct ecm_db_iface_instance *ii, uint8_t *addres
 	/*
 	 * Record general info
 	 */
-	ii->type = ECM_DB_IFACE_TYPE_ETHERNET;
+	ii->type = ECM_DB_IFACE_TYPE_DSA;
 #ifdef ECM_STATE_OUTPUT_ENABLE
-	ii->state_get = ecm_db_iface_ethernet_state_get;
+	ii->state_get = ecm_db_iface_dsa_state_get;
 #endif
 	ii->arg = arg;
 	ii->final = final;
@@ -2799,7 +2964,7 @@ void ecm_db_iface_add_ethernet(struct ecm_db_iface_instance *ii, uint8_t *addres
 	/*
 	 * Type specific info
 	 */
-	type_info = &ii->type_info.ethernet;
+	type_info = &ii->type_info.dsa;
 	memcpy(type_info->address, address, ETH_ALEN);
 
 	/*
@@ -2808,9 +2973,8 @@ void ecm_db_iface_add_ethernet(struct ecm_db_iface_instance *ii, uint8_t *addres
 	hash_index = ecm_db_iface_generate_hash_index_ethernet(address);
 
 	ecm_db_iface_add_to_db(ii, hash_index);
-
 }
-EXPORT_SYMBOL(ecm_db_iface_add_ethernet);
+#endif
 
 #ifdef ECM_INTERFACE_BOND_ENABLE
 /*

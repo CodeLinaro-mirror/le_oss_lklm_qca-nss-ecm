@@ -473,6 +473,55 @@ static struct notifier_block ecm_db_ip6route_table_update_nb = {
 #endif
 
 /*
+ * ecm_db_defunct_all_handler()
+ * 	Proc handler to defunct ecm db
+ */
+static int ecm_db_defunct_all_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	/*
+	 * Usage:
+	 *
+	 * To defunct ecm rules from ecm db
+	 * echo 1 > /proc/sys/net/ecm/ecm_db/defunct_all
+	 *
+	 * To read status:
+	 * cat /proc/sys/net/ecm/ecm_db/defunct_all
+	 */
+
+	char *buf;
+	int ret;
+	int num;
+	int len;
+
+	if (write) {
+		ecm_db_connection_defunct_all();
+		return *lenp;
+	}
+
+	buf = kzalloc(sizeof(int), GFP_KERNEL);
+	if (!buf) {
+		return -ENOMEM;
+	}
+
+	spin_lock_bh(&ecm_db_lock);
+	num = _ecm_db_connection_count_get() + _ecm_db_mapping_count_get() + _ecm_db_host_count_get()
+		 + _ecm_db_node_count_get() + _ecm_db_iface_count_get();
+	spin_unlock_bh(&ecm_db_lock);
+
+	len = scnprintf(buf, PAGE_SIZE, "%d\n", num);
+	if (!len) {
+		DEBUG_ERROR("Failed to read buf\n");
+		kfree(buf);
+		return -EINVAL;
+	}
+
+	ret = memory_read_from_buffer(buffer, *lenp, ppos, buf, len);
+	*lenp = ret;
+	kfree(buf);
+	return 0;
+}
+
+/*
  * ecm_db_ipv4_route_handler()
  * 	Proc handler to disable IPV4 route table events
  */
@@ -509,18 +558,24 @@ static int ecm_db_ipv4_route_handler(struct ctl_table *ctl, int write, void *buf
 
 	if (current_val == ecm_db_ipv4_route_enable) {
 		DEBUG_WARN("No change in the current configuration.\n");
-		return 0;
+		return ret;
 	}
 
 	if (ecm_db_ipv4_route_enable) {
 		ecm_front_end_ipv4_stop_temp(1);
-		ip_rt_register_notifier(&ecm_db_iproute_table_update_nb);
+		ret = ip_rt_register_notifier(&ecm_db_iproute_table_update_nb);
+		if (ret) {
+			DEBUG_ERROR("Could not register for the IPV4 routing events error:%d\n", ret);
+		}
 		ecm_front_end_ipv4_stop_temp(0);
 		return ret;
 	}
 
 	ecm_front_end_ipv4_stop_temp(1);
-	ip_rt_unregister_notifier(&ecm_db_iproute_table_update_nb);
+	ret = ip_rt_unregister_notifier(&ecm_db_iproute_table_update_nb);
+	if (ret) {
+		DEBUG_ERROR("Could not unregister for the IPV4 routing events error:%d\n", ret);
+	}
 	ecm_front_end_ipv4_stop_temp(0);
 
 	return ret;
@@ -564,18 +619,24 @@ static int ecm_db_ipv6_route_handler(struct ctl_table *ctl, int write, void *buf
 
 	if (current_val == ecm_db_ipv6_route_enable) {
 		DEBUG_WARN("No change in the current configuration.\n");
-		return 0;
+		return ret;
 	}
 
 	if (ecm_db_ipv6_route_enable) {
 		ecm_front_end_ipv6_stop_temp(1);
-		rt6_register_notifier(&ecm_db_ip6route_table_update_nb);
+		ret = rt6_register_notifier(&ecm_db_ip6route_table_update_nb);
+		if (ret) {
+			DEBUG_ERROR("Could not register for the IPV6 routing events error:%d\n", ret);
+		}
 		ecm_front_end_ipv6_stop_temp(0);
 		return ret;
 	}
 
 	ecm_front_end_ipv6_stop_temp(1);
-	rt6_unregister_notifier(&ecm_db_ip6route_table_update_nb);
+	ret = rt6_unregister_notifier(&ecm_db_ip6route_table_update_nb);
+	if (ret) {
+		DEBUG_ERROR("Could not unregister for the IPV6 routing events error:%d\n", ret);
+	}
 	ecm_front_end_ipv6_stop_temp(0);
 
 	return ret;
@@ -583,6 +644,13 @@ static int ecm_db_ipv6_route_handler(struct ctl_table *ctl, int write, void *buf
 #endif
 
 static struct ctl_table ecm_db_ctl_table[] = {
+	{
+		.procname	= "defunct_all",
+		.data		= NULL,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_db_defunct_all_handler,
+	},
 	{
 		.procname	= "ipv4_route_handle",
 		.data		= &ecm_db_ipv4_route_enable,
@@ -609,6 +677,8 @@ static struct ctl_table ecm_db_ctl_table[] = {
  */
 int ecm_db_init(struct dentry *dentry)
 {
+	int ret = 0;
+
 	DEBUG_INFO("ECM Module init\n");
 
 	ecm_db_ctl_table_header = register_sysctl(ECM_DB_PATH, ecm_db_ctl_table);
@@ -683,13 +753,22 @@ int ecm_db_init(struct dentry *dentry)
 	/*
 	 * register for route table modification events
 	 */
-	if (ecm_db_ipv4_route_enable)
-		ip_rt_register_notifier(&ecm_db_iproute_table_update_nb);
+	if (ecm_db_ipv4_route_enable) {
+		ret = ip_rt_register_notifier(&ecm_db_iproute_table_update_nb);
+		if (ret) {
+			DEBUG_ERROR("Could not register for the IPV4 routing events error:%d\n", ret);
+		}
+	}
+
 #ifdef ECM_IPV6_ENABLE
-	if (ecm_db_ipv6_route_enable)
-		rt6_register_notifier(&ecm_db_ip6route_table_update_nb);
+	if (ecm_db_ipv6_route_enable) {
+		ret = rt6_register_notifier(&ecm_db_ip6route_table_update_nb);
+		if (ret) {
+			DEBUG_ERROR("Could not register for the IPV6 routing events error:%d\n", ret);
+		}
+	}
 #endif
-	return 0;
+	return ret;
 
 init_cleanup_4:
 	ecm_db_node_exit();
@@ -713,6 +792,8 @@ void ecm_db_exit(void)
 {
 	DEBUG_INFO("ECM DB Module exit\n");
 
+	int ret;
+
 	spin_lock_bh(&ecm_db_lock);
 	ecm_db_terminate_pending = true;
 	spin_unlock_bh(&ecm_db_lock);
@@ -720,11 +801,20 @@ void ecm_db_exit(void)
 	/*
 	 * unregister for route table update events only if registered.
 	 */
-	if (ecm_db_ipv4_route_enable)
-		ip_rt_unregister_notifier(&ecm_db_iproute_table_update_nb);
+	if (ecm_db_ipv4_route_enable) {
+		ret = ip_rt_unregister_notifier(&ecm_db_iproute_table_update_nb);
+		if (ret) {
+			DEBUG_ERROR("Could not unregister for the IPV4 routing events error:%d\n", ret);
+		}
+	}
+
 #ifdef ECM_IPV6_ENABLE
-	if (ecm_db_ipv6_route_enable)
-		rt6_unregister_notifier(&ecm_db_ip6route_table_update_nb);
+	if (ecm_db_ipv6_route_enable) {
+		ret = rt6_unregister_notifier(&ecm_db_ip6route_table_update_nb);
+		if (ret) {
+			DEBUG_ERROR("Could not unregister for the IPV6 routing events error:%d\n", ret);
+		}
+	}
 #endif
 	ecm_db_connection_defunct_all();
 

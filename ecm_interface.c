@@ -37,8 +37,11 @@
 #include <linux/socket.h>
 #include <linux/wireless.h>
 #include <net/genetlink.h>
-#include <linux/nl80211.h>
+#include <net/netevent.h>
 #include <net/gre.h>
+#ifdef ECM_INTERFACE_SKIP_ACCEL_ENABLE
+#include <linux/jhash.h>
+#endif
 #ifdef ECM_INTERFACE_BOND_ENABLE
 #include <net/bonding.h>
 #endif
@@ -68,6 +71,10 @@
 #ifdef ECM_INTERFACE_VLAN_ENABLE
 #include <linux/if_vlan.h>
 #endif
+#ifdef ECM_INTERFACE_DSA_ENABLE
+#include <linux/dsa/8021q.h>
+#include <net/dsa.h>
+#endif
 #ifdef ECM_INTERFACE_PPP_ENABLE
 #include <linux/if_pppox.h>
 #ifdef ECM_INTERFACE_L2TPV2_ENABLE
@@ -89,6 +96,7 @@
 #ifdef ECM_INTERFACE_MACVLAN_ENABLE
 #include <linux/if_macvlan.h>
 #endif
+#include <linux/hex.h>
 
 /*
  * Debug output levels
@@ -125,42 +133,38 @@
 #endif
 #include "ecm_front_end_common.h"
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
-#define ECM_INTERFACE_NL80211_MC_GROUP_INVALID_ID	-1
-#define ECM_INTERFACE_GENEL_MESSAGE_SIZE		4096
+#ifdef ECM_INTERFACE_SKIP_ACCEL_ENABLE
+/*
+ * Hash table for skip accel based on interaface name
+ * We are supporting 32 interfaces.
+ */
+#define ECM_INTERFACE_ACCEL_DENIED_HASH_BITS 5
+#define ECM_INTERFACE_ACCEL_DENIED_DEVICE_HTABLE_SIZE (1 << ECM_INTERFACE_ACCEL_DENIED_HASH_BITS)
+
+/*
+ * Denied acceleration interface hash tables
+ */
+static DEFINE_HASHTABLE(ecm_interface_accel_denied_list, ECM_INTERFACE_ACCEL_DENIED_HASH_BITS);
+static atomic_t ecm_interface_accel_denied_list_count;
+
+/*
+ * Hash node in the denied interface hash list
+ */
+struct ecm_interface_denied_node {
+	struct hlist_node hnode;
+	char name[IFNAMSIZ];
+};
 #endif
 
 /*
- * Peer authorization event coming from WLAN driver.
+ * List to store MAC of clients that are marked as defunct
  */
-#define ECM_INTERFACE_WIFI_EVENT_NODE_AUTH	30
+static uint8_t ecm_interface_defunct_mac[ETH_ALEN];
 
 /*
  * Store iface name that is marked for defunct
  */
 static char ecm_interface_defunct_iface[IFNAMSIZ];
-
-/*
- * Wi-Fi event node authorized information structure.
- */
-struct ecm_interface_wifi_event_node_authorized {
-	u_int8_t  mac_addr[ETH_ALEN];	/* MAC address */
-	u_int8_t  channel_num;		/* Operating channel number */
-	u_int16_t assoc_id;		/* Assoc id */
-	u_int16_t phymode;		/* Phymode(11ac/abgn) */
-	u_int8_t  nss;			/* TX/RX chains */
-	u_int8_t  is_256qam;		/* TX/RX chains */
-};
-
-/*
- * Wifi event handler structure.
- */
-struct ecm_interface_wifi_event {
-	struct task_struct *thread;
-	struct socket *sock;
-};
-
-static struct ecm_interface_wifi_event __ewn;
 
 #ifdef ECM_INTERFACE_IPSEC_GLUE_LAYER_SUPPORT_ENABLE
 /*
@@ -186,6 +190,17 @@ static bool ecm_interface_terminate_pending = false;		/* True when the user has 
  */
 int ecm_interface_src_check;
 
+/*
+ * Sysctl to enable mwan3
+ */
+int ecm_interface_mwan3_enable = 0;
+
+/*
+ * Source interface check no flush flag.
+ * 	If this is enabled, the flows with a mismatch of source interface will not be flushed.
+ */
+int ecm_interface_src_check_no_flush;
+
 #if defined(CONFIG_NET_CLS_ACT) && defined(ECM_CLASSIFIER_DSCP_IGS)
 /*
  * IGS enabled flag.
@@ -195,7 +210,274 @@ int ecm_interface_src_check;
 int ecm_interface_igs_enabled;
 #endif
 
+/*
+ * struct ecm_interface_netdev_hook_entry
+ *	Holds the netdev hook entry information
+ */
+struct ecm_interface_netdev_hook_entry {
+	struct list_head list;
+	struct nf_hook_ops nfho;
+};
+
 static struct ctl_table_header *ecm_interface_ctl_table_header;	/* Sysctl table header */
+
+static LIST_HEAD(ecm_interface_netdev_hook_reg_list);
+
+/*
+ * ecm_interface_handle_wlan_egress_packet()
+ *	Process the packets that need WLAN QoS handling
+ */
+int ecm_interface_handle_wlan_egress_packet(struct sk_buff *skb)
+{
+	__u8 proto;
+	int ip_version;
+	ip_addr_t src_ip, dst_ip;
+	struct ecm_db_connection_instance *ci;
+	struct ecm_front_end_flowsawf_msg msg;
+	struct ecm_classifier_instance *aci;
+	struct nf_conn *ct;
+	enum ip_conntrack_info ctinfo;
+	struct nf_conntrack_tuple orig_tuple;
+	struct nf_conntrack_tuple reply_tuple;
+	u8 l3proto;
+	struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
+	int aci_index;
+	int assignment_count;
+
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct) {
+		DEBUG_TRACE("%px: no ct\n", skb);
+		return -1;
+	}
+
+	orig_tuple = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	reply_tuple = ct->tuplehash[IP_CT_DIR_REPLY].tuple;
+
+	l3proto = orig_tuple.src.l3num;
+	proto = orig_tuple.dst.protonum;
+
+	if (l3proto == NFPROTO_IPV4) {
+		ci = ecm_db_connection_ipv4_from_ct_get_and_ref(ct);
+		if (!ci) {
+			DEBUG_TRACE("%px: connection not found\n", ct);
+			return -1;
+		}
+
+		ECM_NIN4_ADDR_TO_IP_ADDR(src_ip, orig_tuple.src.u3.ip);
+		ECM_NIN4_ADDR_TO_IP_ADDR(dst_ip, reply_tuple.src.u3.ip);
+		ip_version = 4;
+	} else if (l3proto == NFPROTO_IPV6) {
+		ci = ecm_db_connection_ipv6_from_ct_get_and_ref(ct);
+		if (!ci) {
+			DEBUG_TRACE("%px: connection not found\n", ct);
+			return -1;
+		}
+
+		ECM_NIN6_ADDR_TO_IP_ADDR(src_ip, orig_tuple.src.u3.in6);
+		ECM_NIN6_ADDR_TO_IP_ADDR(dst_ip, reply_tuple.src.u3.in6);
+		ip_version = 6;
+	} else {
+		DEBUG_TRACE("%px: Unsupported protocol %d\n", ct, l3proto);
+		return -1;
+	}
+
+	ECM_IP_ADDR_COPY(msg.flow_src_ip, src_ip);
+	ECM_IP_ADDR_COPY(msg.flow_dest_ip, dst_ip);
+	msg.flow_mark = skb->mark;
+	msg.ip_version = ip_version;
+	msg.protocol = proto;
+
+	assignment_count = ecm_db_connection_classifier_assignments_get_and_ref(ci, assignments);
+
+	for (aci_index = 0; aci_index < assignment_count; ++aci_index) {
+		aci = assignments[aci_index];
+		if (aci->update) {
+			aci->update(aci, ECM_RULE_UPDATE_TYPE_FLOWMARK_WIFI_QM, &msg);
+		}
+	}
+
+	ecm_db_connection_assignments_release(assignment_count, assignments);
+
+	ecm_db_connection_deref(ci);
+
+	return 0;
+}
+
+/*
+ * ecm_interface_wlan_egress_netdev_hookfn()
+ *	Process the SCS and MSCS tagged packets
+ */
+static inline unsigned int ecm_interface_wlan_egress_netdev_hookfn(void *priv,
+							    struct sk_buff *skb,
+							    const struct nf_hook_state *state)
+{
+	int ret;
+
+	if (((skb->mark & ECM_INTERFACE_WIFI_QOS_TAG_MASK) == ECM_INTERFACE_WIFI_QOS_SCS_TAG) ||
+	    ((skb->mark & ECM_INTERFACE_WIFI_QOS_TAG_MASK) == ECM_INTERFACE_WIFI_QOS_MSCS_TAG)) {
+		ret = ecm_interface_handle_wlan_egress_packet(skb);
+		if (ret) {
+			DEBUG_TRACE("%px WLAN egress packet handling failed, mark : 0x%x, err: %d\n", skb, skb->mark, ret);
+		}
+	}
+
+	return NF_ACCEPT;
+}
+
+/*
+ * ecm_interface_pop_netdev_hook_reg_list()
+ *	Pop a hook entry from the global list ecm_interface_netdev_hook_reg_list
+ */
+static inline struct ecm_interface_netdev_hook_entry *
+ecm_interface_pop_netdev_hook_reg_list(void)
+{
+	struct ecm_interface_netdev_hook_entry *hook_entry = NULL;
+
+	spin_lock_bh(&ecm_interface_lock);
+
+	hook_entry = list_first_entry_or_null(&ecm_interface_netdev_hook_reg_list,
+					      struct ecm_interface_netdev_hook_entry, list);
+	if (hook_entry) {
+		list_del(&hook_entry->list);
+	}
+
+	spin_unlock_bh(&ecm_interface_lock);
+	return hook_entry;
+}
+
+/*
+ * ecm_interface_unregister_nf_hook()
+ *	Unregister nf hook
+ */
+static inline void ecm_interface_unregister_nf_hook(struct ecm_interface_netdev_hook_entry *hook_entry)
+{
+	DEBUG_TRACE("unregister nf hook :%s ", hook_entry->nfho.dev->name);
+	nf_unregister_net_hook(&init_net, &hook_entry->nfho);
+}
+
+/*
+ *ecm_interface_unregister_nf_hook_wlan_device()
+ *	Unregister nf hook for wlan devices
+ */
+static inline void ecm_interface_unregister_nf_hook_wlan_device(void)
+{
+	struct ecm_interface_netdev_hook_entry *hook_entry;
+
+	while ((hook_entry = ecm_interface_pop_netdev_hook_reg_list())) {
+		ecm_interface_unregister_nf_hook(hook_entry);
+		kfree(hook_entry);
+	}
+}
+
+/*
+ * ecm_interface_check_dup_and_add_nf_hookfn_entry()
+ *	Check whether the hookfn entry is present in the global list.
+ *	If not, add it in the global list
+ */
+static inline bool ecm_interface_check_dup_and_add_nf_hookfn_entry(struct ecm_interface_netdev_hook_entry *new_hook_entry)
+{
+	struct ecm_interface_netdev_hook_entry *hook_entry;
+
+	spin_lock_bh(&ecm_interface_lock);
+
+	list_for_each_entry(hook_entry, &ecm_interface_netdev_hook_reg_list, list) {
+		if (hook_entry->nfho.dev == new_hook_entry->nfho.dev &&
+		    hook_entry->nfho.hook == new_hook_entry->nfho.hook) {
+			spin_unlock_bh(&ecm_interface_lock);
+			return true;
+		}
+	}
+
+	list_add_tail(&new_hook_entry->list, &ecm_interface_netdev_hook_reg_list);
+	spin_unlock_bh(&ecm_interface_lock);
+
+	return false;
+}
+
+/*
+ * ecm_interface_remove_nf_hookfn_entry()
+ *	Remove the hook_entry that matches dev and hookfn from ecm_interface_netdev_hook_reg_list
+ */
+static inline struct ecm_interface_netdev_hook_entry *
+ecm_interface_remove_nf_hookfn_entry(struct net_device *dev, nf_hookfn *hookfn)
+{
+	struct ecm_interface_netdev_hook_entry *hook_entry;
+	struct ecm_interface_netdev_hook_entry *temp;
+
+	spin_lock_bh(&ecm_interface_lock);
+
+	list_for_each_entry_safe(hook_entry, temp, &ecm_interface_netdev_hook_reg_list, list) {
+		if (hook_entry->nfho.dev == dev && hook_entry->nfho.hook == hookfn) {
+			list_del(&hook_entry->list);
+			spin_unlock_bh(&ecm_interface_lock);
+			return hook_entry;
+		}
+	}
+
+	spin_unlock_bh(&ecm_interface_lock);
+
+	return NULL;
+}
+
+/*
+ * ecm_interface_add_nf_hookfn_entry_and_register()
+ *	Register nf hook and add the hook entry to the global hook entry list
+ */
+static inline void ecm_interface_add_nf_hookfn_entry_and_register(struct net_device *dev, nf_hookfn *hookfn)
+{
+	struct ecm_interface_netdev_hook_entry *hook_entry;
+	int ret;
+
+	hook_entry = kzalloc(sizeof(*hook_entry), GFP_ATOMIC);
+	if (!hook_entry) {
+		DEBUG_WARN("Failed to allocate hook entry%s\n", dev->name);
+		return;
+	}
+
+	hook_entry->nfho.pf = NFPROTO_NETDEV;
+	hook_entry->nfho.hooknum = NF_NETDEV_EGRESS;
+	hook_entry->nfho.hook = ecm_interface_wlan_egress_netdev_hookfn;
+	hook_entry->nfho.priority = NF_IP_PRI_LAST;
+	hook_entry->nfho.dev = dev;
+
+	ret = ecm_interface_check_dup_and_add_nf_hookfn_entry(hook_entry);
+	if (ret) {
+		DEBUG_TRACE("hook entry already present, iface %s", dev->name);
+		kfree(hook_entry);
+		return;
+	}
+
+	ret = nf_register_net_hook(&init_net, &hook_entry->nfho);
+	if (ret) {
+		DEBUG_WARN("Failed to register netdev hook on %s err : %d\n", dev->name, ret);
+		hook_entry = ecm_interface_remove_nf_hookfn_entry(dev, ecm_interface_wlan_egress_netdev_hookfn);
+		kfree(hook_entry);
+		return;
+	}
+
+	DEBUG_TRACE("Netdev egress hook register for iface %s success", dev->name);
+}
+
+/*
+ * ecm_interface_remove_nf_hookfn_entry_and_unregister()
+ *	Remove hook entry from the global hook entry list and unregister the nf hook
+ */
+static inline void ecm_interface_remove_nf_hookfn_entry_and_unregister(struct net_device *dev, nf_hookfn *hookfn)
+{
+	struct ecm_interface_netdev_hook_entry *hook_entry;
+
+	hook_entry = ecm_interface_remove_nf_hookfn_entry(dev, hookfn);
+
+	if (!hook_entry) {
+		DEBUG_TRACE("No hook entry match found for iface %s", dev->name);
+		return;
+	}
+
+	ecm_interface_unregister_nf_hook(hook_entry);
+	kfree(hook_entry);
+
+	DEBUG_TRACE("Netdev egress hook unregister for iface %s", dev->name);
+}
 
 #ifdef ECM_INTERFACE_OVPN_ENABLE
 /*
@@ -321,6 +603,36 @@ struct net_device *ecm_interface_get_and_hold_dev_master(struct net_device *dev)
 }
 EXPORT_SYMBOL(ecm_interface_get_and_hold_dev_master);
 
+#ifdef ECM_INTERFACE_SKIP_ACCEL_ENABLE
+/*
+ * ecm_interface_lookup_in_denied_list()
+ * 	Checks if the device name is in the accel_denied_list
+ * 	Return true if interface is in the list.
+ */
+static inline bool ecm_interface_lookup_in_denied_list(char *dev_name)
+{
+	struct hlist_node *pnode, *temp;
+	uint32_t hash;
+
+	if (!atomic_read(&ecm_interface_accel_denied_list_count)) {
+		DEBUG_TRACE("No interface in the denied list\n");
+		return false;
+	}
+
+	hash = (uint32_t)jhash(dev_name, strlen(dev_name), ecm_db_jhash_rnd) % ECM_INTERFACE_ACCEL_DENIED_DEVICE_HTABLE_SIZE;
+
+	hlist_for_each_safe(pnode, temp, &ecm_interface_accel_denied_list[hash]) {
+		struct ecm_interface_denied_node *p = hlist_entry(pnode, struct ecm_interface_denied_node, hnode);
+
+		if (!strcmp(p->name, dev_name)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+#endif
+
 /*
  * ecm_interface_vlan_real_dev()
  *	Return immediate VLAN net device or Physical device pointer
@@ -394,7 +706,7 @@ EXPORT_SYMBOL(ecm_interface_dev_find_by_local_addr);
  * NOTE: The device may be the device upon which has a default gateway to reach the address.
  * from_local_addr is true when the device was found by a local address search.
  */
-struct net_device *ecm_interface_dev_find_by_addr(ip_addr_t addr, bool *from_local_addr)
+struct net_device *ecm_interface_dev_find_by_addr(ip_addr_t addr, bool *from_local_addr, uint32_t skb_mark)
 {
 	struct ecm_interface_route ecm_rt;
 	struct net_device *dev;
@@ -422,7 +734,7 @@ struct net_device *ecm_interface_dev_find_by_addr(ip_addr_t addr, bool *from_loc
 	 * Try a route to the address instead
 	 * NOTE: This will locate a route entry in the route destination *cache*.
 	 */
-	if (!ecm_interface_find_route_by_addr(addr, NULL, &ecm_rt)) {
+	if (!ecm_interface_find_route_by_addr(addr, NULL, &ecm_rt, skb_mark)) {
 		DEBUG_WARN("no route found\n");
 		return NULL;
 	}
@@ -444,7 +756,7 @@ EXPORT_SYMBOL(ecm_interface_dev_find_by_addr);
  *
  * GGG TODO Need to make sure this also works for local IP addresses too.
  */
-static bool ecm_interface_mac_addr_get_ipv6(ip_addr_t addr, uint8_t *mac_addr, bool *on_link, ip_addr_t gw_addr)
+static bool ecm_interface_mac_addr_get_ipv6(ip_addr_t addr, uint8_t *mac_addr, bool *on_link, ip_addr_t gw_addr, uint32_t skb_mark)
 {
 	struct in6_addr daddr = {0};
 	struct ecm_interface_route ecm_rt;
@@ -458,7 +770,7 @@ static bool ecm_interface_mac_addr_get_ipv6(ip_addr_t addr, uint8_t *mac_addr, b
 	 * This means we will also work if the neighbours are routers too.
 	 */
 	ECM_IP_ADDR_TO_NIN6_ADDR(daddr, addr);
-	if (!ecm_interface_find_route_by_addr(addr, NULL, &ecm_rt)) {
+	if (!ecm_interface_find_route_by_addr(addr, NULL, &ecm_rt, skb_mark)) {
 		*on_link = false;
 		return false;
 	}
@@ -542,7 +854,7 @@ static bool ecm_interface_mac_addr_get_ipv6(ip_addr_t addr, uint8_t *mac_addr, b
  * ecm_interface_find_gateway_ipv6()
  *	Finds the ipv6 gateway ip address of a given ipv6 address.
  */
-static bool ecm_interface_find_gateway_ipv6(ip_addr_t daddr, ip_addr_t saddr, ip_addr_t gw_addr)
+static bool ecm_interface_find_gateway_ipv6(ip_addr_t daddr, ip_addr_t saddr, ip_addr_t gw_addr, uint32_t skb_mark)
 {
 	struct ecm_interface_route ecm_rt;
 	struct rt6_info *rt;
@@ -551,7 +863,7 @@ static bool ecm_interface_find_gateway_ipv6(ip_addr_t daddr, ip_addr_t saddr, ip
 	 * Find the ipv6 route of the given ip address to look up
 	 * whether we have a gateway to reach to that ip address or not.
 	 */
-	if (!ecm_interface_find_route_by_addr(daddr, saddr, &ecm_rt)) {
+	if (!ecm_interface_find_route_by_addr(daddr, saddr, &ecm_rt, skb_mark)) {
 		return false;
 	}
 	DEBUG_ASSERT(!ecm_rt.v4_route, "Did not locate a v6 route!\n");
@@ -576,7 +888,7 @@ static bool ecm_interface_find_gateway_ipv6(ip_addr_t daddr, ip_addr_t saddr, ip
  * ecm_interface_find_gateway_ipv4()
  *	Finds the ipv4 gateway address of a given ipv4 address.
  */
-static bool ecm_interface_find_gateway_ipv4(ip_addr_t addr, ip_addr_t gw_addr)
+static bool ecm_interface_find_gateway_ipv4(ip_addr_t addr, ip_addr_t gw_addr, uint32_t skb_mark)
 {
 	struct ecm_interface_route ecm_rt;
 	struct rtable *rt;
@@ -585,7 +897,7 @@ static bool ecm_interface_find_gateway_ipv4(ip_addr_t addr, ip_addr_t gw_addr)
 	 * Find the ipv4 route of the given ip address to look up
 	 * whether we have a gateway to reach to that ip address or not.
 	 */
-	if (!ecm_interface_find_route_by_addr(addr, NULL, &ecm_rt)) {
+	if (!ecm_interface_find_route_by_addr(addr, NULL, &ecm_rt, skb_mark)) {
 		return false;
 	}
 	DEBUG_ASSERT(ecm_rt.v4_route, "Did not locate a v4 route!\n");
@@ -612,14 +924,14 @@ static bool ecm_interface_find_gateway_ipv4(ip_addr_t addr, ip_addr_t gw_addr)
  * ecm_interface_find_gateway()
  *	Finds the gateway ip address of a given ECM ip address type.
  */
-bool ecm_interface_find_gateway(ip_addr_t d_addr, ip_addr_t s_addr, ip_addr_t gw_addr)
+bool ecm_interface_find_gateway(ip_addr_t d_addr, ip_addr_t s_addr, ip_addr_t gw_addr, uint32_t skb_mark)
 {
 	if (ECM_IP_ADDR_IS_V4(d_addr)) {
-		return ecm_interface_find_gateway_ipv4(d_addr, gw_addr);
+		return ecm_interface_find_gateway_ipv4(d_addr, gw_addr, skb_mark);
 	}
 
 #ifdef ECM_IPV6_ENABLE
-	return ecm_interface_find_gateway_ipv6(d_addr, s_addr, gw_addr);
+	return ecm_interface_find_gateway_ipv6(d_addr, s_addr, gw_addr, skb_mark);
 #else
 	return false;
 #endif
@@ -672,7 +984,7 @@ bool ecm_interface_mac_addr_get_pppoe(struct net_device *local_dev, uint8_t *nod
  * ecm_interface_mac_addr_get_ipv4()
  *	Return mac for an IPv4 address
  */
-static bool ecm_interface_mac_addr_get_ipv4(ip_addr_t addr, uint8_t *mac_addr, bool *on_link, ip_addr_t gw_addr)
+static bool ecm_interface_mac_addr_get_ipv4(ip_addr_t addr, uint8_t *mac_addr, bool *on_link, ip_addr_t gw_addr, uint32_t skb_mark)
 {
 	struct neighbour *neigh;
 	struct ecm_interface_route ecm_rt;
@@ -687,7 +999,7 @@ static bool ecm_interface_mac_addr_get_ipv4(ip_addr_t addr, uint8_t *mac_addr, b
 	 * We also locate the MAC if the address is a local host address.
 	 */
 	ECM_IP_ADDR_TO_NIN4_ADDR(ipv4_addr, addr);
-	if (!ecm_interface_find_route_by_addr(addr, NULL, &ecm_rt)) {
+	if (!ecm_interface_find_route_by_addr(addr, NULL, &ecm_rt, skb_mark)) {
 		*on_link = false;
 		return false;
 	}
@@ -786,14 +1098,14 @@ static bool ecm_interface_mac_addr_get_ipv4(ip_addr_t addr, uint8_t *mac_addr, b
  * ecm_interface_mac_addr_get()
  *	Return the mac address for the given IP address.  Returns false on failure.
  */
-bool ecm_interface_mac_addr_get(ip_addr_t addr, uint8_t *mac_addr, bool *on_link, ip_addr_t gw_addr)
+bool ecm_interface_mac_addr_get(ip_addr_t addr, uint8_t *mac_addr, bool *on_link, ip_addr_t gw_addr, uint32_t skb_mark)
 {
 	if (ECM_IP_ADDR_IS_V4(addr)) {
-		return ecm_interface_mac_addr_get_ipv4(addr, mac_addr, on_link, gw_addr);
+		return ecm_interface_mac_addr_get_ipv4(addr, mac_addr, on_link, gw_addr, skb_mark);
 	}
 
 #ifdef ECM_IPV6_ENABLE
-	return ecm_interface_mac_addr_get_ipv6(addr, mac_addr, on_link, gw_addr);
+	return ecm_interface_mac_addr_get_ipv6(addr, mac_addr, on_link, gw_addr, skb_mark);
 #else
 	return false;
 #endif
@@ -1177,7 +1489,7 @@ uint32_t ecm_interface_vxlan_type_get(struct sk_buff *skb, struct vxlan_dev *vxl
 			dev_put(local_dev);
 			dev_put(lower_dev);
 			DEBUG_TRACE("%px: VxLAN outer interface type.\n", skb);
-			return 0;
+			return ECM_DB_IFACE_VXLAN_OUTER;
 		}
 
 		if (local_dev) {
@@ -1186,7 +1498,7 @@ uint32_t ecm_interface_vxlan_type_get(struct sk_buff *skb, struct vxlan_dev *vxl
 
 		dev_put(lower_dev);
 		DEBUG_TRACE("%px: VxLAN inner interface type.\n", skb);
-		return 1;
+		return ECM_DB_IFACE_VXLAN_INNER;
 	}
 
 	/*
@@ -1198,7 +1510,7 @@ uint32_t ecm_interface_vxlan_type_get(struct sk_buff *skb, struct vxlan_dev *vxl
 		 */
 		if (skb_tunnel_info(skb)) {
 			DEBUG_TRACE("%px: VxLAN inner interface type.\n", skb);
-			return 1;
+			return ECM_DB_IFACE_VXLAN_INNER;
 		}
 
 		/*
@@ -1209,11 +1521,11 @@ uint32_t ecm_interface_vxlan_type_get(struct sk_buff *skb, struct vxlan_dev *vxl
 		if (local_dev) {
 			DEBUG_TRACE("%px: VxLAN outer interface type.\n", skb);
 			dev_put(local_dev);
-			return 0;
+			return ECM_DB_IFACE_VXLAN_OUTER;
 		}
 
 		DEBUG_TRACE("%px: VxLAN inner interface type.\n", skb);
-		return 1;
+		return ECM_DB_IFACE_VXLAN_INNER;
 	}
 
 	/*
@@ -1243,7 +1555,7 @@ uint32_t ecm_interface_vxlan_type_get(struct sk_buff *skb, struct vxlan_dev *vxl
 		 */
 		if (ntohs(skb->protocol) != ETH_P_IP) {
 			DEBUG_TRACE("%px: VxLAN inner interface type.\n", skb);
-			return 1;
+			return ECM_DB_IFACE_VXLAN_INNER;
 		}
 	} else {
 		if (!ipv6_addr_any(&src_ip->sin6.sin6_addr)) {
@@ -1265,17 +1577,17 @@ uint32_t ecm_interface_vxlan_type_get(struct sk_buff *skb, struct vxlan_dev *vxl
 		 */
 		if (ntohs(skb->protocol) != ETH_P_IPV6) {
 			DEBUG_TRACE("%px: VxLAN inner interface type.\n", skb);
-			return 1;
+			return ECM_DB_IFACE_VXLAN_INNER;
 		}
 	}
 
 	if (ECM_IP_ADDR_MATCH(vx_addr, packet_addr)) {
 		DEBUG_TRACE("%px: VxLAN outer interface type.\n", skb);
-		return 0;
+		return ECM_DB_IFACE_VXLAN_OUTER;
 	}
 
 	DEBUG_TRACE("%px: VxLAN inner interface type.\n", skb);
-	return 1;
+	return ECM_DB_IFACE_VXLAN_INNER;
 }
 
 /*
@@ -1312,7 +1624,7 @@ __be32 ecm_interface_vxlan_gpe_get_vni_remote_ip_from_inner(struct net_device *d
 
 		daddr = netif_is_vxlan(indev) ? ip_hdr(skb)->saddr : ip_hdr(skb)->daddr;
 		rt = ip_route_output(&init_net, daddr, 0, 0, 0);
-		if (IS_ERR(rt)) {
+		if (IS_ERR_OR_NULL(rt)) {
 			DEBUG_WARN("%px: VXLAN-GPE failed to get IPv4 route to: %pI4\n", dev, &daddr);
 			goto rt_error;
 		}
@@ -1406,21 +1718,30 @@ static bool ecm_interface_has_multiple_ae_iface_type(struct net_device *dev)
  * ecm_interface_addr_find_route_by_addr_ipv4()
  *	Return the route for the given IP address.  Returns NULL on failure.
  */
-static bool ecm_interface_find_route_by_addr_ipv4(ip_addr_t addr, struct ecm_interface_route *ecm_rt)
+static bool ecm_interface_find_route_by_addr_ipv4(ip_addr_t daddr, ip_addr_t saddr, struct ecm_interface_route *ecm_rt, uint32_t skb_mark)
 {
-	__be32 be_addr;
+	struct flowi4 fl4 = {0};
 
 	/*
 	 * Get a route to the given IP address, this will allow us to also find the interface
 	 * it is using to communicate with that IP address.
 	 */
-	ECM_IP_ADDR_TO_NIN4_ADDR(be_addr, addr);
-	ecm_rt->rt.rtv4 = ip_route_output(&init_net, be_addr, 0, 0, 0);
-	if (IS_ERR(ecm_rt->rt.rtv4)) {
-		DEBUG_TRACE("No output route to: %pI4n\n", &be_addr);
+	ECM_IP_ADDR_TO_NIN4_ADDR(fl4.daddr, daddr);
+
+	if (ecm_interface_mwan3_enable) {
+		if (saddr) {
+			ECM_IP_ADDR_TO_NIN4_ADDR(fl4.saddr, saddr);
+		}
+		fl4.flowi4_mark = skb_mark;
+	}
+
+	ecm_rt->rt.rtv4 = ip_route_output_key(&init_net, &fl4);
+
+	if (IS_ERR_OR_NULL(ecm_rt->rt.rtv4)) {
+		DEBUG_TRACE("No output route to: %pI4n from: %pI4n skb_mark: 0x%x\n", &fl4.daddr, &fl4.saddr, skb_mark);
 		return false;
 	}
-	DEBUG_TRACE("Output route to: %pI4n is: %px\n", &be_addr, ecm_rt->rt.rtv4);
+	DEBUG_TRACE("Output route to: %pI4n from: %pI4n skb_mark: 0x%x\n", &fl4.daddr, &fl4.saddr, skb_mark);
 	ecm_rt->dst = (struct dst_entry *)ecm_rt->rt.rtv4;
 	ecm_rt->v4_route = true;
 	return true;
@@ -1431,28 +1752,45 @@ static bool ecm_interface_find_route_by_addr_ipv4(ip_addr_t addr, struct ecm_int
  * ecm_interface_addr_find_route_by_addr_ipv6()
  *	Return the route for the given IP address.  Returns NULL on failure.
  */
-static bool ecm_interface_find_route_by_addr_ipv6(ip_addr_t daddr, ip_addr_t saddr, struct ecm_interface_route *ecm_rt)
+static bool ecm_interface_find_route_by_addr_ipv6(ip_addr_t daddr, ip_addr_t saddr, struct ecm_interface_route *ecm_rt, uint32_t skb_mark)
 {
-	struct in6_addr naddr = {0};
-	struct in6_addr nsaddr = {0};
-	struct in6_addr *pnsaddr = NULL;
+        int flags = 0;
+	struct dst_entry *dst = NULL;
+	struct flowi6 fl6 = {0};
 
-	ECM_IP_ADDR_TO_NIN6_ADDR(naddr, daddr);
+	ECM_IP_ADDR_TO_NIN6_ADDR(fl6.daddr, daddr);
 	if (saddr) {
-		ECM_IP_ADDR_TO_NIN6_ADDR(nsaddr, saddr);
-		pnsaddr = &nsaddr;
+		ECM_IP_ADDR_TO_NIN6_ADDR(fl6.saddr, saddr);
+		flags |= RT6_LOOKUP_F_HAS_SADDR;
 	}
 
 	/*
 	 * Get a route to the given IP address, this will allow us to also find the interface
 	 * it is using to communicate with that IP address.
 	 */
-	ecm_rt->rt.rtv6 = rt6_lookup(&init_net, &naddr, pnsaddr, 0, NULL, 0);
-	if (!ecm_rt->rt.rtv6) {
+	if (ecm_interface_mwan3_enable) {
+		fl6.flowi6_mark = skb_mark;
+	}
+
+	dst = ip6_route_lookup(&init_net, &fl6, NULL, flags);
+	if (!dst) {
 		DEBUG_TRACE("No output route to: " ECM_IP_ADDR_OCTAL_FMT "\n", ECM_IP_ADDR_TO_OCTAL(daddr));
 		return NULL;
 	}
-	DEBUG_TRACE("Output route to: " ECM_IP_ADDR_OCTAL_FMT " is: %px\n", ECM_IP_ADDR_TO_OCTAL(daddr), ecm_rt->rt.rtv6);
+
+	if (dst->error != 0) {
+		dst_release(dst);
+		DEBUG_TRACE("No output route to: " ECM_IP_ADDR_OCTAL_FMT "\n", ECM_IP_ADDR_TO_OCTAL(daddr));
+		return NULL;
+	}
+
+	ecm_rt->rt.rtv6 = (struct rt6_info *)dst;
+	DEBUG_TRACE("Output route to fl6 addr: " ECM_IP_ADDR_OCTAL_FMT " daddr: " ECM_IP_ADDR_OCTAL_FMT " skb->mark: %d is: %px\n", ECM_IP_ADDR_TO_OCTAL(&fl6.daddr),
+										ECM_IP_ADDR_TO_OCTAL(daddr), skb_mark, ecm_rt->rt.rtv6);
+	if (saddr) {
+		DEBUG_TRACE("Output route from fl6 addr: " ECM_IP_ADDR_OCTAL_FMT " saddr: " ECM_IP_ADDR_OCTAL_FMT "\n", ECM_IP_ADDR_TO_OCTAL(&fl6.saddr),
+										ECM_IP_ADDR_TO_OCTAL(saddr));;
+	}
 	ecm_rt->dst = (struct dst_entry *)ecm_rt->rt.rtv6;
 	ecm_rt->v4_route = false;
 	return true;
@@ -1467,17 +1805,17 @@ static bool ecm_interface_find_route_by_addr_ipv6(ip_addr_t daddr, ip_addr_t sad
  *
  * Returns true if the route was able to be located.  The route must be released using ecm_interface_route_release().
  */
-bool ecm_interface_find_route_by_addr(ip_addr_t daddr, ip_addr_t saddr, struct ecm_interface_route *ecm_rt)
+bool ecm_interface_find_route_by_addr(ip_addr_t daddr, ip_addr_t saddr, struct ecm_interface_route *ecm_rt, uint32_t skb_mark)
 {
 	if (ECM_IP_ADDR_IS_V4(daddr)) {
 		DEBUG_TRACE("Locate dev for " ECM_IP_ADDR_DOT_FMT "\n", ECM_IP_ADDR_TO_DOT(daddr));
-		return ecm_interface_find_route_by_addr_ipv4(daddr, ecm_rt);
+		return ecm_interface_find_route_by_addr_ipv4(daddr,saddr, ecm_rt, skb_mark);
 	}
 
 	DEBUG_TRACE("Locate dev for " ECM_IP_ADDR_OCTAL_FMT "\n", ECM_IP_ADDR_TO_OCTAL(daddr));
 
 #ifdef ECM_IPV6_ENABLE
-	return ecm_interface_find_route_by_addr_ipv6(daddr, saddr, ecm_rt);
+	return ecm_interface_find_route_by_addr_ipv6(daddr, saddr, ecm_rt, skb_mark);
 #else
 	return false;
 #endif
@@ -1530,7 +1868,7 @@ void ecm_interface_send_neighbour_solicitation(struct net_device *dev, ip_addr_t
 	 * Find the neighbor entry
 	 */
 	neigh = rt6i->dst.ops->neigh_lookup(&rt6i->dst, NULL, &dst_addr);
-	if (IS_ERR(neigh)) {
+	if (IS_ERR_OR_NULL(neigh)) {
 		DEBUG_TRACE("Neighbour lookup failure for destination IPv6 address " ECM_IP_ADDR_OCTAL_FMT "\n", ECM_IP_ADDR_TO_OCTAL(addr));
 		dst_release(&rt6i->dst);
 		return;
@@ -1582,7 +1920,7 @@ void ecm_interface_send_arp_request(struct net_device *dest_dev, ip_addr_t dest_
 	neigh = neigh_lookup(&arp_tbl, &ipv4_addr, dest_dev);
 	if (!neigh) {
 		neigh = neigh_create(&arp_tbl, &ipv4_addr, dest_dev);
-		if (IS_ERR(neigh)) {
+		if (IS_ERR_OR_NULL(neigh)) {
 			DEBUG_WARN("Unable to create ARP request neigh for %pI4\n", &ipv4_addr);
 			return;
 		}
@@ -1609,7 +1947,7 @@ struct neighbour *ecm_interface_ipv4_neigh_get(ip_addr_t addr)
 
 	ECM_IP_ADDR_TO_NIN4_ADDR(ipv4_addr, addr);
 	rt = ip_route_output(&init_net, ipv4_addr, 0, 0, 0);
-	if (IS_ERR(rt)) {
+	if (IS_ERR_OR_NULL(rt)) {
 		return NULL;
 	}
 	dst = (struct dst_entry *)rt;
@@ -2179,18 +2517,18 @@ static struct ecm_db_iface_instance *ecm_interface_lag_interface_establish(struc
  * Returns NULL on failure or a reference to interface.
  */
 static struct ecm_db_iface_instance *ecm_interface_ethernet_interface_establish(struct ecm_db_interface_info_ethernet *type_info,
-							char *dev_name, int32_t dev_interface_num, int32_t ae_interface_num, int32_t mtu)
+							struct net_device *dev, int32_t ae_interface_num, int32_t mtu)
 {
 	struct ecm_db_iface_instance *nii;
 	struct ecm_db_iface_instance *ii;
 
 	DEBUG_INFO("Establish ETHERNET iface: %s with address: %pM, MTU: %d, if num: %d, accel engine if id: %d\n",
-			dev_name, type_info->address, mtu, dev_interface_num, ae_interface_num);
+			dev->name, type_info->address, mtu, dev->ifindex, ae_interface_num);
 
 	/*
 	 * Locate the iface
 	 */
-	ii = ecm_db_iface_ifidx_find_and_ref_ethernet(type_info->address, dev_interface_num, ae_interface_num);
+	ii = ecm_db_iface_ifidx_find_and_ref_ethernet(type_info->address, dev->ifindex, ae_interface_num);
 
 	if (ii) {
 		DEBUG_TRACE("%px: iface established\n", ii);
@@ -2210,19 +2548,71 @@ static struct ecm_db_iface_instance *ecm_interface_ethernet_interface_establish(
 	 * Add iface into the database, atomically to avoid races creating the same thing
 	 */
 	spin_lock_bh(&ecm_interface_lock);
-	ii = ecm_db_iface_ifidx_find_and_ref_ethernet(type_info->address, dev_interface_num, ae_interface_num);
+	ii = ecm_db_iface_ifidx_find_and_ref_ethernet(type_info->address, dev->ifindex, ae_interface_num);
 	if (ii) {
 		spin_unlock_bh(&ecm_interface_lock);
 		ecm_db_iface_deref(nii);
 		return ii;
 	}
-	ecm_db_iface_add_ethernet(nii, type_info->address, dev_name,
-			mtu, dev_interface_num, ae_interface_num, NULL, nii);
+	ecm_db_iface_add_ethernet(nii, type_info->address, dev,
+			mtu, ae_interface_num, NULL, nii);
 	spin_unlock_bh(&ecm_interface_lock);
 
 	DEBUG_TRACE("%px: ethernet iface established\n", nii);
 	return nii;
 }
+
+#ifdef ECM_INTERFACE_DSA_ENABLE
+/*
+ * ecm_interface_dsa_interface_establish()
+ * 	Returns a reference to a iface of the DSA type, possibly creating one if necessary.
+ * Returns NULL on failure or a reference to interface.
+ */
+static struct ecm_db_iface_instance *ecm_interface_dsa_interface_establish(struct ecm_db_interface_info_dsa *type_info,
+					char *dev_name, int32_t dev_interface_num, int32_t ae_interface_num, int32_t mtu)
+{
+	struct ecm_db_iface_instance *nii;
+	struct ecm_db_iface_instance *ii;
+
+	DEBUG_INFO("Establish DSA iface: %s with address: %pM, MTU: %d, if num: %d, accel engine if id: %d\n",
+			dev_name, type_info->address, mtu, dev_interface_num, ae_interface_num);
+
+	/*
+	 * Locate the iface
+	 */
+	ii = ecm_db_iface_find_and_ref_dsa(dev_interface_num, type_info->address);
+	if (ii) {
+		DEBUG_TRACE("%px: iface DSA established\n", ii);
+		return ii;
+	}
+
+	/*
+	 * No iface - create one
+	 */
+	nii = ecm_db_iface_alloc();
+	if (!nii) {
+		DEBUG_WARN("Failed to establish DSA iface\n");
+		return NULL;
+	}
+
+	/*
+	 * Add iface into the database, atomically to avoid races creating the same thing
+	 */
+	spin_lock_bh(&ecm_interface_lock);
+	ii = ecm_db_iface_find_and_ref_dsa(dev_interface_num, type_info->address);
+	if (ii) {
+		spin_unlock_bh(&ecm_interface_lock);
+		ecm_db_iface_deref(nii);
+		return ii;
+	}
+
+	ecm_db_iface_add_dsa(nii, type_info->address, dev_name, mtu, dev_interface_num, ae_interface_num, NULL, nii);
+	spin_unlock_bh(&ecm_interface_lock);
+
+	DEBUG_TRACE("%px: DSA iface established\n", nii);
+	return nii;
+}
+#endif
 
 #ifdef ECM_INTERFACE_PPPOE_ENABLE
 /*
@@ -2242,7 +2632,7 @@ static struct ecm_db_iface_instance *ecm_interface_pppoe_interface_establish(str
 	/*
 	 * Locate the iface
 	 */
-	ii = ecm_db_iface_find_and_ref_pppoe(type_info->pppoe_session_id, type_info->remote_mac);
+	ii = ecm_db_iface_find_and_ref_pppoe(type_info->pppoe_session_id, type_info->remote_mac, dev_interface_num);
 	if (ii) {
 		DEBUG_TRACE("%px: iface established\n", ii);
 		return ii;
@@ -2261,7 +2651,7 @@ static struct ecm_db_iface_instance *ecm_interface_pppoe_interface_establish(str
 	 * Add iface into the database, atomically to avoid races creating the same thing
 	 */
 	spin_lock_bh(&ecm_interface_lock);
-	ii = ecm_db_iface_find_and_ref_pppoe(type_info->pppoe_session_id, type_info->remote_mac);
+	ii = ecm_db_iface_find_and_ref_pppoe(type_info->pppoe_session_id, type_info->remote_mac, dev_interface_num);
 	if (ii) {
 		spin_unlock_bh(&ecm_interface_lock);
 		ecm_db_iface_deref(nii);
@@ -2892,7 +3282,7 @@ static struct ecm_db_iface_instance *ecm_interface_vxlan_interface_establish(str
 		/*
 		 * For VxLAN-GPE get the VNI from skb for outer flow and using route lookup for inner flow.
 		 */
-		if (!if_type) {
+		if (if_type == ECM_DB_IFACE_VXLAN_OUTER) {
 			vni = vxlan_hdr(skb)->vx_vni;
 		} else {
 			vni = ecm_interface_vxlan_gpe_get_vni_remote_ip_from_inner(dev, skb, NULL);
@@ -3271,6 +3661,9 @@ struct ecm_db_iface_instance *ecm_interface_establish_and_ref(struct ecm_front_e
 	int32_t interface_type __attribute__((unused));
 	union {
 		struct ecm_db_interface_info_ethernet ethernet;		/* type == ECM_DB_IFACE_TYPE_ETHERNET */
+#ifdef ECM_INTERFACE_DSA_ENABLE
+		struct ecm_db_interface_info_dsa dsa;			/* type == ECM_DB_IFACE_TYPE_DSA */
+#endif
 #ifdef ECM_INTERFACE_VLAN_ENABLE
 		struct ecm_db_interface_info_vlan vlan;			/* type == ECM_DB_IFACE_TYPE_VLAN */
 #endif
@@ -3371,7 +3764,6 @@ struct ecm_db_iface_instance *ecm_interface_establish_and_ref(struct ecm_front_e
 		/*
 		 * Ethernet - but what sub type?
 		 */
-
 #ifdef ECM_INTERFACE_VLAN_ENABLE
 		/*
 		 * VLAN?
@@ -3547,6 +3939,35 @@ struct ecm_db_iface_instance *ecm_interface_establish_and_ref(struct ecm_front_e
 		}
 #endif
 
+#ifdef ECM_INTERFACE_DSA_ENABLE
+		/*
+		 * DSA?
+		 */
+		if (dsa_slave_dev_check(dev)) {
+			struct dsa_port *dsa_port_from_dev = NULL;
+			struct net_device *master_dev = NULL;
+
+			/*
+			 * Copy the mac address
+			 */
+			ether_addr_copy(type_info.dsa.address, dev->dev_addr);
+			DEBUG_TRACE("%px: Net device: %px is DSA with mac: %pM\n", feci, dev, type_info.dsa.address);
+
+			/*
+			 * MTU check for master and slave interface
+			 */
+			dsa_port_from_dev = dsa_port_from_netdev(dev);
+			master_dev = dsa_port_from_dev->cpu_dp->master;
+			dev_mtu = dev->mtu > master_dev->mtu ? master_dev->mtu : dev->mtu;
+
+			/*
+			 * Establish this type of interface
+			 */
+			ii = ecm_interface_dsa_interface_establish(&type_info.dsa, dev_name, dev_interface_num, ae_interface_num, dev_mtu);
+			goto identifier_update;
+		}
+#endif
+
 		/*
 		 * ETHERNET!
 		 * Just plain ethernet it seems
@@ -3558,7 +3979,7 @@ struct ecm_db_iface_instance *ecm_interface_establish_and_ref(struct ecm_front_e
 		/*
 		 * Establish this type of interface
 		 */
-		ii = ecm_interface_ethernet_interface_establish(&type_info.ethernet, dev_name, dev_interface_num, ae_interface_num, dev_mtu);
+		ii = ecm_interface_ethernet_interface_establish(&type_info.ethernet, dev, ae_interface_num, dev_mtu);
 
 identifier_update:
 		if (ii) {
@@ -4354,6 +4775,14 @@ static uint32_t ecm_interface_multicast_heirarchy_construct_single(struct ecm_fr
 				}
 #endif
 
+#ifdef ECM_INTERFACE_DSA_ENABLE
+				if (dsa_slave_dev_check(dest_dev)) {
+					DEBUG_TRACE("%px: Net device: %px (%s) is DSA Interface.\n", feci, dest_dev, dest_dev->name);
+
+					break;
+				}
+#endif
+
 				/*
 				 * ETHERNET!
 				 * Just plain ethernet it seems.
@@ -4912,12 +5341,12 @@ EXPORT_SYMBOL(ecm_interface_multicast_heirarchy_construct_bridged);
  */
 static bool ecm_interface_multicast_get_next_node_mac_address(
 	ip_addr_t dest_addr, struct net_device *dest_dev, int ip_version,
-	uint8_t *mac_addr)
+	uint8_t *mac_addr, uint32_t skb_mark)
 {
 	bool on_link;
 	ip_addr_t gw_addr = ECM_IP_ADDR_NULL;
 
-	if (!ecm_interface_mac_addr_get(dest_addr, mac_addr, &on_link, gw_addr)) {
+	if (!ecm_interface_mac_addr_get(dest_addr, mac_addr, &on_link, gw_addr, skb_mark)) {
 		if (ip_version == 4) {
 			DEBUG_WARN("Unable to obtain MAC address for " ECM_IP_ADDR_DOT_FMT "\n",
 				ECM_IP_ADDR_TO_DOT(dest_addr));
@@ -4943,7 +5372,7 @@ static bool ecm_interface_multicast_get_next_node_mac_address(
  */
 static bool ecm_interface_get_next_node_mac_address(ip_addr_t dest_addr,
 					struct net_device *dest_dev,
-					int ip_version, uint8_t *mac_addr)
+					int ip_version, uint8_t *mac_addr, uint32_t skb_mark)
 {
 	ip_addr_t gw_addr = ECM_IP_ADDR_NULL;
 	bool on_link = true;
@@ -4962,7 +5391,7 @@ static bool ecm_interface_get_next_node_mac_address(ip_addr_t dest_addr,
 	 * If it fails, send the request with the current dest_addr or
 	 * found gateway address.
 	 */
-	if (ecm_interface_find_gateway(dest_addr, NULL, gw_addr)) {
+	if (ecm_interface_find_gateway(dest_addr, NULL, gw_addr, skb_mark)) {
 		on_link = false;
 		if (ecm_interface_mac_addr_get_no_route(dest_dev, gw_addr, mac_addr)) {
 			DEBUG_TRACE("Found the mac address for the gateway\n");
@@ -5203,8 +5632,12 @@ int32_t ecm_interface_heirarchy_construct(struct ecm_front_end_connection_instan
 				}
 			}
 		} else {
-			/* in non-tunnel case, if the dest_dev obtained is different than SKB routing decision, use SKB provided dev */
-			if(dest_dev != const_if) {
+			/*
+			 * In non-tunnel case, if the dest_dev obtained is different than
+			 *  SKB routing decision, use SKB provided dev
+			 */
+			DEBUG_TRACE("%px: non-tunnel case dest_dev:%s const_if:%s", feci, dest_dev->name, const_if->name);
+			if (dest_dev != const_if) {
 				dev_put(dest_dev);
 				dest_dev = const_if;
 				dev_hold(dest_dev);
@@ -5308,8 +5741,12 @@ int32_t ecm_interface_heirarchy_construct(struct ecm_front_end_connection_instan
 				}
 			}
 		} else {
-			/* in non-tunnel case, if the src_dev obtained is different than SKB routing decision, use SKB provided dev */
-			if(src_dev != other_if) {
+			/*
+			 * In non-tunnel case, if the src_dev obtained is different than
+			 * SKB routing decision, use SKB provided dev
+			 */
+			DEBUG_TRACE("%px: non-tunnel case src_dev:%s other_if:%s", feci, src_dev->name, other_if->name);
+			if (src_dev != other_if) {
 				dev_put(src_dev);
 				src_dev = other_if;
 				dev_hold(src_dev);
@@ -5430,15 +5867,33 @@ int32_t ecm_interface_heirarchy_construct(struct ecm_front_end_connection_instan
 	while (current_interface_index > 0) {
 		struct ecm_db_iface_instance *ii;
 		struct net_device *next_dev;
-		/*
-		 * Get the ecm db interface instance for the device at hand
-		 */
-		ii = ecm_interface_establish_and_ref(feci, dest_dev, skb);
 
+		/*
+		 * Check interface status before establishing interface
+		 */
 		if (!(dest_dev->flags & IFF_UP)) {
 			DEBUG_WARN("%px: dest interface(%s) is not up\n", feci, dest_dev->name);
 			goto done;
 		}
+
+#ifdef ECM_INTERFACE_SKIP_ACCEL_ENABLE
+		/*
+		 * Skip acceleration based on device name
+		 * We have the hierachy creation and we skip accel after
+		 * it is added in the ci to avoid hierachy creation for each packet.
+		 */
+		if (ecm_interface_lookup_in_denied_list(dest_dev->name)) {
+			DEBUG_INFO("%px: Acceleration is disable for interface: %s\n", feci, dest_dev->name);
+			spin_lock_bh(&feci->lock);
+			feci->can_accel = false;
+			spin_unlock_bh(&feci->lock);
+		}
+#endif
+
+		/*
+		 * Get the ecm db interface instance for the device at hand
+		 */
+		ii = ecm_interface_establish_and_ref(feci, dest_dev, skb);
 
 		/*
 		 * If the interface could not be established then we abort
@@ -5597,7 +6052,7 @@ int32_t ecm_interface_heirarchy_construct(struct ecm_front_end_connection_instan
 						}
 #endif
 
-						if (!ecm_interface_get_next_node_mac_address(look_up_addr, lookup_dev, ip_version, mac_addr)) {
+						if (!ecm_interface_get_next_node_mac_address(look_up_addr, lookup_dev, ip_version, mac_addr, skb->mark)) {
 							DEBUG_WARN("%px: Unable to find the host MAC address connected to the Linux bridge\n", feci);
 							goto done;
 						}
@@ -5645,7 +6100,7 @@ int32_t ecm_interface_heirarchy_construct(struct ecm_front_end_connection_instan
 						dev_put(tmp_dev);
 					}
 
-					if (!ecm_interface_get_next_node_mac_address(look_up_addr, dest_dev, ip_version, mac_addr)) {
+					if (!ecm_interface_get_next_node_mac_address(look_up_addr, dest_dev, ip_version, mac_addr, skb->mark)) {
 						DEBUG_WARN("%px: Unable to find the host MAC address connected to the OVS bridge\n", feci);
 						goto done;
 					}
@@ -5745,7 +6200,7 @@ int32_t ecm_interface_heirarchy_construct(struct ecm_front_end_connection_instan
 								/*
 								 * Try one more time with gateway ip address if it exists.
 								 */
-								if (!ecm_interface_find_gateway(dest_addr, NULL, gw_addr)) {
+								if (!ecm_interface_find_gateway(dest_addr, NULL, gw_addr, skb->mark)) {
 									goto lag_fail;
 								}
 
@@ -5827,6 +6282,13 @@ lag_success:
 				}
 #endif
 
+#ifdef ECM_INTERFACE_DSA_ENABLE
+				if (dsa_slave_dev_check(dest_dev)) {
+					DEBUG_TRACE("%px: Net device: %px (%s) is DSA Interface.\n", feci, dest_dev, dest_dev->name);
+
+					break;
+				}
+#endif
 				/*
 				 * ETHERNET!
 				 * Just plain ethernet it seems.
@@ -6139,6 +6601,11 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 	uint8_t next_dest_node_addr[ETH_ALEN] = {0};
 	struct net_device *bridge;
 	uint32_t serial = ecm_db_connection_serial_get(feci->ci);
+	uint32_t skb_mark = 0;
+
+	if (skb) {
+		skb_mark = skb->mark;
+	}
 
 	/*
 	 * Get a big endian of the IPv4 address we have been given as our starting point.
@@ -6169,7 +6636,7 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 	 */
 	from_local_addr = false;
 	if (is_routed) {
-		dest_dev = ecm_interface_dev_find_by_addr(dest_addr, &from_local_addr);
+		dest_dev = ecm_interface_dev_find_by_addr(dest_addr, &from_local_addr, skb->mark);
 		if (!dest_dev && given_dest_dev) {
 			/*
 			 * Fall back to any given
@@ -6184,7 +6651,7 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 		/*
 		 * Fall back to routed look up
 		 */
-		dest_dev = ecm_interface_dev_find_by_addr(dest_addr, &from_local_addr);
+		dest_dev = ecm_interface_dev_find_by_addr(dest_addr, &from_local_addr, skb->mark);
 	}
 
 	/*
@@ -6255,7 +6722,7 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 	 */
 	from_local_addr = false;
 	if (is_routed) {
-		src_dev = ecm_interface_dev_find_by_addr(src_addr, &from_local_addr);
+		src_dev = ecm_interface_dev_find_by_addr(src_addr, &from_local_addr, skb->mark);
 		if (!src_dev && given_src_dev) {
 			/*
 			 * Fall back to any given
@@ -6270,7 +6737,7 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 		/*
 		 * Fall back to routed look up
 		 */
-		src_dev = ecm_interface_dev_find_by_addr(src_addr, &from_local_addr);
+		src_dev = ecm_interface_dev_find_by_addr(src_addr, &from_local_addr, skb->mark);
 	}
 
 	/*
@@ -6381,6 +6848,29 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 	while (current_interface_index > 0) {
 		struct ecm_db_iface_instance *ii;
 		struct net_device *next_dev;
+
+		/*
+		 * Check interface status before establishing interface
+		 */
+		if (!(dest_dev->flags & IFF_UP)) {
+			DEBUG_WARN("%px: dest interface(%s) is not up\n", feci, dest_dev->name);
+			goto done;
+		}
+
+#ifdef ECM_INTERFACE_SKIP_ACCEL_ENABLE
+		/*
+		 * Skip acceleration based on device name
+		 * We have the heirachy creation and we skip accel after
+		 * it is added in the ci to avoid hierachy creation for each packet.
+		 */
+		if (ecm_interface_lookup_in_denied_list(dest_dev->name)) {
+			DEBUG_INFO("%px: Acceleration is disable for interface: %s\n", feci, dest_dev->name);
+			spin_lock_bh(&feci->lock);
+			feci->can_accel = false;
+			spin_unlock_bh(&feci->lock);
+		}
+#endif
+
 		/*
 		 * Get the ecm db interface instance for the device at hand
 		 */
@@ -6503,7 +6993,7 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 						ecm_db_connection_interfaces_deref(interfaces, current_interface_index);
 						return ECM_DB_IFACE_HEIRARCHY_MAX;
 					} else {
-						if (!ecm_interface_multicast_get_next_node_mac_address(next_dest_addr, dest_dev, ip_version, mac_addr)) {
+						if (!ecm_interface_multicast_get_next_node_mac_address(next_dest_addr, dest_dev, ip_version, mac_addr, skb_mark)) {
 							dev_put(src_dev);
 							dev_put(dest_dev);
 
@@ -6541,8 +7031,7 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 					 * Figure out which port device the skb will go to using the dest_addr.
 					 */
 					uint8_t mac_addr[ETH_ALEN];
-
-					if (!ecm_interface_multicast_get_next_node_mac_address(next_dest_addr, dest_dev, ip_version, mac_addr)) {
+					if (!ecm_interface_multicast_get_next_node_mac_address(next_dest_addr, dest_dev, ip_version, mac_addr, skb_mark)) {
 						dev_put(src_dev);
 						dev_put(dest_dev);
 
@@ -6629,7 +7118,7 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 							return ECM_DB_IFACE_HEIRARCHY_MAX;
 						} else {
 							if (!ecm_interface_mac_addr_get(dest_addr, dest_mac_addr,
-										&dest_on_link, dest_gw_addr)) {
+										&dest_on_link, dest_gw_addr, skb_mark)) {
 
 								/*
 								 * Find proper interfce from which to issue ARP
@@ -6900,6 +7389,7 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 
 	DEBUG_WARN("Too many interfaces: %d\n", current_interface_index);
 	DEBUG_ASSERT(current_interface_index == 0, "Bad logic handling current_interface_index: %d\n", current_interface_index);
+done:
 	dev_put(src_dev);
 	dev_put(dest_dev);
 
@@ -7138,6 +7628,29 @@ skip_bridge_refresh:
 			stats.tx_bytes = tx_bytes;
 			DEBUG_INFO("vlan call to update status:rx pkt:%u tx pkt:%u", rx_packets, tx_packets);
 			__vlan_dev_update_accel_stats(dev, &stats);
+			dev_put(dev);
+			continue;
+#endif
+
+#ifdef ECM_INTERFACE_DSA_ENABLE
+		case ECM_DB_IFACE_TYPE_DSA:
+			DEBUG_INFO("DSA\n");
+			/*
+			 * Update DSA device with stats from SFE AE only when
+			 * SFE's l2_feature_support is enabled.
+			 */
+			if (ci->feci->accel_engine == ECM_FRONT_END_ENGINE_SFE) {
+				if (!(stats_bitmap & BIT(ECM_DB_IFACE_TYPE_DSA))) {
+					dev_put(dev);
+					continue;
+				}
+			}
+			stats.rx_packets = rx_packets;
+			stats.rx_bytes = rx_bytes;
+			stats.tx_packets = tx_packets;
+			stats.tx_bytes = tx_bytes;
+			DEBUG_INFO("DSA call to update status:rx pkt:%u tx pkt:%u", rx_packets, tx_packets);
+			__dsa_dev_update_accel_stats(dev, &stats);
 			dev_put(dev);
 			continue;
 #endif
@@ -7808,12 +8321,17 @@ static int ecm_interface_netdev_notifier_callback(struct notifier_block *this, u
 		break;
 
 	case NETDEV_UNREGISTER:
+		DEBUG_INFO("Net device: %px, NETDEV_UNREGISTER %s \n", dev, dev->name);
+		if (dev->ieee80211_ptr) {
+			ecm_interface_remove_nf_hookfn_entry_and_unregister(dev, ecm_interface_wlan_egress_netdev_hookfn);
+		}
+
 #ifdef ECM_INTERFACE_VXLAN_ENABLE
 		/*
-		 * 'ppe_vxlan_tun' is the name of the dummy or the child netdevice.
+		 * 'ppe_vxlantun' is the name of the dummy or the child netdevice.
 		 * pdev is the Linux netdevice or parent netdevice.
 		 */
-		if (unlikely(!strncmp(dev->name, "ppe_vxlan_tun", 13))) {
+		if (unlikely(!strncmp(dev->name, "ppe_vxlantun", 12))) {
 			int ifindex;
 			struct net_device *pdev;
 
@@ -7827,6 +8345,7 @@ static int ecm_interface_netdev_notifier_callback(struct notifier_block *this, u
 			ecm_interface_dev_defunct_connections(pdev);
 			DEBUG_INFO("Net device:%px, NETDEV_UNREGISTER dev: %s pdev: %s\n", dev, dev->name, pdev->name);
 			dev_put(pdev);
+			break;
 		}
 #endif
 		DEBUG_INFO("Net device: %px, NETDEV_UNREGISTER \n", dev);
@@ -7840,6 +8359,12 @@ static int ecm_interface_netdev_notifier_callback(struct notifier_block *this, u
 		}
 		break;
 
+	case NETDEV_REGISTER:
+		DEBUG_INFO("Net device: %px, NETDEV_UP %s \n", dev, dev->name);
+		if (dev->ieee80211_ptr) {
+			ecm_interface_add_nf_hookfn_entry_and_register(dev, ecm_interface_wlan_egress_netdev_hookfn);
+		}
+		break;
 	default:
 		DEBUG_TRACE("Net device: %px, UNHANDLED: %lx\n", dev, event);
 		break;
@@ -7886,11 +8411,6 @@ void ecm_interface_node_connections_defunct_by_type(uint8_t *mac, int ip_version
 					ecm_db_traverse_node_connection_list_and_defunct(ni, dir, ip_version, type);
 				}
 			}
-			/*
-			 * node was found and connections are destroyed, we are done.
-			 */
-			ecm_db_node_deref(ni);
-			break;
 		}
 
 		/*
@@ -7909,6 +8429,27 @@ void ecm_interface_node_connections_defunct_by_type(uint8_t *mac, int ip_version
 	ecm_front_end_ipv6_stop_temp(0);
 #endif
 }
+EXPORT_SYMBOL(ecm_interface_node_connections_defunct_by_type);
+
+/*
+ * ecm_interface_node_connections_defunct_by_type_sta_join()
+ *	Defunct by the type -  station join
+ */
+void ecm_interface_node_connections_defunct_by_type_sta_join(uint8_t *mac)
+{
+	ecm_interface_node_connections_defunct_by_type(mac, ECM_DB_IP_VERSION_IGNORE, ECM_DB_CONNECTION_DEFUNCT_TYPE_STA_JOIN);
+}
+EXPORT_SYMBOL(ecm_interface_node_connections_defunct_by_type_sta_join);
+
+/*
+ * ecm_interface_defunct_qm_connections()
+ *	Defunct the connections with qm type and qm id
+ */
+void ecm_interface_defunct_qm_connections(uint8_t *mac, uint8_t wifi_qm_type, uint8_t wifi_qm_id)
+{
+	ecm_db_node_defunct_qm_connections(mac, wifi_qm_type, wifi_qm_id);
+}
+EXPORT_SYMBOL(ecm_interface_defunct_qm_connections);
 
 /*
  * ecm_interface_node_connections_defunct()
@@ -7918,6 +8459,17 @@ void ecm_interface_node_connections_defunct(uint8_t *mac, int ip_version)
 {
 	ecm_interface_node_connections_defunct_by_type(mac, ip_version, ECM_DB_CONNECTION_DEFUNCT_TYPE_IGNORE);
 }
+EXPORT_SYMBOL(ecm_interface_node_connections_defunct);
+
+/*
+ * ecm_interface_node_connections_defunct_by_mac_addr()
+ *	Defunct the connections on this node by mac addr.
+ */
+void ecm_interface_node_connections_defunct_by_mac_addr(uint8_t *mac)
+{
+	ecm_interface_node_connections_defunct_by_type(mac, ECM_DB_IP_VERSION_IGNORE, ECM_DB_CONNECTION_DEFUNCT_TYPE_IGNORE);
+}
+EXPORT_SYMBOL(ecm_interface_node_connections_defunct_by_mac_addr);
 
 /*
  * struct notifier_block ecm_interface_netdev_notifier
@@ -8340,668 +8892,6 @@ static struct notifier_block ecm_interface_neigh_mac_update_nb = {
 };
 #endif
 
-/*
- * ecm_interface_wifi_event_rx()
- *	Receive netlink message from socket
- */
-static int ecm_interface_wifi_event_rx(struct socket *sock, struct sockaddr_nl *addr, unsigned char *buf, int len)
-{
-	struct msghdr msg;
-	struct kvec iov;
-
-	iov.iov_base = buf;
-	iov.iov_len  = len;
-
-	msg.msg_flags = 0;
-	msg.msg_name  = addr;
-	msg.msg_namelen = sizeof(struct sockaddr_nl);
-	msg.msg_control = NULL;
-	msg.msg_controllen = 0;
-
-	return kernel_recvmsg(sock, &msg, &iov, 1, len, msg.msg_flags);
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
-/*
- * ecm_interface_wifi_process_link_events()
- *	Parse and process link add / delete events received from Wi-Fi.
- */
-void ecm_interface_wifi_process_link_events(struct nlmsghdr *nlh, int cmd)
-{
-	struct nlattr **tb = NULL;
-	uint8_t mac[ETH_ALEN];
-	int res;
-
-	if (nlh->nlmsg_len < nlmsg_msg_size(GENL_HDRLEN)) {
-		DEBUG_WARN("%px: Invalid NL response message header length \n", nlh);
-		return;
-	}
-
-	tb = (struct nlattr **)kzalloc((sizeof(struct nlattr *) * (NL80211_ATTR_MAX + 1)), GFP_ATOMIC | __GFP_NOWARN);
-	if (!tb) {
-		DEBUG_WARN("%px: Not able to allocate array to parse the events \n", nlh);
-		return;
-	}
-
-	/*
-	 * Parse the event coming from Wi-Fi.
-	 */
-	res = nla_parse(tb, NL80211_ATTR_MAX, nlmsg_attrdata(nlh, GENL_HDRLEN),
-			nlmsg_attrlen(nlh, GENL_HDRLEN), NULL, NULL);
-
-	if (res < 0) {
-		DEBUG_WARN("%px: Error in parsing the Wi-Fi event \n", nlh);
-		kfree(tb);
-		return;
-	}
-
-	/*
-	 * Get the MAC address of the peer and process the event.
-	 */
-	if (tb[NL80211_ATTR_MAC]) {
-		memcpy(mac, nla_data(tb[NL80211_ATTR_MAC]), ETH_ALEN);
-
-		if (cmd == NL80211_CMD_NEW_STATION) {
-			DEBUG_INFO("STA %pM joining\n", (uint8_t *)mac);
-			ecm_interface_node_connections_defunct_by_type((uint8_t *)mac, ECM_DB_IP_VERSION_IGNORE,
-									ECM_DB_CONNECTION_DEFUNCT_TYPE_STA_JOIN);
-		}
-
-		if (cmd == NL80211_CMD_DEL_STATION) {
-			DEBUG_INFO("STA %pM leaving\n", (uint8_t *)mac);
-			ecm_interface_node_connections_defunct((uint8_t *)mac, ECM_DB_IP_VERSION_IGNORE);
-		}
-	}
-
-	kfree(tb);
-}
-
-/*
- * ecm_interface_wifi_event_handler()
- *	Netlink event handler
- */
-static int ecm_interface_wifi_event_handler(void *buf, int len)
-{
-	struct nlmsghdr *nlh;
-	struct genlmsghdr *hdr;
-	int left;
-
-	nlh = (struct nlmsghdr *) buf;
-	left = len;
-
-	/*
-	 * Check the command type and parse the message accordingly.
-	 */
-	while (NLMSG_OK(nlh, left)) {
-		hdr = NLMSG_DATA(nlh);
-
-		switch (hdr->cmd) {
-		case NL80211_CMD_NEW_STATION:
-		case NL80211_CMD_DEL_STATION:
-			ecm_interface_wifi_process_link_events(nlh, hdr->cmd);
-			break;
-		}
-
-		nlh = NLMSG_NEXT(nlh, left);
-	}
-
-	return 0;
-}
-
-/*
- * ecm_interface_parse_genl_ctrl_response()
- *	Parse the generic control family response message and
- *	get the multicast id of MLME multicast group of nl80211 family.
- */
-int ecm_interface_parse_genl_ctrl_response(struct nlmsghdr *nlh)
-{
-	struct nlattr *tb[CTRL_ATTR_MAX+1];
-	struct nlattr *mcgrp;
-	char data[16];
-	int family_id;
-	int res = -1;
-	int i;
-
-	if (nlh->nlmsg_len < nlmsg_msg_size(GENL_HDRLEN)) {
-		DEBUG_WARN("%px: Invalid NL response message header length \n", nlh);
-		return res;
-	}
-
-	res = nla_parse(tb, CTRL_ATTR_MAX, nlmsg_attrdata(nlh, GENL_HDRLEN),
-			nlmsg_attrlen(nlh, GENL_HDRLEN), NULL, NULL);
-	if (res < 0) {
-		DEBUG_WARN("%px: Error in parsing NL message %d err\n", nlh, res);
-		return res;
-	}
-
-	/*
-	 * Get the family ID for nl80211 family.
-	 */
-	if (!tb[CTRL_ATTR_FAMILY_ID]) {
-		DEBUG_INFO("%px: Failed to get the family ID of nl80211 \n", nlh);
-		return -1;
-	}
-
-	if (!tb[CTRL_ATTR_MCAST_GROUPS]) {
-		DEBUG_WARN("%px: Failed to fetch the multicast groups \n", nlh);
-		return -1;
-	}
-
-	/*
-	 * Parse the multicast groups and get the ID of MLME group.
-	 */
-	family_id = nla_get_u16(tb[CTRL_ATTR_FAMILY_ID]);
-	nla_for_each_nested(mcgrp, tb[CTRL_ATTR_MCAST_GROUPS], i) {
-		struct nlattr *tb2[CTRL_ATTR_MCAST_GRP_MAX + 1];
-
-		res = nla_parse(tb2, CTRL_ATTR_MCAST_GRP_MAX, (struct nlattr *)nla_data(mcgrp), nla_len(mcgrp), NULL, NULL);
-		if (res < 0) {
-			DEBUG_WARN("%px: Error in parsing NL message multicast group %d res\n", nlh, res);
-			return res;
-		}
-
-		/*
-		 * Look for MLME multicast group and get the ID.
-		 */
-		if (tb2[CTRL_ATTR_MCAST_GRP_NAME]) {
-			nla_strscpy(data, tb2[CTRL_ATTR_MCAST_GRP_NAME], sizeof(data));
-			if (strcmp(data, "mlme") == 0) {
-				if (tb2[CTRL_ATTR_MCAST_GRP_ID]) {
-					res = nla_get_u32(tb2[CTRL_ATTR_MCAST_GRP_ID]);
-					DEBUG_INFO("%px: Successfully fetched the MLME group ID %d family ID %d\n", nlh, res, family_id);
-					return res;
-				}
-			}
-		}
-	};
-
-	DEBUG_WARN("%px: Failed to get the MLME group from ctrl msg response \n", nlh);
-	return -1;
-}
-
-/*
- * ecm_interface_construct_nl_message()
- *	Construct a message to generic control family to resolve the
- *	nl80211 multicast groups.
- */
-struct nlmsghdr *ecm_interface_construct_nl_message(void)
-{
-	int flags = GFP_ATOMIC;
-	struct sk_buff *skb;
-	struct nlmsghdr *nlh;
-	struct genlmsghdr *ghdr;
-	int res = 0;
-
-	/*
-	 * Allocate a genl message structure to send a resolution
-	 * request to generic control family.
-	 */
-	skb = genlmsg_new(NLMSG_DEFAULT_SIZE, flags);
-	if (!skb) {
-		DEBUG_WARN("Not enough space to allocate genl message !\n");
-		return NULL;
-	}
-
-	/*
-	 * Construct the nl header with command addressing to control
-	 * family.
-	 */
-	nlh = nlmsg_put(skb, 0, 0, GENL_ID_CTRL, GENL_HDRLEN, 0);
-	if (!nlh) {
-		DEBUG_WARN("%px: Error in constructing nl header !\n", skb);
-		nlmsg_free(skb);
-		return NULL;
-	}
-
-	/*
-	 * Construct the genl header.
-	 */
-	nlh->nlmsg_flags |= NLM_F_REQUEST;
-
-	ghdr = nlmsg_data(nlh);
-	ghdr->cmd = CTRL_CMD_GETFAMILY;
-	ghdr->version = 1;
-	ghdr->reserved = 0;
-
-	/*
-	 * Add the family name attribute that ECM wants to resolve.
-	 */
-	res = nla_put_string(skb, CTRL_ATTR_FAMILY_NAME, "nl80211");
-	if (res) {
-		DEBUG_WARN("%px: Failed to put family name attribute \n", skb);
-		goto err;
-	}
-
-	nlh->nlmsg_len = skb->len;
-
-	return nlh;
-err:
-	genlmsg_cancel(skb, ghdr);
-	nlmsg_free(skb);
-
-	return NULL;
-}
-
-/*
- * ecm_interface_resolve_nl80211_family()
- *	Resolve the nl80211 family multicast groups to
- *	receive Wi-Fi specific events.
- */
-int ecm_interface_resolve_nl80211_family(struct socket *sock, struct sockaddr_nl *addr)
-{
-	struct nlmsghdr *nlh;
-	struct kvec iov = {0};
-	struct msghdr mhdr = {0};
-	unsigned char *buf;
-	int mc_group_id = ECM_INTERFACE_NL80211_MC_GROUP_INVALID_ID;
-	int len = ECM_INTERFACE_GENEL_MESSAGE_SIZE;
-	int ret = -1;
-	int size = 0;
-
-	/*
-	 * Construct the NL message to generic control family to resolve the
-	 * nl80211 multicast groups.
-	 */
-	nlh = (struct nlmsghdr *)ecm_interface_construct_nl_message();
-	if (!nlh) {
-		DEBUG_WARN("%px: Failed to construct the NL message\n", sock);
-		return ret;
-	}
-
-	/*
-	 * Fill the message buffer and send the control message.
-	 */
-	iov.iov_base = (void *) nlh;
-	iov.iov_len = nlh->nlmsg_len;
-
-	mhdr.msg_name = 0;
-	mhdr.msg_namelen = 0;
-
-	iov_iter_kvec(&mhdr.msg_iter, WRITE, &iov, 1, iov.iov_len);
-
-	ret = sock_sendmsg(sock, &mhdr);
-	if (ret < 0) {
-		DEBUG_WARN("%px: Failed to send the NL ctrl message\n", sock);
-		return ret;
-	}
-
-	/*
-	 * Allocate a buffer to receive the reply message from
-	 * generic control family having information about the
-	 * multicast groups of nl80211.
-	 */
-	buf = (char *)kzalloc(len, GFP_ATOMIC | __GFP_NOWARN);
-	if (!buf) {
-		DEBUG_WARN("%px: Failed to allocate a buffer to receive message!\n", sock);
-		return -1;
-	}
-
-	size = ecm_interface_wifi_event_rx(sock, addr, buf, len);
-	if (size < 0) {
-		DEBUG_WARN("%px: Netlink RX error !\n", sock);
-		kfree(buf);
-		return size;
-	}
-
-	/*
-	 * Parse the NL message response received from kernel.
-	 * This has all the information about the family, its multicast groups,
-	 * callbacks etc.
-	 */
-	nlh = (struct nlmsghdr *)buf;
-	while (NLMSG_OK(nlh, size)) {
-		DEBUG_INFO("%px: Received an NL response, length %d type %d\n", nlh, nlh->nlmsg_len, nlh->nlmsg_type);
-		mc_group_id = ecm_interface_parse_genl_ctrl_response(nlh);
-		if (mc_group_id < 0) {
-			DEBUG_WARN("%px: Failed to parse the multicast group message %d\n", sock, mc_group_id);
-			kfree(buf);
-			return mc_group_id;
-		}
-
-		nlh = NLMSG_NEXT(nlh, size);
-	}
-
-	/*
-	 * Release the buffer allocated for receiving the message.
-	 */
-	kfree(buf);
-
-	/*
-	 * Add this socket as a memeber to the MLME multicast group of the
-	 * nl80211 family.
-	 */
-	if (mc_group_id != ECM_INTERFACE_NL80211_MC_GROUP_INVALID_ID) {
-		ret = sock->ops->setsockopt(sock, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, KERNEL_SOCKPTR((void *)&mc_group_id), sizeof(mc_group_id));
-		if (ret < 0) {
-			DEBUG_WARN("%px: Failed to set the multicast membership %d ret %d\n", sock, mc_group_id, ret);
-			return ret;
-		}
-
-		DEBUG_INFO("%px: Adding a this sokcet as a member to NL80211 MLME multicast group %d \n", sock, mc_group_id);
-	}
-
-	return 0;
-}
-
-/*
- * ecm_interface_wifi_event_thread()
- */
-static void ecm_interface_wifi_event_thread(void)
-{
-	int err;
-	int size;
-	struct sockaddr_nl saddr;
-	unsigned char *buf;
-	int len = ECM_INTERFACE_GENEL_MESSAGE_SIZE;
-
-	kernel_sigaction(SIGKILL, SIG_DFL);
-
-	/*
-	 * Create a socket to listen to the events coming from nl80211 family.
-	 */
-	err = sock_create(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC, &__ewn.sock);
-	if (err < 0) {
-		DEBUG_ERROR("failed to create sock err %d\n", err);
-		goto exit1;
-	}
-
-	memset(&saddr, 0, sizeof(saddr));
-	saddr.nl_family = AF_NETLINK;
-	saddr.nl_pid    = current->pid;
-
-	err = __ewn.sock->ops->bind(__ewn.sock, (struct sockaddr *)&saddr, sizeof(struct sockaddr));
-	if (err < 0) {
-		DEBUG_ERROR("failed to bind sock err %d\n", err);
-		goto exit2;
-	}
-
-	/*
-	 * ECM is supposed to listen to the multicast events sent from the nl80211 family.
-	 * So resolve the family and the multicast event.
-	 */
-	err = ecm_interface_resolve_nl80211_family(__ewn.sock, &saddr);
-	if (err < 0) {
-		DEBUG_ERROR("Failed to resolve the nl80211 generic netlink family err %d\n", err);
-		goto exit2;
-	}
-
-	buf = (char *)kzalloc(len, GFP_ATOMIC | __GFP_NOWARN);
-	if (!buf) {
-		DEBUG_ERROR("Failed to allocate the buffer %d\n", err);
-		goto exit2;
-	}
-
-	/*
-	 * Start listening to the Wi-Fi events.
-	 */
-	DEBUG_INFO("ecm_interface_wifi_event thread started\n");
-	while (!kthread_should_stop()) {
-		size = ecm_interface_wifi_event_rx(__ewn.sock, &saddr, buf, len);
-		DEBUG_TRACE("got a netlink msg with len %d\n", size);
-
-		if (signal_pending(current))
-			break;
-
-		if (size < 0) {
-			DEBUG_WARN("netlink rx error\n");
-		} else {
-			ecm_interface_wifi_event_handler((void *)buf, size);
-		}
-	}
-
-	kfree(buf);
-	DEBUG_INFO("ecm_interface_wifi_event thread stopped\n");
-exit2:
-	sock_release(__ewn.sock);
-exit1:
-	__ewn.sock = NULL;
-}
-
-#else
-/*
- * ecm_interface_wifi_event_iwevent()
- *	wireless event handler
- */
-static int ecm_interface_wifi_event_iwevent(int ifindex, unsigned char *buf, size_t len)
-{
-	struct iw_event iwe_buf, *iwe = &iwe_buf;
-	char *pos, *end, *custom, *dpos;
-	int dlen;
-	void *dbuf;
-	struct ecm_interface_wifi_event_node_authorized *wifi_ev_au;
-
-	pos = buf;
-	end = buf + len;
-	while (pos + IW_EV_LCP_LEN <= end) {
-
-		/*
-		 * Copy the base data structure to get iwe->len
-		 */
-		memcpy(&iwe_buf, pos, IW_EV_LCP_LEN);
-
-		/*
-		 * Check that len is valid and that we have that much in the buffer.
-		 */
-		if (iwe->len < IW_EV_LCP_LEN) {
-			return -1;
-		}
-
-		/*
-		 * Check for any custom events like STA authorized.
-		 */
-		custom = pos + IW_EV_POINT_LEN;
-		if (iwe->cmd == IWEVCUSTOM) {
-			dpos = (char *)&iwe_buf.u.data.length;
-			dlen = dpos - (char *)&iwe_buf;
-
-			memcpy(dpos, pos + IW_EV_LCP_LEN, sizeof(struct iw_event) - dlen);
-
-			if (custom + iwe->u.data.length > end) {
-				DEBUG_WARN("Invalid buffer length received in the event iwe->u.data.length %d\n", iwe->u.data.length);
-				return -1;
-			}
-
-			/*
-			 * Check the flags of iw event if it indicates the IW authorized signal.
-			 */
-			if (iwe->u.data.flags == ECM_INTERFACE_WIFI_EVENT_NODE_AUTH) {
-				dbuf = kzalloc((iwe->u.data.length + 1), GFP_KERNEL);
-				if (!dbuf) {
-					DEBUG_WARN("Failed to allocated a buffer to process the custom event");
-					return -1;
-				}
-
-				/*
-				 * Copy the user content of custom event to extract information.
-				 */
-				memset(dbuf, 0, iwe->u.data.length);
-				memcpy(dbuf, custom, iwe->u.data.length);
-
-				wifi_ev_au = (struct ecm_interface_wifi_event_node_authorized *)dbuf;
-
-				DEBUG_INFO("STA %pM is authorized \n", (uint8_t *)wifi_ev_au->mac_addr);
-				ecm_interface_node_connections_defunct_by_type((uint8_t *)wifi_ev_au->mac_addr, ECM_DB_IP_VERSION_IGNORE, ECM_DB_CONNECTION_DEFUNCT_TYPE_STA_JOIN);
-
-				kfree(dbuf);
-			}
-
-			return 0;
-		}
-
-		if ((iwe->len > sizeof(struct iw_event)) || (iwe->len + pos) > end) {
-			return -1;
-		}
-
-		/*
-		 * Do the copy again with the full length.
-		 */
-		memcpy(&iwe_buf, pos, iwe->len);
-
-		if (iwe->cmd == IWEVEXPIRED) {
-			DEBUG_INFO("STA %pM leaving\n", (uint8_t *)iwe->u.addr.sa_data);
-			ecm_interface_node_connections_defunct((uint8_t *)iwe->u.addr.sa_data, ECM_DB_IP_VERSION_IGNORE);
-		} else {
-			DEBUG_INFO("iwe->cmd is %d for STA %pM\n", iwe->cmd, (unsigned char *) iwe->u.addr.sa_data);
-		}
-
-		pos += iwe->len;
-	}
-
-	return 0;
-}
-
-/*
- * ecm_interface_wifi_event_newlink()
- *	Link event handler
- */
-static int ecm_interface_wifi_event_newlink(struct ifinfomsg *ifi, unsigned char *buf, size_t len)
-{
-	struct rtattr *attr;
-	int attrlen, rta_len;
-
-	DEBUG_TRACE("Event from interface %d\n", ifi->ifi_index);
-
-	attrlen = len;
-	attr = (struct rtattr *) buf;
-	rta_len = RTA_ALIGN(sizeof(struct rtattr));
-
-	while (RTA_OK(attr, attrlen)) {
-		if (attr->rta_type == IFLA_WIRELESS) {
-			ecm_interface_wifi_event_iwevent(ifi->ifi_index, ((char *) attr) + rta_len, attr->rta_len - rta_len);
-		}
-		attr = RTA_NEXT(attr, attrlen);
-	}
-
-	return 0;
-}
-
-/*
- * ecm_interface_wifi_event_handler()
- *	Netlink event handler
- */
-static int ecm_interface_wifi_event_handler(void *buf, int len)
-{
-	struct nlmsghdr *nlh;
-	struct ifinfomsg *ifi;
-	int left;
-
-	nlh = (struct nlmsghdr *) buf;
-	left = len;
-
-	while (NLMSG_OK(nlh, left)) {
-		switch (nlh->nlmsg_type) {
-		case RTM_NEWLINK:
-		case RTM_DELLINK:
-			if (NLMSG_PAYLOAD(nlh, 0) < sizeof(struct ifinfomsg)) {
-				DEBUG_INFO("invalid netlink message\n");
-				break;
-			}
-
-			ifi = NLMSG_DATA(nlh);
-			DEBUG_INFO("ifi->ifi_family: %d\n", ifi->ifi_family);
-			if (ifi->ifi_family != AF_BRIDGE) {
-				ecm_interface_wifi_event_newlink(ifi, (u8 *)ifi + NLMSG_ALIGN(sizeof(struct ifinfomsg)),
-					NLMSG_PAYLOAD(nlh, sizeof(struct ifinfomsg)));
-			}
-			break;
-		}
-
-		nlh = NLMSG_NEXT(nlh, left);
-	}
-
-	return 0;
-}
-
-/*
- * ecm_interface_wifi_event_thread()
- */
-static void ecm_interface_wifi_event_thread(void)
-{
-	int err;
-	int size;
-	struct sockaddr_nl saddr;
-	unsigned char buf[512];
-	int len = sizeof(buf);
-
-	kernel_sigaction(SIGKILL, SIG_DFL);
-	err = sock_create(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE, &__ewn.sock);
-	if (err < 0) {
-		DEBUG_ERROR("failed to create sock\n");
-		goto exit1;
-	}
-
-	memset(&saddr, 0, sizeof(saddr));
-	saddr.nl_family = AF_NETLINK;
-	saddr.nl_groups = RTNLGRP_LINK;
-	saddr.nl_pid    = current->pid;
-
-	err = __ewn.sock->ops->bind(__ewn.sock, (struct sockaddr *)&saddr, sizeof(struct sockaddr));
-	if (err < 0) {
-		DEBUG_ERROR("failed to bind sock\n");
-		goto exit2;
-	}
-
-	DEBUG_INFO("ecm_interface_wifi_event thread started\n");
-	while (!kthread_should_stop()) {
-		size = ecm_interface_wifi_event_rx(__ewn.sock, &saddr, buf, len);
-		DEBUG_TRACE("got a netlink msg with len %d\n", size);
-
-		if (signal_pending(current))
-			break;
-
-		if (size < 0) {
-			DEBUG_WARN("netlink rx error\n");
-		} else {
-			ecm_interface_wifi_event_handler((void *)buf, size);
-		}
-	}
-
-	DEBUG_INFO("ecm_interface_wifi_event thread stopped\n");
-exit2:
-	sock_release(__ewn.sock);
-exit1:
-	__ewn.sock = NULL;
-}
-#endif
-
-/*
- * ecm_interface_wifi_event_start()
- */
-int ecm_interface_wifi_event_start(void)
-{
-	if (__ewn.thread) {
-		return 0;
-	}
-
-	__ewn.thread = kthread_run((void *)ecm_interface_wifi_event_thread, NULL, "ECM_wifi_event");
-	if (IS_ERR(__ewn.thread)) {
-		DEBUG_ERROR("Unable to start kernel thread\n");
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-
-/*
- * ecm_interface_wifi_event_stop()
- */
-int ecm_interface_wifi_event_stop(void)
-{
-	int err;
-
-	if (__ewn.thread == NULL || __ewn.sock == NULL) {
-		return 0;
-	}
-
-	DEBUG_INFO("kill ecm_interface_wifi_event thread\n");
-
-	send_sig(SIGKILL, __ewn.thread, 1);
-	err = kthread_stop(__ewn.thread);
-	__ewn.thread = NULL;
-
-	return err;
-}
-
 #if defined(CONFIG_NET_CLS_ACT) && defined(ECM_CLASSIFIER_DSCP_IGS)
 /*
  * ecm_interface_igs_enabled_handler()
@@ -9086,6 +8976,368 @@ static int ecm_interface_src_check_handler(struct ctl_table *ctl, int write, voi
 }
 
 /*
+ * ecm_interface_src_check_no_flush_handler()
+ *	Source interface check no flush sysctl node handler.
+ */
+static int ecm_interface_src_check_no_flush_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	/*
+	 * Write the variable with user input
+	 */
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	/*
+	 * TODO: Add a front end feature check for this flag.
+	 * Currently only SFE supports this feature.
+	 */
+	DEBUG_TRACE("Source interface check no flush value = %d\n", ecm_interface_src_check_no_flush);
+	return ret;
+}
+
+/*
+ * ecm_interface_mwan3_enable_handler()
+ *	 mwan3 enable check sysctl node handler.
+ */
+static int ecm_interface_mwan3_enable_handler(struct ctl_table *ctl, int write, void __user *buffer,
+		 size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_value;
+
+	/*
+	 * Take the current value
+	 */
+	current_value = ecm_interface_mwan3_enable;
+
+	/*
+	 * Write the variable with user input
+	 */
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if ((ecm_interface_mwan3_enable != 1) && (ecm_interface_mwan3_enable != 0)) {
+		DEBUG_WARN("Invalid input. Valid values 0/1\n");
+		ecm_interface_mwan3_enable = current_value;
+		return -EINVAL;
+	}
+	return 0;
+}
+#ifdef ECM_INTERFACE_SKIP_ACCEL_ENABLE
+/*
+ * ecm_interface_accel_denied_read()
+ * 	Reads the denied interface name from the denied hash list and prints
+ */
+static int ecm_interface_accel_denied_read(void *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct hlist_node *pnode;
+	size_t bytes = 0;
+	char *read_buf;
+	int i, len;
+
+	if (!atomic_read(&ecm_interface_accel_denied_list_count)) {
+		DEBUG_ERROR("no interface present in denied list\n");
+		return -EINVAL;
+	}
+
+	read_buf = kzalloc(ECM_INTERFACE_ACCEL_DENIED_DEVICE_HTABLE_SIZE * 16 *sizeof(char), GFP_KERNEL);
+	if (!read_buf) {
+		DEBUG_ERROR("Failed to allocate buffer for interface array \n");
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < ECM_INTERFACE_ACCEL_DENIED_DEVICE_HTABLE_SIZE; i++) {
+		hlist_for_each(pnode, &ecm_interface_accel_denied_list[i]) {
+			struct ecm_interface_denied_node *p = hlist_entry(pnode, struct ecm_interface_denied_node, hnode);
+
+			if (!p) {
+				DEBUG_ERROR("No entry on the given hash\n");
+				continue;
+			}
+
+			len = scnprintf(read_buf + bytes, 16, "%s ", p->name);
+			if (!len) {
+				DEBUG_ERROR("Failed to format device name = %s\n", p->name);
+				kfree(read_buf);
+				return -EINVAL;
+			}
+			bytes += len;
+		}
+	}
+
+	len = scnprintf(read_buf + bytes, 4, "\n");
+	bytes += len;
+	bytes = memory_read_from_buffer(buffer, *lenp, ppos, read_buf, bytes);
+	*lenp = bytes;
+
+	kfree(read_buf);
+	return 0;
+}
+
+/*
+ * ecm_interface_accel_denied_handler()
+ * 	Proc handler function for denied devices read/write operation.
+ */
+static int ecm_interface_accel_denied_handler(int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	char *buf, *pfree, *token;
+	int count;
+
+	if (!write) {
+		return ecm_interface_accel_denied_read(buffer, lenp, ppos);
+	}
+
+	/*
+	 * Allocate buffer to hold up to 16 interfaces
+	 * Assuming each interfaces have 16 bytes each
+	 */
+	buf = kzalloc((ECM_INTERFACE_ACCEL_DENIED_DEVICE_HTABLE_SIZE * 8) * sizeof(char), GFP_KERNEL);
+	if (!buf) {
+		DEBUG_ERROR("Failed to allocate buffer for write operation\n");
+		return -ENOMEM;
+	}
+
+	pfree = buf;
+	count = *lenp;
+
+	if (count > (ECM_INTERFACE_ACCEL_DENIED_DEVICE_HTABLE_SIZE * 8 * sizeof(char))) {
+		DEBUG_ERROR("maximum length supported is 256\n");
+		kfree(pfree);
+		return -EINVAL;
+	}
+
+	memcpy(buf, buffer, count);
+	*lenp = count;
+	*ppos += count;
+
+	token = strsep(&buf, " ");
+	if (strlen(token) != 3) {
+		DEBUG_ERROR("cmd: echo \"add/del eth1 eth2\" > /proc/sys/net/ecm/interface_denied_list\n");
+		kfree(pfree);
+		return -EINVAL;
+	}
+
+	if (!strncmp(token, "add", 3)) {
+		while ((token = strsep(&buf, " ")) != NULL) {
+			struct ecm_interface_denied_node *p;
+			struct net_device *dev_to_defunct;
+			char *newline;
+			uint32_t hash;
+			int token_len;
+
+			p = kzalloc(sizeof(struct ecm_interface_denied_node), GFP_KERNEL);
+			if (!p) {
+				DEBUG_ERROR("unable to allocate the memory for interface %s\n", token);
+				kfree(pfree);
+				return -ENOMEM;
+			}
+
+			/*
+			 * Strip newline characters from the token
+			 * Required for last string in the list.
+			 */
+			newline = strchr(token, '\n');
+			if (newline) {
+				*newline = '\0';
+			}
+
+			/*
+			 * Copy only the size of parse string and make it null terminate
+			 */
+			token_len = strlen(token);
+			memcpy(p->name, token, token_len);
+			p->name[token_len] = '\0';
+
+			/*
+			 * Check if the interface name already present.
+			 */
+			if (ecm_interface_lookup_in_denied_list(p->name)) {
+				DEBUG_ERROR("interface already been added\n");
+				kfree(p);
+				continue;
+			}
+
+			dev_to_defunct = dev_get_by_name(&init_net, p->name);
+			if (!dev_to_defunct) {
+				DEBUG_ERROR("interface %s couldn't be found\n", p->name);
+				kfree(p);
+				break;
+			}
+
+			hash = (uint32_t)jhash(p->name, token_len, ecm_db_jhash_rnd) % ECM_INTERFACE_ACCEL_DENIED_DEVICE_HTABLE_SIZE;
+			INIT_HLIST_NODE(&p->hnode);
+			hlist_add_head(&p->hnode, &ecm_interface_accel_denied_list[hash]);
+
+			/*
+			 * Defunct the rules if ci is created before echo
+			 */
+			ecm_interface_dev_defunct_connections(dev_to_defunct);
+			atomic_inc(&ecm_interface_accel_denied_list_count);
+			dev_put(dev_to_defunct);
+		}
+	} else if (!strncmp(token, "del", 3)) {
+		while ((token = strsep(&buf, " ")) != NULL) {
+			struct hlist_node *pnode, *temp;
+			struct net_device *dev_to_defunct;
+			char *newline;
+			uint32_t hash;
+
+			newline = strchr(token, '\n');
+			if (newline) {
+				*newline = '\0';
+			}
+
+			hash = (uint32_t)jhash(token, strlen(token), ecm_db_jhash_rnd) % ECM_INTERFACE_ACCEL_DENIED_DEVICE_HTABLE_SIZE;
+
+			hlist_for_each_safe(pnode, temp, &ecm_interface_accel_denied_list[hash]) {
+				struct ecm_interface_denied_node *p = hlist_entry(pnode, struct ecm_interface_denied_node, hnode);
+				if (!strcmp(p->name, token)) {
+					dev_to_defunct = dev_get_by_name(&init_net, token);
+					if (!dev_to_defunct) {
+						DEBUG_ERROR("interface %s couldn't be found\n", token);
+						break;
+					}
+
+					hlist_del(&p->hnode);
+					kfree(p);
+
+					/*
+					 * Defunct the rule to create new ci
+					 */
+					ecm_interface_dev_defunct_connections(dev_to_defunct);
+					atomic_dec(&ecm_interface_accel_denied_list_count);
+					dev_put(dev_to_defunct);
+					break;
+				}
+			}
+		}
+	} else {
+		DEBUG_ERROR("Use command: echo \"add/del eth1 eth2 eth3\" > /proc/sys/net/ecm/interface_denied_list\n");
+	}
+
+	kfree(pfree);
+	return count;
+}
+
+/*
+ * ecm_interface_accel_denied_list_handler()
+ * 	Proc handler function for denied interface read/write operation
+ */
+static int ecm_interface_accel_denied_list_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	/*
+	 * Usage:
+	 * 	Add interface to the list:
+	 * 	echo "add eth1 eth2 eth3" > /proc/sys/net/ecm/interface_denied_list
+	 *
+	 * 	Delete ports using :
+	 * 	echo "del eth3" > /proc/sys/net/ecm/interface_denied_list
+	 *
+	 * 	Dump the list:
+	 * 	cat /proc/sys/ecm/net/interface_denied_list
+	 *
+	 */
+	return ecm_interface_accel_denied_handler(write, buffer, lenp, ppos);
+}
+#endif
+
+/*
+ * ecm_interface_defunct_by_mac_address_read()
+ * 	Read function for defunct the ecm rules by mac address
+ */
+static int ecm_interface_defunct_by_mac_address_read(void *buffer, size_t *lenp, loff_t *ppos)
+{
+	size_t bytes = 0;
+	char *read_buf;
+	int len;
+
+	read_buf = kzalloc(ECM_MAC_ADDR_STR_BUFF_SIZE * sizeof(char), GFP_KERNEL);
+	if (!read_buf) {
+		DEBUG_ERROR("Failed to allocate buffer for MAC address\n");
+		return -ENOMEM;
+	}
+
+	len = scnprintf(read_buf, ECM_MAC_ADDR_STR_BUFF_SIZE, "%pM", ecm_interface_defunct_mac);
+	if (!len) {
+		DEBUG_ERROR("Failed to format MAC address\n");
+		kfree(read_buf);
+		return -EINVAL;
+	}
+
+	bytes += len;
+	len = scnprintf(read_buf + bytes, 4, "\n");
+	bytes += len;
+	bytes = memory_read_from_buffer(buffer, *lenp, ppos, read_buf, bytes);
+	*lenp = bytes;
+	kfree(read_buf);
+
+	return 0;
+}
+
+/*
+ * ecm_interface_defunct_by_mac_address()
+ * 	write function for defunct the ecm rules by mac address
+ */
+static int ecm_interface_defunct_by_mac_address(int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	char *buf;
+	int count;
+
+	if (!write) {
+		return ecm_interface_defunct_by_mac_address_read(buffer, lenp, ppos);
+	}
+
+	buf = kzalloc(ECM_MAC_ADDR_STR_BUFF_SIZE * sizeof(char), GFP_KERNEL);
+	if (!buf) {
+		DEBUG_ERROR("failed to allocate a buffer\n");
+		return -ENOMEM;
+	}
+
+	count = *lenp;
+	if (count > (ECM_MAC_ADDR_STR_BUFF_SIZE * sizeof(char))) {
+		DEBUG_ERROR("maximum length supported is 18\n");
+		kfree(buf);
+		return -EINVAL;
+	}
+
+	memcpy(buf, buffer, count);
+	*lenp = count;
+	*ppos += count;
+	buf[count-1] = '\0';
+
+	/*
+	 * Converting MAC addr given in char to integers
+	 */
+	if (!mac_pton(buf, ecm_interface_defunct_mac)) {
+		DEBUG_ERROR("cannot parse mac address\n");
+		kfree(buf);
+		return -EINVAL;
+	}
+
+	/*
+	 * Check for valid ether address
+	 */
+	if (!is_valid_ether_addr(ecm_interface_defunct_mac)) {
+		DEBUG_ERROR("Mac address %pM is not valid\n", ecm_interface_defunct_mac);
+		kfree(buf);
+		return -EINVAL;
+	}
+
+	/*
+	 * defunct the ecm rules corresponding to parse MAC
+	 */
+	ecm_interface_node_connections_defunct(ecm_interface_defunct_mac, ECM_DB_IP_VERSION_IGNORE);
+	kfree(buf);
+	return 0;
+}
+
+/*
  * ecm_interface_defunct_by_iface_read()
  * 	Read function for defunct the ecm rules by iface
  */
@@ -9161,6 +9413,21 @@ static int ecm_interface_defunct_by_iface(int write, void *buffer, size_t *lenp,
 }
 
 /*
+ * ecm_interface_defunct_by_mac_addr_handler()
+ * 	Proc handler function for defunct the ecm rules by mac address
+ */
+static int ecm_interface_defunct_by_mac_address_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	/*
+	 * To mark a MAC address as defunct:
+	 * echo "00:03:7F:DE:5C:78" > /proc/sys/net/ecm/defunct_by_mac
+	 *
+	 * Only one MAC address can be processed per defunct_by_mac
+	 */
+	return ecm_interface_defunct_by_mac_address(write, buffer, lenp, ppos);
+}
+
+/*
  * ecm_interface_defunct_by_iface_handler()
  * 	Proc handler function for defunct the ecm rules by iface
  */
@@ -9184,6 +9451,13 @@ static struct ctl_table ecm_interface_table[] = {
 		.mode			= 0644,
 		.proc_handler		= &ecm_interface_src_check_handler,
 	},
+	{
+		.procname		= "src_interface_check_no_flush",
+		.data			= &ecm_interface_src_check_no_flush,
+		.maxlen			= sizeof(int),
+		.mode			= 0644,
+		.proc_handler		= &ecm_interface_src_check_no_flush_handler,
+	},
 #if defined(CONFIG_NET_CLS_ACT) && defined(ECM_CLASSIFIER_DSCP_IGS)
 	{
 		.procname		= "igs_enabled",
@@ -9193,6 +9467,29 @@ static struct ctl_table ecm_interface_table[] = {
 		.proc_handler		= &ecm_interface_igs_enabled_handler,
 	},
 #endif
+#ifdef ECM_INTERFACE_SKIP_ACCEL_ENABLE
+	{
+		.procname		= "interface_denied_list",
+		.data			= &ecm_interface_accel_denied_list,
+		.maxlen			= sizeof(char) * 16 * 16,
+		.mode			= 0644,
+		.proc_handler		= &ecm_interface_accel_denied_list_handler,
+	},
+#endif
+	{
+		.procname		= "defunct_by_mac",
+		.data			= &ecm_interface_defunct_mac,
+		.maxlen			= sizeof(ecm_interface_defunct_mac),
+		.mode			= 0644,
+		.proc_handler		= &ecm_interface_defunct_by_mac_address_handler,
+	},
+	{
+		.procname		= "mwan3_enable",
+		.data			= &ecm_interface_mwan3_enable,
+		.maxlen			= sizeof(int),
+		.mode			= 0644,
+		.proc_handler		= &ecm_interface_mwan3_enable_handler,
+	},
 	{
 		.procname		= "defunct_by_iface",
 		.data			= &ecm_interface_defunct_iface,
@@ -9689,6 +9986,55 @@ static struct notifier_block ecm_interface_ovs_notifier __read_mostly = {
 #endif
 
 /*
+ * ecm_interface_netevent_callback()
+ *	Netevent notifier callback to inform us about the netevents like
+ *	the change in neighbour state
+ */
+static int ecm_interface_netevent_callback(struct notifier_block *self, unsigned long event,
+					   void *ctx)
+{
+	struct neighbour *neigh = ctx;
+
+	if (event != NETEVENT_NEIGH_UPDATE) {
+		return NOTIFY_DONE;
+	}
+
+	if (neigh->nud_state & NUD_FAILED) {
+		DEBUG_TRACE("NUD_FAILED for mac=%pM nud_state : 0x%x", neigh->ha, neigh->nud_state);
+		ecm_interface_node_connections_defunct_by_type(neigh->ha, ECM_DB_IP_VERSION_IGNORE, ECM_DB_CONNECTION_DEFUNCT_TYPE_ARP_DELETE);
+	}
+
+	return NOTIFY_DONE;
+}
+
+/*
+ * struct notifier_block ecm_interface_netevent_notifier
+ *	Registration for netevents such as neighbour update
+ */
+static struct notifier_block ecm_interface_netevent_notifier = {
+	.notifier_call = ecm_interface_netevent_callback,
+};
+
+/*
+ * ecm_interface_register_nf_hook_wlan_device()
+ *	Register nf hook for wlan interfaces
+ */
+static inline void ecm_interface_register_nf_hook_wlan_device(void)
+{
+	struct net_device *dev;
+
+	rtnl_lock();
+
+	for_each_netdev(&init_net, dev) {
+		if (dev->ieee80211_ptr) {
+			ecm_interface_add_nf_hookfn_entry_and_register(dev, ecm_interface_wlan_egress_netdev_hookfn);
+		}
+	}
+
+	rtnl_unlock();
+}
+
+/*
  * ecm_interface_init()
  */
 int ecm_interface_init(void)
@@ -9707,6 +10053,15 @@ int ecm_interface_init(void)
 		unregister_sysctl_table(ecm_interface_ctl_table_header);
 		return result;
 	}
+
+	result = register_netevent_notifier(&ecm_interface_netevent_notifier);
+	if (result != 0) {
+		DEBUG_ERROR("Failed to register netevent notifier %d\n", result);
+		unregister_netdevice_notifier(&ecm_interface_netdev_notifier);
+		unregister_sysctl_table(ecm_interface_ctl_table_header);
+		return result;
+	}
+
 #if defined(ECM_DB_XREF_ENABLE) && defined(ECM_BAND_STEERING_ENABLE)
 	/*
 	 * If the bridge feature is supported in the selected frontend,
@@ -9723,7 +10078,8 @@ int ecm_interface_init(void)
 #ifdef ECM_INTERFACE_OVS_BRIDGE_ENABLE
 	ovsmgr_notifier_register(&ecm_interface_ovs_notifier);
 #endif
-	ecm_interface_wifi_event_start();
+
+	ecm_interface_register_nf_hook_wlan_device();
 
 	return 0;
 }
@@ -9740,6 +10096,10 @@ void ecm_interface_exit(void)
 	ecm_interface_terminate_pending  = true;
 	spin_unlock_bh(&ecm_interface_lock);
 
+	ecm_interface_unregister_nf_hook_wlan_device();
+
+	unregister_netevent_notifier(&ecm_interface_netevent_notifier);
+
 	unregister_netdevice_notifier(&ecm_interface_netdev_notifier);
 #ifdef ECM_DB_XREF_ENABLE
 	neigh_mac_update_unregister_notify(&ecm_interface_neigh_mac_update_nb);
@@ -9755,7 +10115,6 @@ void ecm_interface_exit(void)
 		br_fdb_unregister_notify(&ecm_interface_node_br_fdb_delete_nb);
 	}
 #endif
-	ecm_interface_wifi_event_stop();
 
 #ifdef ECM_INTERFACE_OVS_BRIDGE_ENABLE
 	ovsmgr_notifier_unregister(&ecm_interface_ovs_notifier);

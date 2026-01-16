@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2024, 2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -24,6 +24,11 @@
 
 #define DEBUG_LEVEL ECM_PPE_STATS_DEBUG_LEVEL
 #include "ecm_types.h"
+#include "ecm_db_types.h"
+#include "ecm_state.h"
+#include "ecm_tracker.h"
+#include "ecm_classifier.h"
+#include "ecm_front_end_types.h"
 #include "ecm_ppe_stats_v4.h"
 
 struct ecm_ppe_stats_v4 ppe_v4_stats;
@@ -50,6 +55,8 @@ static const char *ecm_ppe_stats_v4_exception_ported_name_str[] = {
 	"v4_exception_ported_from_iface_invalid_iface_id",
 	"v4_exception_ported_from_iface_invalid_bottom_iface",
 	"v4_exception_ported_from_iface_invalid_top_iface",
+	"v4_exception_ported_from_iface_dsa_qinq_unsupported",
+	"v4_exception_ported_from_iface_dsa_unsupported",
 	"v4_exception_ported_to_iface_ingress_qdisc_unsupported",
 	"v4_exception_ported_to_iface_qdisc_unsupported",
 	"v4_exception_ported_to_iface_bridge_cascade",
@@ -66,6 +73,8 @@ static const char *ecm_ppe_stats_v4_exception_ported_name_str[] = {
 	"v4_exception_ported_to_iface_invalid_iface_id",
 	"v4_exception_ported_to_iface_invalid_bottom_iface",
 	"v4_exception_ported_to_iface_invalid_top_iface",
+	"v4_exception_ported_to_iface_dsa_qinq_unsupported",
+	"v4_exception_ported_to_iface_dsa_unsupported",
 	"v4_exception_ported_ppe_offload_disabled",
 	"v4_exception_ported_regen_occurred",
 	"v4_exception_ported_immediate_flush",
@@ -116,7 +125,7 @@ static const char *ecm_ppe_stats_v4_exception_non_ported_name_str[] = {
 };
 #endif
 
-void ecm_ppe_stats_v4_inc(ecm_ppe_stats_v4_exception_type_t stat_type, int stat_idx)
+void ecm_ppe_stats_v4_inc(struct ecm_front_end_connection_instance *feci, ecm_ppe_stats_v4_exception_type_t stat_type, int stat_idx)
 {
 	switch (stat_type) {
 	case ECM_PPE_STATS_V4_EXCEPTION_PORTED:
@@ -131,6 +140,12 @@ void ecm_ppe_stats_v4_inc(ecm_ppe_stats_v4_exception_type_t stat_type, int stat_
 		DEBUG_TRACE("PPE Fallback Event type unknown.\n");
 		break;
 	}
+
+	/*
+	 * In ECM exceptions 0 means ACCEL_NOT_PERMITTED, it may overwrite the actual AE failure
+	 */
+	if (stat_idx)
+		atomic64_set(&feci->ppe_accel_fail_reason, stat_idx);
 }
 
 static int ecm_ppe_stats_v4_exception_show(struct seq_file *m, void __attribute__((unused))*ptr)

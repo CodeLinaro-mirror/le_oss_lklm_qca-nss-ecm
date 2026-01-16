@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2024, 2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -36,6 +36,10 @@ enum ecm_sfe_stats_v6_exception_multicast_events {
     /* Number of IPv6 packets ignored in from interface multicast flow as multiple PPPOE not supported */
     ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_PPPOE_FLOW_INVALID,
     /* Number of IPv6 packets ignored in from interface multicast flow as PPPOE not enabled */
+    ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_DSA_UNSUPPORTED,
+    /* Number of IPv6 packets ignored in from interface multicast flow as dsa interface is not supported */
+    ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_DSA_QINQ_UNSUPPORTED,
+    /* Number of IPv6 packets ignored in from interface multicast flow as dsa Q-in-Q interface is not supported */
     ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_NO_TO_INTERFACES,
     /* Number of IPv6 packets ignored in multicast flow as no interface in to interface list */
     ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_BRIDGE_CASCADE,
@@ -58,6 +62,10 @@ enum ecm_sfe_stats_v6_exception_multicast_events {
     /* Number of IPv6 packets ignored in to interface multicast flow as multi vlan not supported */
     ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_VLAN_NOT_ENABLED,
     /* Number of IPv6 packets ignored in to interface multicast flow as vlan not enabled */
+    ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_DSA_UNSUPPORTED,
+    /* Number of IPv6 packets ignored in to interface multicast flow as dsa interface is not supported */
+    ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_DSA_QINQ_UNSUPPORTED,
+    /* Number of IPv6 packets ignored in to interface multicast flow as dsa Q-in-Q interface is not supported */
     ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_REGEN_OCCURRED,
     /* Number of IPv6 packets ignored in multicast flow as connection regen occured */
     ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TX_FAILED,
@@ -104,6 +112,10 @@ enum ecm_sfe_stats_v6_exception_ported_events {
     /* Number of IPv6 packets ignored in from interface ported flow as vxlan not enabled */
     ECM_SFE_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_TUN6RD_NOT_ENABLED,
     /* Number of IPv6 packets ignored in from interface ported flow as tun6rd not enabled */
+    ECM_SFE_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_DSA_QINQ_UNSUPPORTED,
+    /* Number of IPv6 packets ignored in from interface ported flow as Q-in-Q on dsa interface is not supported */
+    ECM_SFE_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_DSA_UNSUPPORTED,
+    /* Number of IPv6 packets ignored in from interface ported flow as dsa interface is not supported */
     ECM_SFE_STATS_V6_EXCEPTION_PORTED_TO_IFACE_BRIDGE_CASCADE,
     /* Number of IPv6 packets ignored in to interface ported flow as bridge cascade not possible */
     ECM_SFE_STATS_V6_EXCEPTION_PORTED_TO_IFACE_OVS_BRIDGE_CASCADE,
@@ -132,6 +144,10 @@ enum ecm_sfe_stats_v6_exception_ported_events {
     /* Number of IPv6 packets ignored in to interface ported flow as vxlan not enabled */
     ECM_SFE_STATS_V6_EXCEPTION_PORTED_TO_IFACE_TUN6RD_NOT_ENABLED,
     /* Number of IPv6 packets ignored in to interface ported flow as tun6rd not enabled */
+    ECM_SFE_STATS_V6_EXCEPTION_PORTED_TO_IFACE_DSA_QINQ_UNSUPPORTED,
+    /* Number of IPv6 packets ignored in to interface ported flow as Q-in-Q on dsa interface is not supported */
+    ECM_SFE_STATS_V6_EXCEPTION_PORTED_TO_IFACE_DSA_UNSUPPORTED,
+    /* Number of IPv6 packets ignored in to interface ported flow as dsa interface is not supported */
     ECM_SFE_STATS_V6_EXCEPTION_PORTED_MHT_PORT_FAIL,
     /* Number of IPv6 packets ignored in ported flow as mht feature is enabled */
     ECM_SFE_STATS_V6_EXCEPTION_PORTED_REGEN_OCCURRED,
@@ -222,7 +238,7 @@ struct ecm_sfe_stats_v6 {
 #endif
 };
 
-void ecm_sfe_stats_v6_inc(ecm_sfe_stats_v6_exception_type_t stat_type, int stat_idx);
+void ecm_sfe_stats_v6_inc(struct ecm_front_end_connection_instance *feci, ecm_sfe_stats_v6_exception_type_t stat_type, int stat_idx);
 int ecm_sfe_stats_v6_debugfs_init(struct dentry *dentry);
 
 #endif

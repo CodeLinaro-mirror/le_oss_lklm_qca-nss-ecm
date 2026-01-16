@@ -1,7 +1,7 @@
 /*
  **************************************************************************
  * Copyright (c) 2014,2015,2017-2020 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022, 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -239,6 +239,7 @@ enum ecm_db_directions {
 	ECM_DB_DIRECTION_INGRESS_NAT,			/* WAN->LAN NAT */
 	ECM_DB_DIRECTION_NON_NAT,			/* NET<>NET */
 	ECM_DB_DIRECTION_BRIDGED,			/* BRIDGED */
+	ECM_DB_DIRECTION_HAIRPIN_NAT,			/* Hairpin NAT */
 };
 typedef enum ecm_db_directions ecm_db_direction_t;
 
@@ -284,6 +285,7 @@ enum ecm_db_iface_types {
 	ECM_DB_IFACE_TYPE_MACVLAN,			/* Interface is a MACVLAN interface */
 	ECM_DB_IFACE_TYPE_L2TPV3,			/* Interface is a L2TPV3 over ethernet interface */
 	ECM_DB_IFACE_TYPE_OVS_INTERNAL,			/* Interface is a OpenvSwitch bridge internal interface */
+	ECM_DB_IFACE_TYPE_DSA,				/* Interface is a DSA interface */
 	ECM_DB_IFACE_TYPE_COUNT,			/* Number of interface types */
 };
 typedef enum ecm_db_iface_types ecm_db_iface_type_t;
@@ -293,7 +295,15 @@ typedef enum ecm_db_iface_types ecm_db_iface_type_t;
  */
 struct ecm_db_interface_info_ethernet {			/* type == ECM_DB_IFACE_TYPE_ETHERNET */
 	uint8_t address[ETH_ALEN];			/* MAC Address of this Interface */
+	struct net_device *dev;				/* netdevice of this Interface */
 };
+
+#ifdef ECM_INTERFACE_DSA_ENABLE
+struct ecm_db_interface_info_dsa {			/* type == ECM_DB_IFACE_TYPE_DSA */
+	uint8_t address[ETH_ALEN];			/* MAC Address of this Interface */
+	uint16_t dsa_proto;				/* DSA protocol */
+};
+#endif
 
 #ifdef ECM_INTERFACE_VXLAN_ENABLE
 enum ecm_db_interface_vxlan_extension {

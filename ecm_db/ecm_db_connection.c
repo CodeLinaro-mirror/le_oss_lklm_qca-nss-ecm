@@ -223,6 +223,35 @@ uint16_t ecm_db_connection_l2_encap_proto_get(struct ecm_db_connection_instance 
 }
 
 /*
+ * ecm_db_connection_rtp_set()
+ *	Sets true RTP is present
+ */
+void ecm_db_connection_rtp_set(struct ecm_db_connection_instance *ci, bool is_rtp)
+{
+	DEBUG_CHECK_MAGIC(ci, ECM_DB_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", ci);
+
+	spin_lock_bh(&ecm_db_lock);
+	ci->is_rtp = is_rtp;
+	spin_unlock_bh(&ecm_db_lock);
+}
+
+/*
+ * ecm_db_connection_is_rtp()
+ *	Gets the RTP present flag.
+ */
+bool ecm_db_connection_is_rtp(struct ecm_db_connection_instance *ci)
+{
+	bool is_rtp;
+	DEBUG_CHECK_MAGIC(ci, ECM_DB_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", ci);
+
+	spin_lock_bh(&ecm_db_lock);
+	is_rtp = ci->is_rtp;
+	spin_unlock_bh(&ecm_db_lock);
+
+	return is_rtp;
+}
+
+/*
  * ecm_db_connection_mark_set()
  *	Sets the mark value of the connection.
  */
@@ -1606,7 +1635,7 @@ EXPORT_SYMBOL(ecm_db_connection_defunct_all);
  */
 void ecm_db_connection_defunct_by_classifier(int ip_ver, ip_addr_t src_addr_mask, uint16_t src_port_mask,
 					     ip_addr_t dest_addr_mask, uint16_t dest_port_mask,
-					     int proto_mask, bool is_routed, ecm_classifier_type_t ca_type)
+					     int proto, bool is_routed, ecm_classifier_type_t ca_type)
 {
 	struct ecm_db_connection_instance *ci;
 	int cnt = 0;
@@ -1622,7 +1651,7 @@ void ecm_db_connection_defunct_by_classifier(int ip_ver, ip_addr_t src_addr_mask
 		ip_addr_t sip;
 		ip_addr_t dip;
 		uint16_t sport, dport;
-		int proto;
+		int ci_proto;
 
 		DEBUG_CHECK_MAGIC(ci, ECM_DB_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", ci);
 
@@ -1650,8 +1679,8 @@ void ecm_db_connection_defunct_by_classifier(int ip_ver, ip_addr_t src_addr_mask
 		/*
 		 * Check protocol if specified
 		 */
-		proto = ecm_db_connection_protocol_get(ci);
-		if (!ECM_PROTO_MASK_MATCH(proto, proto_mask)) {
+		ci_proto = ecm_db_connection_protocol_get(ci);
+		if (ci_proto != proto) {
 			goto next_ci;
 		}
 
@@ -1739,11 +1768,11 @@ defunct_conn:
 		if (ECM_IP_ADDR_IS_V4(src_addr_mask)) {
 			DEBUG_TRACE("%px: Defunct CI masked 5 tuple match(%s) src=" ECM_IP_ADDR_DOT_FMT " sport=%d dest="
 					ECM_IP_ADDR_DOT_FMT ", dport=%d, proto=%d cnt=%d\n", ci, direction,
-					ECM_IP_ADDR_TO_DOT(sip), sport, ECM_IP_ADDR_TO_DOT(dip), dport, proto, cnt);
+					ECM_IP_ADDR_TO_DOT(sip), sport, ECM_IP_ADDR_TO_DOT(dip), dport, ci_proto, cnt);
 		} else {
 			DEBUG_TRACE("%px: Defunct CI masked 5 tuple match(%s) src=" ECM_IP_ADDR_OCTAL_FMT " sport=%d dest="
 					ECM_IP_ADDR_OCTAL_FMT ", dport=%d, proto=%d, cnt=%d\n", ci, direction,
-					ECM_IP_ADDR_TO_OCTAL(sip), sport, ECM_IP_ADDR_TO_OCTAL(dip), dport, proto, cnt);
+					ECM_IP_ADDR_TO_OCTAL(sip), sport, ECM_IP_ADDR_TO_OCTAL(dip), dport, ci_proto, cnt);
 		}
 
 		ecm_db_connection_make_defunct(ci);
@@ -1756,14 +1785,14 @@ next_ci:
 
 	if (ECM_IP_ADDR_IS_V4(src_addr_mask)) {
 		DEBUG_TRACE("%px: Defunct request by masked 5 tuple src_mask=" ECM_IP_ADDR_DOT_FMT " sport_mask=%d, dest_mask="
-				ECM_IP_ADDR_DOT_FMT " dport_mask=%d, proto_mask=%d, cnt=%d\n", ci,
+				ECM_IP_ADDR_DOT_FMT " dport_mask=%d, proto=%d, cnt=%d\n", ci,
 				ECM_IP_ADDR_TO_DOT(src_addr_mask), src_port_mask, ECM_IP_ADDR_TO_DOT(dest_addr_mask),
-				dest_port_mask, proto_mask, cnt);
+				dest_port_mask, proto, cnt);
 	} else {
 		DEBUG_TRACE("%px: Defunct request by masked 5 tuple src_mask=" ECM_IP_ADDR_OCTAL_FMT " sport_mask=%d dest_mask="
-				ECM_IP_ADDR_OCTAL_FMT " dport_mask=%d, proto_mask=%d cnt=%d\n", ci,
+				ECM_IP_ADDR_OCTAL_FMT " dport_mask=%d, proto=%d cnt=%d\n", ci,
 				ECM_IP_ADDR_TO_OCTAL(src_addr_mask), src_port_mask,
-				ECM_IP_ADDR_TO_OCTAL(dest_addr_mask), dest_port_mask, proto_mask, cnt);
+				ECM_IP_ADDR_TO_OCTAL(dest_addr_mask), dest_port_mask, proto, cnt);
 	}
 }
 
@@ -2609,7 +2638,19 @@ struct net_device *ecm_db_connection_first_iface_dev_get_and_ref(struct ecm_db_c
 	_ecm_db_iface_ref(ii);
 	spin_unlock_bh(&ecm_db_lock);
 
-	dev = dev_get_by_index(&init_net, ecm_db_iface_interface_identifier_get(ii));
+	/*
+	 * Dev pointer may get removed from inet array when wifi interface is unregistered 
+	 * And dev_get_by_index() will return null then.
+	 * To avoid this store dev pointer in ii during interface establishment
+	 * And get it from ii if iface_type is ECM_DB_IFACE_TYPE_ETHERNET.
+	 */
+	if (ii->type == ECM_DB_IFACE_TYPE_ETHERNET) {
+		dev = ii->type_info.ethernet.dev;
+		dev_hold(dev);
+	} else {
+		dev = dev_get_by_index(&init_net, ecm_db_iface_interface_identifier_get(ii));
+	}
+
 	ecm_db_iface_deref(ii);
 
 	return dev;
@@ -3722,6 +3763,7 @@ int ecm_db_connection_state_get(struct ecm_state_file_instance *sfi, struct ecm_
 	int ip_version;
 	int protocol;
 	bool is_routed;
+	bool is_rtp;
 	uint32_t regen_success;
 	uint32_t regen_fail;
 	uint16_t regen_required;
@@ -3812,6 +3854,7 @@ int ecm_db_connection_state_get(struct ecm_state_file_instance *sfi, struct ecm_
 	ip_version = ci->ip_version;
 	protocol = ci->protocol;
 	is_routed = ci->is_routed;
+	is_rtp = ci->is_rtp;
 	time_added = ci->time_added;
 	serial = ci->serial;
 	ecm_db_connection_data_stats_get(ci, &from_data_total, &to_data_total,
@@ -3897,6 +3940,12 @@ int ecm_db_connection_state_get(struct ecm_state_file_instance *sfi, struct ecm_
 
 	if ((result = ecm_state_write(sfi, "is_routed", "%d", is_routed))) {
 		return result;
+	}
+
+	if (protocol == IPPROTO_UDP) {
+		if ((result = ecm_state_write(sfi, "is_rtp", "%d", is_rtp))) {
+			return result;
+		}
 	}
 
 	if ((result = ecm_state_write(sfi, "expires", "%ld", expires_in))) {
@@ -4944,7 +4993,7 @@ next_v0:
 }
 
 /*
- * ecm_db_connection_defunct_by_5tuple_handler()
+ * ecm_db_connection_defunct_by_5tuple_mask_handler()
  * 	Proc handler to defunct the ecm rules by giving 5 tuple mask
  */
 static int ecm_db_connection_defunct_by_5tuple_mask_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)

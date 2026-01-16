@@ -1,20 +1,9 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021 The Linux Foundation.  All rights reserved.
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- **************************************************************************
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
+ ***************************************************************************
  */
 
 #include <linux/version.h>
@@ -114,6 +103,9 @@ DEFINE_SPINLOCK(ecm_ipv4_lock);			/* Protect against SMP access between netfilte
  */
 bool ecm_ipv4_terminate_pending = false;		/* True when the user has signalled we should quit */
 
+extern int register_ip_post_routing;			/* Module param to indicate if ECM should register for IP post routing*/
+extern int register_br_post_routing;			/* Module param to indicate if ECM should register for bridge post routing*/
+
 /*
  * ecm_ipv4_dev_has_ipaddr()
  *	Returns true if dev has an IPv4 address
@@ -174,6 +166,34 @@ static bool ecm_ipv4_is_bridge_pkt(struct net_device *in,
 }
 
 /*
+ * ecm_ipv4_is_arp_allowed()
+ *	Check if ARP is allowed for a given tunnel interface.
+ */
+static bool ecm_ipv4_is_arp_allowed(struct net_device *dev, struct sk_buff *skb)
+{
+	struct iphdr *iph;
+	uint8_t proto;
+
+	iph = ip_hdr(skb);
+	proto = iph->protocol;
+
+	/*
+	 * For tunnels, sending an ARP request while the
+	 * packet is being transmitted can lead to a deadlock.
+	 * Dont send NS frames on tunnel interface if the IP protocol is of tunnel type
+	 */
+	if ((dev->priv_flags_ext & IFF_EXT_ETH_L2TPV3) && (proto == IPPROTO_L2TP)) {
+		return false;
+	}
+
+	if ((dev->priv_flags_ext & IFF_EXT_GRE_V4_TAP) && (proto == IPPROTO_GRE)) {
+		return false;
+	}
+
+	return true;
+}
+
+/*
  * ecm_ipv4_node_establish_and_ref()
  *	Returns a reference to a node, possibly creating one if necessary.
  *
@@ -182,7 +202,7 @@ static bool ecm_ipv4_is_bridge_pkt(struct net_device *in,
  * Returns NULL on failure.
  */
 struct ecm_db_node_instance *ecm_ipv4_node_establish_and_ref(struct ecm_front_end_connection_instance *feci,
-							struct net_device *dev, ip_addr_t addr,
+							struct net_device *dev, ip_addr_t addr, ip_addr_t saddr,
 							struct ecm_db_iface_instance *interface_list[], int32_t interface_list_first,
 							uint8_t *given_node_addr, struct sk_buff *skb)
 {
@@ -331,7 +351,7 @@ struct ecm_db_node_instance *ecm_ipv4_node_establish_and_ref(struct ecm_front_en
 					 * If the host is behind a route device, use the gateway's mac
 					 * address instead.
 					 */
-					if (ecm_interface_find_gateway(remote_ip, NULL, gw_addr)) {
+					if (ecm_interface_find_gateway(remote_ip, NULL, gw_addr, skb->mark)) {
 						DEBUG_TRACE("%px: Have a gw address " ECM_IP_ADDR_DOT_FMT "\n", feci, ECM_IP_ADDR_TO_DOT(gw_addr));
 						if (!ecm_interface_mac_addr_get_no_route(local_dev, gw_addr, node_addr)) {
 							DEBUG_TRACE("%px: Failed to find the mac address for gateway\n", feci);
@@ -402,7 +422,7 @@ struct ecm_db_node_instance *ecm_ipv4_node_establish_and_ref(struct ecm_front_en
 				if (unlikely(!ecm_interface_mac_addr_get_no_route(local_dev, remote_ip, node_addr))) {
 					ip_addr_t gw_addr = ECM_IP_ADDR_NULL;
 
-					if (!ecm_interface_find_gateway(remote_ip, NULL, gw_addr)) {
+					if (!ecm_interface_find_gateway(remote_ip, NULL, gw_addr, skb->mark)) {
 						DEBUG_WARN("%px: failed to obtain Gateway address for host " ECM_IP_ADDR_DOT_FMT "\n", feci, ECM_IP_ADDR_TO_DOT(remote_ip));
 						dev_put(local_dev);
 						return NULL;
@@ -524,6 +544,25 @@ struct ecm_db_node_instance *ecm_ipv4_node_establish_and_ref(struct ecm_front_en
 #ifdef ECM_INTERFACE_VLAN_ENABLE
 		case ECM_DB_IFACE_TYPE_VLAN:
 #endif
+		case ECM_DB_IFACE_TYPE_DSA:
+#ifdef ECM_INTERFACE_DSA_ENABLE
+			/*
+			 * DSA handled same along with ethernet, lag, bridge etc.
+			 */
+#else
+			/*
+			 * Additional check is required for cases where DSA interface is not enabled.
+			 * and VLAN case fall through happens. In that scenario, it's important to
+			 * cross-check if we are correctly returning.
+			 */
+			if (type == ECM_DB_IFACE_TYPE_DSA) {
+				DEBUG_TRACE("DSA interface unsupported\n");
+				return NULL;
+			}
+#if __has_attribute(__fallthrough__)
+			__attribute__((__fallthrough__));
+#endif
+#endif
 		case ECM_DB_IFACE_TYPE_LAG:
 		case ECM_DB_IFACE_TYPE_BRIDGE:
 #ifdef ECM_INTERFACE_OVS_BRIDGE_ENABLE
@@ -557,7 +596,7 @@ struct ecm_db_node_instance *ecm_ipv4_node_establish_and_ref(struct ecm_front_en
 				 * of that gateway. If it fails, we will send ARP request to that address
 				 * to find the node MAC address while processing the subsequent packets.
 				 */
-				if (ecm_interface_find_gateway(addr, NULL, gw_addr)) {
+				if (ecm_interface_find_gateway(addr, saddr, gw_addr, skb->mark)) {
 					DEBUG_TRACE("%px: Have a gw address " ECM_IP_ADDR_DOT_FMT "\n", feci, ECM_IP_ADDR_TO_DOT(gw_addr));
 					if (ecm_interface_mac_addr_get_no_route(mac_dev, gw_addr, node_addr)) {
 						DEBUG_TRACE("%px: Found the mac address for gateway\n", feci);
@@ -567,7 +606,9 @@ struct ecm_db_node_instance *ecm_ipv4_node_establish_and_ref(struct ecm_front_en
 					on_link = false;
 				}
 
-				ecm_interface_send_arp_request(mac_dev, addr, on_link, gw_addr);
+				if (ecm_ipv4_is_arp_allowed(dev, skb)) {
+					ecm_interface_send_arp_request(mac_dev, addr, on_link, gw_addr);
+				}
 
 				DEBUG_WARN("%px: failed to obtain any node address for host " ECM_IP_ADDR_DOT_FMT "\n", feci, ECM_IP_ADDR_TO_DOT(addr));
 				dev_put(mac_dev);
@@ -884,26 +925,35 @@ void ecm_ipv4_connection_regenerate(struct ecm_db_connection_instance *ci, ecm_t
 	struct ecm_front_end_ovs_params *to_ovs_params = NULL;
 	struct ecm_front_end_ovs_params *from_nat_ovs_params = NULL;
 	struct ecm_front_end_ovs_params *to_nat_ovs_params = NULL;
+	struct nf_conn *ct;
+	enum ip_conntrack_info ctinfo;
 
 	DEBUG_INFO("%px: re-gen needed\n", ci);
 
 	/*
-	 * We may need to swap the devices around depending on who the sender of the packet that triggered the re-gen is
+	 * If packet is in the reverse direction relative to the established ECM connection,
+	 * we cannot re-construct the interface with this packet. We need a packet in the same
+	 * direction of connection instance.
 	 */
 	if (sender == ECM_TRACKER_SENDER_TYPE_DEST) {
-		struct net_device *tmp_dev;
+		DEBUG_TRACE("%px: Re-gen can be done with the same ci direction packet\n", ci);
+		ecm_db_connection_regeneration_failed(ci);
+		return ;
+	}
 
-		/*
-		 * This is a packet sent by the destination of the connection, i.e. it is a packet issued by the 'from' side of the connection.
-		 */
-		DEBUG_TRACE("%px: Re-gen swap devs\n", ci);
-		tmp_dev = out_dev;
-		out_dev = in_dev;
-		in_dev = tmp_dev;
-
-		tmp_dev = out_dev_nat;
-		out_dev_nat = in_dev_nat;
-		in_dev_nat = tmp_dev;
+	/*
+	 * This regenerate function is called after the connection is established. At that time,
+	 * sender is normalized relative to the connection direction. Here, we use sender in the
+	 * ecm_front_end_ipv4_interface_construct_set_and_hold() function to set the input interfaces
+	 * for the hierarchy re-construct function. So, we need to use the sender value relative to the
+	 * conntarck direction as we used it while creating the new ECM database connection.
+	 */
+	ct = nf_ct_get(skb, &ctinfo);
+	if (likely(ct) && likely(ctinfo != IP_CT_UNTRACKED)) {
+		if (IP_CT_DIR_ORIGINAL != CTINFO2DIR(ctinfo)) {
+			DEBUG_TRACE("%px: Normalize the sender to DEST relative to conntrack\n", ci);
+			sender = ECM_TRACKER_SENDER_TYPE_DEST;
+		}
 	}
 
 	/*
@@ -1205,8 +1255,10 @@ unsigned int ecm_ipv4_ip_process(struct net_device *out_dev, struct net_device *
 		orig_tuple = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
 		reply_tuple = ct->tuplehash[IP_CT_DIR_REPLY].tuple;
 		if (IP_CT_DIR_ORIGINAL == CTINFO2DIR(ctinfo)) {
+			DEBUG_TRACE("%px: sender is SRC relative to conntrack\n", skb);
 			sender = ECM_TRACKER_SENDER_TYPE_SRC;
 		} else {
+			DEBUG_TRACE("%px: sender is DEST relative to conntrack\n", skb);
 			sender = ECM_TRACKER_SENDER_TYPE_DEST;
 		}
 
@@ -2248,27 +2300,25 @@ int ecm_ipv4_init(struct dentry *dentry)
 	}
 
 	/*
+	 * Based on the module param register for post routing hook.
+	 * Now packets that are being routed at the IP layer
+	 * will be accelerated.
+	 * eg ETH <---> 5GFWA and WLAN<-->5GFWA flows.
 	 * Register netfilter routing hooks
 	 */
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-	result = nf_register_hooks(ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
-#else
-	result = nf_register_net_hooks(&init_net, ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
-#endif
-	if (result < 0) {
-		DEBUG_ERROR("Can't register common netfilter routing hooks.\n");
-		goto nf_register_failed_1;
+	if (register_ip_post_routing) {
+		result = nf_register_net_hooks(&init_net, ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
+		if (result < 0) {
+			DEBUG_ERROR("Can't register common netfilter routing hooks.\n");
+			goto nf_register_failed_1;
+		}
 	}
 
 	/*
-	 * Register netfilter bridge hooks, if the frontend type supports it. SFE only mode doesn't support it.
+	 * Register netfilter bridge hooks based on the module param register_br_post_routing.
 	 */
-	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_BRIDGE)) {
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-		result = nf_register_hooks(ecm_ipv4_netfilter_bridge_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_bridge_hooks));
-#else
+	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_BRIDGE) && register_br_post_routing) {
 		result = nf_register_net_hooks(&init_net, ecm_ipv4_netfilter_bridge_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_bridge_hooks));
-#endif
 		if (result < 0) {
 			DEBUG_ERROR("Can't register common netfilter bridge hooks.\n");
 			goto nf_register_failed_2;
@@ -2287,11 +2337,9 @@ int ecm_ipv4_init(struct dentry *dentry)
 	return 0;
 
 nf_register_failed_2:
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-	nf_unregister_hooks(ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
-#else
-	nf_unregister_net_hooks(&init_net, ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
-#endif
+	if (register_ip_post_routing) {
+		nf_unregister_net_hooks(&init_net, ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
+	}
 nf_register_failed_1:
 	ecm_sfe_ipv4_exit();
 
@@ -2319,24 +2367,18 @@ void ecm_ipv4_exit(void)
 	spin_unlock_bh(&ecm_ipv4_lock);
 
 	/*
-	 * Unregister the netfilter bridge hooks, if the frontend type supports it. SFE only mode doesn't support it.
+	 * Unregister netfilter bridge hook, based on module param register_br_post_routing.
 	 */
-	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_BRIDGE)) {
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-		nf_unregister_hooks(ecm_ipv4_netfilter_bridge_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_bridge_hooks));
-#else
+	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_BRIDGE) && register_br_post_routing) {
 		nf_unregister_net_hooks(&init_net, ecm_ipv4_netfilter_bridge_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_bridge_hooks));
-#endif
 	}
 
 	/*
 	 * Unregister the netfilter routing hooks.
 	 */
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-	nf_unregister_hooks(ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
-#else
-	nf_unregister_net_hooks(&init_net, ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
-#endif
+	if (register_ip_post_routing) {
+		nf_unregister_net_hooks(&init_net, ecm_ipv4_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv4_netfilter_routing_hooks));
+	}
 
 	/*
 	 * Unregister OVS bridge DP hook

@@ -94,6 +94,9 @@ struct ecm_db_iface_instance {
 	 */
 	union {
 		struct ecm_db_interface_info_ethernet ethernet;		/* type == ECM_DB_IFACE_TYPE_ETHERNET */
+#ifdef ECM_INTERFACE_DSA_ENABLE
+		struct ecm_db_interface_info_dsa dsa;			/* type == ECM_DB_IFACE_TYPE_DSA */
+#endif
 #ifdef ECM_INTERFACE_VLAN_ENABLE
 		struct ecm_db_interface_info_vlan vlan;			/* type == ECM_DB_IFACE_TYPE_VLAN */
 #endif
@@ -199,6 +202,15 @@ void ecm_db_iface_vlan_info_get(struct ecm_db_iface_instance *ii,
 struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_by_interface_identifier(int32_t interface_id);
 struct ecm_db_iface_instance *ecm_db_iface_ifidx_find_and_ref_ethernet(uint8_t *address, int32_t idx, int32_t ae_interface_num);
 
+#ifdef ECM_INTERFACE_DSA_ENABLE
+void ecm_db_iface_add_dsa(struct ecm_db_iface_instance *ii, uint8_t *address, char *name, int32_t mtu,
+			int32_t interface_identifier, int32_t ae_interface_identifier,
+			ecm_db_iface_final_callback_t final, void *arg);
+struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_dsa(int32_t interface_identifier, uint8_t *address);
+void ecm_db_iface_dsa_address_get(struct ecm_db_iface_instance *ii, uint8_t *address);
+void ecm_db_iface_dsa_info_get(struct ecm_db_iface_instance *ii, struct ecm_db_interface_info_dsa *dsa_info);
+#endif
+
 #ifdef ECM_INTERFACE_RAWIP_ENABLE
 struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_rawip(uint8_t *address);
 #endif
@@ -236,7 +248,7 @@ struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_ovs_internal(uint8_t *ad
 struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_unknown(uint32_t os_specific_ident);
 
 #ifdef ECM_INTERFACE_PPPOE_ENABLE
-struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_pppoe(uint16_t pppoe_session_id, uint8_t *remote_mac);
+struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_pppoe(uint16_t pppoe_session_id, uint8_t *remote_mac, int32_t if_num);
 void ecm_db_iface_add_pppoe(struct ecm_db_iface_instance *ii,
 			    uint16_t pppoe_session_id, uint8_t *remote_mac, char *name,
 			    int32_t mtu, int32_t interface_identifier, int32_t ae_interface_identifier,
@@ -324,6 +336,12 @@ void ecm_db_iface_add_ovpn(struct ecm_db_iface_instance *ii,
 #endif
 
 #ifdef ECM_INTERFACE_VXLAN_ENABLE
+/*
+ * VxLAN interface types.
+ */
+#define ECM_DB_IFACE_VXLAN_OUTER 0
+#define ECM_DB_IFACE_VXLAN_INNER 1
+
 void ecm_db_iface_vxlan_info_get(struct ecm_db_iface_instance *ii, struct ecm_db_interface_info_vxlan *vxlan_info);
 struct ecm_db_iface_instance *ecm_db_iface_find_and_ref_vxlan(uint32_t vni, uint32_t if_type);
 void ecm_db_iface_add_vxlan(struct ecm_db_iface_instance *ii,
@@ -347,7 +365,7 @@ ecm_db_iface_connections_get_and_ref_first(struct ecm_db_iface_instance *ii,
 struct ecm_db_iface_instance *ecm_db_iface_alloc(void);
 
 void ecm_db_iface_add_ethernet(struct ecm_db_iface_instance *ii,
-				uint8_t *address, char *name, int32_t mtu, int32_t interface_identifier,
+				uint8_t *address, struct net_device *dev, int32_t mtu,
 				int32_t ae_interface_identifier, ecm_db_iface_final_callback_t final, void *arg);
 
 void ecm_db_iface_add_bridge(struct ecm_db_iface_instance *ii,

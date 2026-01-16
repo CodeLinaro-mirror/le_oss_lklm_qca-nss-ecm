@@ -33,6 +33,7 @@
 #include "ecm_db_types.h"
 #include "ecm_state.h"
 #include "ecm_tracker.h"
+#include "ecm_tracker_udp.h"
 #include "ecm_classifier.h"
 #include "ecm_front_end_types.h"
 #include "ecm_db.h"
@@ -46,8 +47,25 @@
 enum ecm_front_end_type selected_front_end;
 
 int front_end_selection;
+int register_ip_post_routing = 1;
+int register_br_post_routing = 1;
+int ecm_front_end_ipv4_stopped;
+int ecm_front_end_ipv6_stopped;
+
 module_param(front_end_selection, int, 0);
 MODULE_PARM_DESC(front_end_selection, "Select front end for ECM");
+
+module_param(register_ip_post_routing, int, 0);
+MODULE_PARM_DESC(register_ip_post_routing, "Register for ECM to intercept packets on IP post routing hook");
+
+module_param(register_br_post_routing, int, 0);
+MODULE_PARM_DESC(register_br_post_routing, "Register for ECM to intercept packets on bridge post routing hook");
+
+module_param(ecm_front_end_ipv4_stopped, int, 0644) ;
+MODULE_PARM_DESC(ecm_front_end_ipv4_stopped, "Frontend disable");
+
+module_param(ecm_front_end_ipv6_stopped, int, 0644) ;
+MODULE_PARM_DESC(ecm_front_end_ipv6_stopped, "Frontend disable");
 
 struct dentry *ecm_dentry;	/* Dentry object for top level ecm debugfs directory */
 
@@ -123,7 +141,8 @@ static int __init ecm_init(void)
 
 	selected_front_end = ecm_front_end_type_select();
 
-	printk(KERN_INFO "ECM init: selected_front_end=%d\n", selected_front_end);
+	printk(KERN_INFO "ECM init: selected_front_end=%d, register_ip_post_routing=%d, register_br_post_routing=%d\n", selected_front_end,
+				register_ip_post_routing, register_br_post_routing);
 
 	if (selected_front_end == ECM_FRONT_END_TYPE_MAX) {
 		DEBUG_ERROR("Front-end couldn't be selected\n");
@@ -268,6 +287,7 @@ static int __init ecm_init(void)
 #endif
 
 	ecm_front_end_common_sysctl_register();
+	ecm_tracker_udp_sysctl_register();
 	printk(KERN_INFO "ECM init complete\n");
 	return 0;
 
@@ -437,6 +457,7 @@ static void __exit ecm_exit(void)
 		debugfs_remove_recursive(ecm_dentry);
 	}
 
+	ecm_tracker_udp_sysctl_unregister();
 	ecm_front_end_common_sysctl_unregister();
 #ifdef ECM_FRONT_END_PPE_ENABLE
 	if (ecm_front_end_ppe_fse_enable) {

@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -63,8 +52,11 @@
 #endif
 #include <net/vxlan.h>
 #ifdef ECM_INTERFACE_VLAN_ENABLE
-#include <linux/../../net/8021q/vlan.h>
 #include <linux/if_vlan.h>
+#endif
+#ifdef ECM_INTERFACE_DSA_ENABLE
+#include <linux/dsa/8021q.h>
+#include <net/dsa.h>
 #endif
 
 /*
@@ -100,6 +92,8 @@
 
 static int ecm_sfe_multicast_ipv6_accelerated_count = 0;
 						/* Number of IPv6 multicast connections currently offloaded */
+
+static struct ctl_table_header *ecm_sfe_multicast_ipv6_ctl_table_header;	/* Sysctl table header */
 
 /*
  * ecm_sfe_multicast_ipv6_connection_update_callback()
@@ -430,6 +424,7 @@ static int ecm_sfe_multicast_ipv6_connection_update_accelerate(struct ecm_front_
 	uint8_t dest_mac[ETH_ALEN];
 	uint32_t l2_accel_bits = (ECM_SFE_COMMON_FLOW_L2_ACCEL_ALLOWED | ECM_SFE_COMMON_RETURN_L2_ACCEL_ALLOWED);
 	ecm_sfe_common_l2_accel_check_callback_t l2_accel_check;
+	bool is_bridge;
 
 	DEBUG_INFO("%px: UPDATE Accel conn: %px\n", feci, feci->ci);
 
@@ -487,11 +482,16 @@ static int ecm_sfe_multicast_ipv6_connection_update_accelerate(struct ecm_front_
 	 */
 	create->valid_flags |= SFE_RULE_CREATE_CONN_VALID;
 
+	is_bridge = !ecm_db_connection_is_routed_get(feci->ci);
+	if (is_bridge) {
+		create->rule_flags |= SFE_RULE_CREATE_FLAG_BRIDGE_FLOW;
+	}
+
 	/*
 	 * Check which side of the connection can support L2 acceleration.
 	 * The check is done only for the routed flows and if the L2 feature is enabled.
 	 */
-	if (sfe_is_l2_feature_enabled() && ecm_db_connection_is_routed_get(feci->ci)) {
+	if (sfe_is_l2_feature_enabled() && !is_bridge) {
 		rcu_read_lock();
 		l2_accel_check = rcu_dereference(ecm_sfe_cb.l2_accel_check);
 		if (l2_accel_check) {
@@ -573,7 +573,6 @@ static int ecm_sfe_multicast_ipv6_connection_update_accelerate(struct ecm_front_
 			uint32_t vlan_value = 0;
 			struct net_device *vlan_out_dev = NULL;
 #endif
-
 			ii_single = ecm_db_multicast_if_instance_get_at_index(ii_temp, list_index);
 			ifaces = (struct ecm_db_iface_instance **)ii_single;
 			ii = *ifaces;
@@ -735,6 +734,27 @@ static int ecm_sfe_multicast_ipv6_connection_update_accelerate(struct ecm_front_
 				DEBUG_TRACE("%px: VLAN - unsupported\n", feci);
 #endif
 				break;
+
+			case ECM_DB_IFACE_TYPE_DSA:
+#ifdef ECM_INTERFACE_DSA_ENABLE
+				DEBUG_TRACE("%px: DSA\n", feci);
+				if (interface_type_counts[ii_type] != 0) {
+					/*
+					 * We can't have multiple DSA interface in the same heirarchy.
+					 */
+					DEBUG_TRACE("%px: DSA - ignore additional\n", feci);
+					break;
+				}
+
+				ecm_db_iface_dsa_address_get(ii, to_sfe_iface_address);
+				to_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
+				DEBUG_TRACE("%px: DSA - mac: %pM\n", feci, to_sfe_iface_address);
+#else
+				rule_invalid = true;
+				DEBUG_TRACE("%px: DSA interface is not supported\n", feci);
+#endif
+				break;
+
 			default:
 				DEBUG_TRACE("%px: Ignoring: %d (%s)\n", feci, ii_type, ii_name);
 			}
@@ -756,7 +776,6 @@ static int ecm_sfe_multicast_ipv6_connection_update_accelerate(struct ecm_front_
 		 * Is this a valid interface?
 		 */
 		if (to_sfe_iface_id != -1) {
-			bool is_bridge;
 			create->if_rule[valid_vif_idx].if_num = to_sfe_iface_id;
 			create->if_rule[valid_vif_idx].if_mtu = to_mtu;
 			if (rp->if_join_idx[vif]) {
@@ -791,8 +810,6 @@ static int ecm_sfe_multicast_ipv6_connection_update_accelerate(struct ecm_front_
 				create->if_rule[valid_vif_idx].rule_flags |= SFE_MC_RULE_CREATE_IF_FLAG_LEAVE;
 			}
 
-			is_bridge = !ecm_db_connection_is_routed_get(feci->ci);
-
 			/*
 			 * Do not set the ROUTED flag for pure bridged interfaces
 			 */
@@ -801,7 +818,6 @@ static int ecm_sfe_multicast_ipv6_connection_update_accelerate(struct ecm_front_
 				ecm_db_connection_node_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM, (uint8_t *)from_sfe_iface_address);
 				memcpy(create->if_rule[valid_vif_idx].if_mac, from_sfe_iface_address, ETH_ALEN);
 				create->if_rule[valid_vif_idx].rule_flags |= SFE_MC_RULE_CREATE_IF_FLAG_BRIDGE_FLOW;
-				create->rule_flags |= SFE_RULE_CREATE_FLAG_BRIDGE_FLOW;
 			} else {
 				memcpy(create->if_rule[valid_vif_idx].if_mac, to_sfe_iface_address, ETH_ALEN);
 				create->if_rule[valid_vif_idx].rule_flags |= SFE_MC_RULE_CREATE_IF_FLAG_ROUTED_FLOW;
@@ -1009,6 +1025,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	ecm_front_end_acceleration_mode_t result_mode;
 	uint32_t l2_accel_bits = (ECM_SFE_COMMON_FLOW_L2_ACCEL_ALLOWED | ECM_SFE_COMMON_RETURN_L2_ACCEL_ALLOWED);
 	ecm_sfe_common_l2_accel_check_callback_t l2_accel_check;
+	bool is_bridge;
 
 	DEBUG_CHECK_MAGIC(feci, ECM_FRONT_END_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", feci);
 
@@ -1023,7 +1040,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	 * Can this connection be accelerated at all?
 	 */
 	if (!ecm_sfe_ipv6_accel_pending_set(feci)) {
-		ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_ACCEL_NOT_PERMITTED);
+		ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_ACCEL_NOT_PERMITTED);
 		DEBUG_TRACE("%px: Acceleration denied: %px\n", feci, feci->ci);
 		return;
 	}
@@ -1037,7 +1054,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	nim = (struct sfe_ipv6_msg *)kzalloc(sizeof(struct sfe_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
 	if (!nim) {
 		ecm_sfe_ipv6_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
-		ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_NO_MEM);
+		ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_NO_MEM);
 		return;
 	}
 
@@ -1064,7 +1081,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	 */
 	from_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, from_ifaces, ECM_DB_OBJ_DIR_FROM);
 	if (from_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
-		ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_NO_FROM_INTERFACES);
+		ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_NO_FROM_INTERFACES);
 		DEBUG_WARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
 		kfree(nim);
 		return;
@@ -1073,7 +1090,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	from_sfe_iface = from_ifaces[from_ifaces_first];
 	from_sfe_iface_id = ecm_db_iface_ae_interface_identifier_get(from_sfe_iface);
 	if (from_sfe_iface_id < 0) {
-		ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_INVALID_BOTTOM_IFACE);
+		ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_INVALID_BOTTOM_IFACE);
                 DEBUG_TRACE("%px: from_sfe_iface_id: %d\n", feci, from_sfe_iface_id);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		kfree(nim);
@@ -1085,11 +1102,18 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	 */
 	create->valid_flags |= SFE_RULE_CREATE_CONN_VALID;
 
+	is_bridge = !ecm_db_connection_is_routed_get(feci->ci);
+	if (is_bridge) {
+		create->rule_flags |= SFE_RULE_CREATE_FLAG_BRIDGE_FLOW;
+		create->rule_flags |= SFE_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK;
+		create->rule_flags |= SFE_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK_NO_FLUSH;
+	}
+
 	/*
 	 * Check which side of the connection can support L2 acceleration.
 	 * The check is done only for the routed flows and if the L2 feature is enabled.
 	 */
-	if (sfe_is_l2_feature_enabled() && ecm_db_connection_is_routed_get(feci->ci)) {
+	if (sfe_is_l2_feature_enabled() && !is_bridge) {
 		rcu_read_lock();
 		l2_accel_check = rcu_dereference(ecm_sfe_cb.l2_accel_check);
 		if (l2_accel_check) {
@@ -1172,7 +1196,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 			DEBUG_TRACE("%px: Macvlan - mac: %pM\n", feci, from_sfe_iface_address);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_MACVLAN_NOT_ENABLED);
+			ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_MACVLAN_NOT_ENABLED);
 			DEBUG_TRACE("%px: MACVLAN - unsupported\n", feci);
 #endif
 			break;
@@ -1184,7 +1208,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 				 * Can only support two vlans
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_ONLY_TWO_VLANS_SUPPORTED);
+				ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_ONLY_TWO_VLANS_SUPPORTED);
 				DEBUG_TRACE("%px: VLAN - additional unsupported\n", feci);
 				break;
 			}
@@ -1233,17 +1257,18 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_VLAN_NOT_ENABLED);
+			ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_VLAN_NOT_ENABLED);
 			DEBUG_TRACE("%px: VLAN - unsupported\n", feci);
 #endif
 			break;
+
 		case ECM_DB_IFACE_TYPE_PPPOE:
 #ifdef ECM_INTERFACE_PPPOE_ENABLE
 			/*
 			 * More than one PPPoE in the list is not valid!
 			 */
 			if (interface_type_counts[ii_type] != 0) {
-				ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
+				ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
 				DEBUG_TRACE("%px: PPPoE - additional unsupported\n", feci);
 				rule_invalid = true;
 				break;
@@ -1284,7 +1309,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_PPPOE_FLOW_INVALID);
+			ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_FROM_IFACE_PPPOE_FLOW_INVALID);
 #endif
 			break;
 
@@ -1298,7 +1323,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 
 	ret = ecm_db_multicast_connection_to_interfaces_get_and_ref_all(feci->ci, &to_ifaces, &to_ifaces_first);
 	if (!ret) {
-		ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_NO_TO_INTERFACES);
+		ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_NO_TO_INTERFACES);
 		DEBUG_WARN("%px: Accel attempt failed - no multicast interfaces in to_interfaces list!\n", feci);
 		kfree(nim);
 		return;
@@ -1377,7 +1402,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 					 * Cannot cascade bridges
 					 */
 					rule_invalid = true;
-					ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_BRIDGE_CASCADE);
+					ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_BRIDGE_CASCADE);
 					DEBUG_TRACE("%px: Bridge - ignore additional\n", feci);
 					break;
 				}
@@ -1413,7 +1438,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 				to_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
 				to_sfe_iface_id = ecm_db_iface_ae_interface_identifier_get(ii);
 				if (to_sfe_iface_id < 0) {
-					ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_INVALID_IFACE_ID);
+					ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_INVALID_IFACE_ID);
 					DEBUG_TRACE("%px: to_sfe_iface_id: %d\n", feci, to_sfe_iface_id);
 					ecm_db_multicast_connection_to_interfaces_deref_all(to_ifaces, to_ifaces_first);
 					kfree(nim);
@@ -1433,7 +1458,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 					 * Ignore additional mac addresses, these are usually as a result of address propagation
 					 * from bridges down to ports etc.
 					 */
-					ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_LAG_ADDITIONAL_IGNORE);
+					ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_LAG_ADDITIONAL_IGNORE);
 					DEBUG_TRACE("%px: LAG - ignore additional\n", feci);
 					rule_invalid = true;
 					break;
@@ -1441,7 +1466,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 
 				dev = dev_get_by_index(&init_net, ecm_db_iface_interface_identifier_get(ii));
 				if (!dev) {
-					ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_LAG_NOT_PRESENT);
+					ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_LAG_NOT_PRESENT);
 					DEBUG_TRACE("%px: LAG device is not present\n", feci);
 					rule_invalid = true;
 					break;
@@ -1451,7 +1476,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 				 * Destination interface is MLO bond device itself
 				 */
 				if (!bond_is_mlo_device(dev)) {
-					ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_LAG_NOT_MLO);
+					ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_LAG_NOT_MLO);
 					DEBUG_TRACE("%px: LAG device is not MLO device: %s\n", feci, dev->name);
 					dev_put(dev);
 					rule_invalid = true;
@@ -1466,7 +1491,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 				to_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
 				to_sfe_iface_id = ecm_db_iface_ae_interface_identifier_get(ii);
 				if (to_sfe_iface_id < 0) {
-					ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_INVALID_IFACE_ID);
+					ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_INVALID_IFACE_ID);
 					DEBUG_TRACE("%px: to_sfe_iface_id: %d\n", feci, to_sfe_iface_id);
 					dev_put(dev);
 					rule_invalid = true;
@@ -1475,7 +1500,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 				DEBUG_TRACE("%px: LAG - mac: %pM, mtu %d\n", feci, to_sfe_iface_address, to_mtu);
 				dev_put(dev);
 #else
-				ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_LAG_NOT_ENABLED);
+				ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_LAG_NOT_ENABLED);
 				DEBUG_TRACE("%px: LAG not supported\n", feci);
 				rule_invalid = true;
 #endif
@@ -1487,7 +1512,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 				 * More than one PPPoE in the list is not valid!
 				 */
 				if (interface_type_counts[ii_type] != 0) {
-					ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
+					ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
 					DEBUG_TRACE("%px: PPPoE - additional unsupported\n", feci);
 					rule_invalid = true;
 					break;
@@ -1526,7 +1551,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 				create->if_rule[valid_vif_idx].valid_flags |= SFE_MC_RULE_CREATE_IF_FLAG_PPPOE_VALID;
 
 #else
-				ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_PPPOE_FLOW_INVALID);
+				ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_PPPOE_FLOW_INVALID);
 				DEBUG_TRACE("%px: PPPoE - unsupported\n", feci);
 				rule_invalid = true;
 #endif
@@ -1539,7 +1564,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 					 * Can only support two vlans
 					 */
 					rule_invalid = true;
-					ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_ONLY_TWO_VLANS_SUPPORTED);
+					ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_ONLY_TWO_VLANS_SUPPORTED);
 					DEBUG_TRACE("%px: VLAN - additional unsupported\n", feci);
 					break;
 				}
@@ -1581,10 +1606,32 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 
 #else
 				rule_invalid = true;
-				ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_VLAN_NOT_ENABLED);
+				ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_VLAN_NOT_ENABLED);
 				DEBUG_TRACE("%px: VLAN - unsupported\n", feci);
 #endif
 				break;
+
+			case ECM_DB_IFACE_TYPE_DSA:
+#ifdef ECM_INTERFACE_DSA_ENABLE
+				DEBUG_TRACE("%px: DSA\n", feci);
+				if (interface_type_counts[ii_type] != 0) {
+					/*
+					 * We can't have multiple DSA interface in the same heirarchy.
+					 */
+					DEBUG_TRACE("%px: DSA - ignore additional\n", feci);
+					break;
+				}
+
+				ecm_db_iface_dsa_address_get(ii, to_sfe_iface_address);
+				to_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
+				DEBUG_TRACE("%px: DSA - mac: %pM\n", feci, to_sfe_iface_address);
+#else
+				rule_invalid = true;
+				ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TO_IFACE_DSA_UNSUPPORTED);
+				DEBUG_TRACE("%px: DSA - unsupported\n", feci);
+#endif
+				break;
+
 			default:
 				DEBUG_TRACE("%px: Ignoring: %d (%s)\n", feci, ii_type, ii_name);
 			}
@@ -1608,7 +1655,6 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 		 * interface list.
 		 */
 		if (to_sfe_iface_id != -1) {
-			bool is_bridge;
 
 			/*
 			 * Set a rule for NAT if found_nat_ii_match flag is set
@@ -1634,8 +1680,6 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 			create->if_rule[valid_vif_idx].if_num = to_sfe_iface_id;
 			create->if_rule[valid_vif_idx].if_mtu = to_mtu;
 
-			is_bridge = !ecm_db_connection_is_routed_get(feci->ci);
-
 			/*
 			 * Identify if the destination interface blongs to pure bridge or routed flow.
 			 */
@@ -1644,7 +1688,6 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 				ecm_db_connection_node_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM, (uint8_t *)from_sfe_iface_address);
 				memcpy(create->if_rule[valid_vif_idx].if_mac, from_sfe_iface_address, ETH_ALEN);
 				create->if_rule[valid_vif_idx].rule_flags |= SFE_MC_RULE_CREATE_IF_FLAG_BRIDGE_FLOW;
-				create->rule_flags |= SFE_RULE_CREATE_FLAG_BRIDGE_FLOW;
 			} else {
 				memcpy(create->if_rule[valid_vif_idx].if_mac, to_sfe_iface_address, ETH_ALEN);
 				create->if_rule[valid_vif_idx].rule_flags |= SFE_MC_RULE_CREATE_IF_FLAG_ROUTED_FLOW;
@@ -1882,7 +1925,7 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	 * after this check passes, the connection will be decelerated and refreshed very quickly.
 	 */
 	if (regen_occurrances != ecm_db_connection_regeneration_occurrances_get(feci->ci)) {
-		ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_REGEN_OCCURRED);
+		ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_REGEN_OCCURRED);
 		DEBUG_INFO("%px: connection:%px regen occurred - aborting accel rule.\n", feci, feci->ci);
 		ecm_sfe_ipv6_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		kfree(nim);
@@ -1927,6 +1970,10 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	}
 
 	DEBUG_INFO("%px: Accel Tx Failed\n", feci);
+
+	ecm_sfe_stats_v6_inc(feci, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TX_FAILED);
+	atomic64_set(&feci->sfe_accel_fail_reason, ecm_front_end_set_ae_failure_reason(nim->cm.error));
+
 	/*
 	 * Release that ref!
 	 */
@@ -1951,7 +1998,6 @@ static void ecm_sfe_multicast_ipv6_connection_accelerate(struct ecm_front_end_co
 	spin_unlock_bh(&ecm_sfe_ipv6_lock);
 
 	spin_unlock_bh(&feci->lock);
-	ecm_sfe_stats_v6_inc(ECM_SFE_STATS_V6_EXCEPTION_MULTICAST, ECM_SFE_STATS_V6_EXCEPTION_MULTICAST_TX_FAILED);
 	kfree(nim);
 	return;
 }
@@ -2479,7 +2525,7 @@ static void ecm_sfe_multicast_ipv6_bridge_update_connections(ip_addr_t dest_ip, 
 			int i;
 			struct in6_addr ip_src;
 			struct in6_addr ip_grp;
-			uint32_t dst_if_cnt;
+			int dst_if_cnt;
 			uint32_t dst_dev[ECM_DB_MULTICAST_IF_MAX];
 
 			/*
@@ -2536,7 +2582,7 @@ process_packet:
 		spin_lock_bh(&ecm_sfe_ipv6_lock);
 		mc_update = ecm_interface_multicast_find_updates_to_iface_list(ci, &mc_sync, 0, true, mc_dst_dev, if_num, brdev);
 		spin_unlock_bh(&ecm_sfe_ipv6_lock);
-		if (!mc_update) {
+		if (!mc_update && ether_addr_equal(dest_mac, ci->mcuc_addr)) {
 			/*
 			 * No updates to this multicast flow. Move on to the next
 			 * flow for the same group
@@ -3100,18 +3146,58 @@ static void ecm_sfe_multicast_ipv6_mfc_update_event_callback(struct in6_addr *gr
 }
 
 /*
- * ecm_sfe_multicast_ipv6_debugfs_init()
+ * ecm_front_end_ipv6_mc_stop_handler()
+ * 	Proc handler to enable/disable IPv6 Mulitcast via SFE
  */
-bool ecm_sfe_multicast_ipv6_debugfs_init(struct dentry *dentry)
+static int ecm_front_end_ipv6_mc_stop_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
-	if (!ecm_debugfs_create_u32("multicast_accelerated_count", S_IRUGO, dentry,
-						&ecm_sfe_multicast_ipv6_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm sfe ipv6 multicast_accelerated_count file in debugfs\n");
-		return false;
+	/*
+	 * Usage:
+	 *
+	 * Enable Multicast traffic
+	 * echo 1 > /proc/sys/net/ecm/ecm_sfe_ipv6/ecm_sfe_multicast_ipv4_stop
+	 *
+	 * Disable Multicast traffic
+	 * echo 0 > /proc/sys/net/ecm/ecm_sfe_ipv6/ecm_sfe_multicast_ipv4_stop
+	 *
+	 * To read status
+	 * cat /proc/sys/net/ecm/ecm_sfe_ipv6/ecm_sfe_multicast_ipv4_stop
+	 */
+
+	int ret;
+	int current_val;
+
+	/*
+	 * Write the value with user input
+	 */
+	current_val = ecm_front_end_ipv6_mc_stopped;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		/*
+		 * Return if failure or read operation
+		 */
+		return ret;
 	}
 
-	return true;
+	if ((ecm_front_end_ipv6_mc_stopped != 0) && (ecm_front_end_ipv6_mc_stopped != 1)) {
+		ecm_front_end_ipv6_mc_stopped = current_val;
+		DEBUG_ERROR("Invalid input, Valid input 0/1\n");
+		return -EINVAL;
+	}
+
+	return ret;
 }
+
+static struct ctl_table ecm_sfe_multicast_ipv6_ctl_table[] = {
+	{
+		.procname	= "ecm_sfe_multicast_ipv6_stop",
+		.data		= &ecm_front_end_ipv6_mc_stopped,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_front_end_ipv6_mc_stop_handler,
+	},
+	{ }
+};
 
 /*
  * ecm_sfe_multicast_ipv6_stop()
@@ -3127,9 +3213,16 @@ void ecm_sfe_multicast_ipv6_stop(int num)
  */
 int ecm_sfe_multicast_ipv6_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("ecm_sfe_multicast_ipv6_stop", S_IRUGO | S_IWUSR, dentry,
-					(u32 *)&ecm_front_end_ipv6_mc_stopped)) {
-		DEBUG_ERROR("Failed to create ecm front end ipv6 mc stop file in debugfs\n");
+	ecm_sfe_multicast_ipv6_ctl_table_header = register_sysctl(ECM_SFE_IPV6_PATH, ecm_sfe_multicast_ipv6_ctl_table);
+	if (!ecm_sfe_multicast_ipv6_ctl_table_header) {
+		DEBUG_ERROR("Failed to create ecm front end ipv6 mc stop file in sysctl\n");
+		return -1;
+	}
+
+	if (!ecm_debugfs_create_u32("multicast_accelerated_count", S_IRUGO, dentry,
+						&ecm_sfe_multicast_ipv6_accelerated_count)) {
+		DEBUG_ERROR("Failed to create ecm sfe ipv6 multicast_accelerated_count file in debugfs\n");
+		unregister_sysctl_table(ecm_sfe_multicast_ipv6_ctl_table_header);
 		return -1;
 	}
 
@@ -3157,4 +3250,11 @@ void ecm_sfe_multicast_ipv6_exit(void)
 	 */
 	ip6mr_unregister_mfc_event_offload_callback();
 	mc_bridge_ipv6_update_callback_deregister();
+
+	/*
+	 * Unregister sysctl table header
+	 */
+	if (ecm_sfe_multicast_ipv6_ctl_table_header) {
+		unregister_sysctl_table(ecm_sfe_multicast_ipv6_ctl_table_header);
+	}
 }

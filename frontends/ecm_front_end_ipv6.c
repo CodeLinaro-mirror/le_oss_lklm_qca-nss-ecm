@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2017, 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -55,9 +44,19 @@
 #include"ecm_stats_v6.h"
 
 /*
+ * Default path for sysctl
+ */
+#define ECM_FRONT_END_IPV6_PATH "net/ecm"
+
+/*
+ * Sysctl table header
+ */
+static struct ctl_table_header *ecm_front_end_ipv6_ctl_table_header;
+
+/*
  * General operational control
  */
-int ecm_front_end_ipv6_stopped = 0;	/* When non-zero further traffic will not be processed */
+extern int ecm_front_end_ipv6_stopped;	/* When non-zero further traffic will not be processed */
 
 /*
  * Temporary operational control
@@ -103,6 +102,59 @@ static void ecm_front_end_ipv6_interface_construct_netdev_set(struct ecm_front_e
 	efeici->to_nat_dev = to_nat;
 	efeici->to_nat_other_dev = to_nat_other;
 }
+
+/*
+ * ecm_front_end_ipv6_stop_handler()
+ * 	Proc handler to enable or disable ipv6 frontend
+ */
+static int ecm_front_end_ipv6_stop_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	/*
+	 * Usage:
+	 *
+	 * Enable IPv6 frontend
+	 * echo 1 > /proc/sys/net/ecm/front_end_ipv6_stop
+	 *
+	 * Disable IPv6 frontend
+	 * echo 0 > /proc/sys/net/ecm/front_end_ipv6_stop
+	 *
+	 * To read status
+	 * cat /proc/sys/net/ecm/front_end_ipv6_stop
+	 */
+	int ret;
+	int current_val;
+
+	/*
+	 * Write the value with user input
+	 */
+	current_val = ecm_front_end_ipv6_stopped;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		/*
+		 * Return if failure or read operation
+		 */
+		return ret;
+	}
+
+	if ((ecm_front_end_ipv6_stopped != 0) && (ecm_front_end_ipv6_stopped != 1)) {
+		DEBUG_ERROR("Invalid input, valid input 0/1\n");
+		ecm_front_end_ipv6_stopped = current_val;
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+static struct ctl_table ecm_front_end_ipv6_ctl_table[] = {
+	{
+		.procname	= "front_end_ipv6_stop",
+		.data		= &ecm_front_end_ipv6_stopped,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_front_end_ipv6_stop_handler,
+	},
+	{ }
+};
 
 /*
  * ecm_front_end_ipv6_interface_construct_netdev_put()
@@ -160,6 +212,7 @@ bool ecm_front_end_ipv6_interface_construct_set_and_hold(struct sk_buff *skb, ec
 	struct net_device *to_nat = NULL;
 	struct net_device *to_nat_other = NULL;
 	struct net_device *dst_dev = NULL;
+	struct net_device *master = NULL;
 	ip_addr_t from_mac_lookup;
 	ip_addr_t to_mac_lookup;
 	ip_addr_t from_nat_mac_lookup;
@@ -204,6 +257,23 @@ bool ecm_front_end_ipv6_interface_construct_set_and_hold(struct sk_buff *skb, ec
 		if (!rt_iif_dev) {
 			DEBUG_WARN("No rt_iif dev\n");
 			return false;
+		}
+
+		/*
+		 * For Hairpin NAT flows, (rt_iif_dev) will be a Bridged Port, and it's Master dev
+		 * will the bridge interface.
+		 * We need to use the master netdevice for heirarchy creation.
+		 */
+		if (rt_iif_dev->priv_flags & IFF_BRIDGE_PORT) {
+			rcu_read_lock();
+			master = netdev_master_upper_dev_get_rcu(rt_iif_dev);
+			rcu_read_unlock();
+
+			if (master) {
+				dev_put(rt_iif_dev);
+				rt_iif_dev = master;
+				dev_hold(rt_iif_dev);
+			}
 		}
 
 		dst_dev = dst->dev;
@@ -317,6 +387,17 @@ bool ecm_front_end_ipv6_interface_construct_set_and_hold(struct sk_buff *skb, ec
 			to_nat_other = out_dev;
 			ECM_IP_ADDR_COPY(from_nat_mac_lookup, ip_src_addr_nat);
 			ECM_IP_ADDR_COPY(to_nat_mac_lookup, ip_dest_addr_nat);
+		} else if (ecm_dir == ECM_DB_DIRECTION_HAIRPIN_NAT) {
+			from_nat = out_dev;
+			from_nat_other = out_dev;
+			to_nat = out_dev;
+			to_nat_other = out_dev;
+
+			ECM_IP_ADDR_TO_NIN6_ADDR(nat_dev_daddr, ip_dest_addr);
+			ipv6_dev_get_saddr(dev_net(out_dev), out_dev, &nat_dev_daddr, 0, &nat_dev_saddr);
+			ECM_NIN6_ADDR_TO_IP_ADDR(ip_nat_dev_saddr, nat_dev_saddr);
+			ECM_IP_ADDR_COPY(from_nat_mac_lookup, ip_nat_dev_saddr);
+			ECM_IP_ADDR_COPY(to_nat_mac_lookup, ip_nat_dev_saddr);
 		} else {
 			DEBUG_ASSERT(false, "Unhandled ecm_dir: %d\n", ecm_dir);
 		}
@@ -365,6 +446,17 @@ bool ecm_front_end_ipv6_interface_construct_set_and_hold(struct sk_buff *skb, ec
 			to_nat_other = out_dev;
 			ECM_IP_ADDR_COPY(from_nat_mac_lookup, ip_src_addr_nat);
 			ECM_IP_ADDR_COPY(to_nat_mac_lookup, ip_dest_addr_nat);
+		} else if (ecm_dir == ECM_DB_DIRECTION_HAIRPIN_NAT) {
+			from_nat = out_dev;
+			from_nat_other = out_dev;
+			to_nat = out_dev;
+			to_nat_other = out_dev;
+
+			ECM_IP_ADDR_TO_NIN6_ADDR(nat_dev_daddr, ip_dest_addr);
+			ipv6_dev_get_saddr(dev_net(out_dev), out_dev, &nat_dev_daddr, 0, &nat_dev_saddr);
+			ECM_NIN6_ADDR_TO_IP_ADDR(ip_nat_dev_saddr, nat_dev_saddr);
+			ECM_IP_ADDR_COPY(from_nat_mac_lookup, ip_nat_dev_saddr);
+			ECM_IP_ADDR_COPY(to_nat_mac_lookup, ip_nat_dev_saddr);
 		} else {
 			DEBUG_ASSERT(false, "Unhandled ecm_dir: %d\n", ecm_dir);
 		}
@@ -426,27 +518,38 @@ int ecm_front_end_ipv6_init(struct dentry *dentry)
 {
 	struct dentry *ecm_stats_dentry;
 
+	ecm_front_end_ipv6_ctl_table_header = register_sysctl(ECM_FRONT_END_IPV6_PATH, ecm_front_end_ipv6_ctl_table);
+	if (!ecm_front_end_ipv6_ctl_table_header) {
+		DEBUG_ERROR("Failed to create sysctl node for front end ipv6\n");
+		return -1;
+	}
+
 	if (!ecm_debugfs_create_u32("front_end_ipv6_stop", S_IRUGO | S_IWUSR, dentry,
 					(u32 *)&ecm_front_end_ipv6_stopped)) {
 		DEBUG_ERROR("Failed to create ecm front end ipv6 stop file in debugfs\n");
-		return -1;
+		goto init_cleanup;
 	}
 
 	ecm_stats_dentry = debugfs_lookup("stats", dentry);
 	if (!ecm_stats_dentry) {
 		DEBUG_ERROR("Stats dentry not created\n");
-		return -1;
+		goto init_cleanup;
 	}
 
 	if (ecm_stats_v6_debugfs_init(ecm_stats_dentry)) {
 		DEBUG_ERROR("Failed to create v6 stats file in ecm\n");
 		/*
-		 * Cleanup will be taken care by the calling function.
+		 * Debugfs cleanup will be taken care by the calling function.
 		 */
-		return -1;
+		goto init_cleanup;
 	}
 
 	return ecm_ipv6_init(dentry);
+
+init_cleanup:
+
+	unregister_sysctl_table(ecm_front_end_ipv6_ctl_table_header);
+	return -1;
 }
 
 /*
@@ -455,4 +558,11 @@ int ecm_front_end_ipv6_init(struct dentry *dentry)
 void ecm_front_end_ipv6_exit(void)
 {
 	ecm_ipv6_exit();
+
+	/*
+	 * Unregister sysctl table header
+	 */
+	if (ecm_front_end_ipv6_ctl_table_header) {
+		unregister_sysctl_table(ecm_front_end_ipv6_ctl_table_header);
+	}
 }

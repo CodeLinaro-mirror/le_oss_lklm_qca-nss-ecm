@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2020, The Linux Foundation.  All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -35,7 +24,6 @@
 #define ECM_CLASSIFIER_EMESH_SAWF_SVID_VALID		0x1
 #define ECM_CLASSIFIER_EMESH_SAWF_DSCP_VALID		0x2
 #define ECM_CLASSIFIER_EMESH_SAWF_VLAN_PCP_VALID	0x4
-#define ECM_CLASSIFIER_EMESH_SAWF_DSCPCTE_VALID		0x8
 #define ECM_CLASSIFIER_EMESH_SAWF_INVALID_MSDUQ         0xffffffff
 #define ECM_CLASSIFIER_EMESH_SAWF_DEFAULT_MSDUQ         0x0
 #define ECM_CLASSIFIER_EMESH_SAWF_INVALID_SVID		0xffffffff
@@ -77,6 +65,8 @@ struct ecm_classifier_fse_info {
 	uint32_t rv_svc_info;			/**< Reverse SAWF info. */
 	struct net_device *src_dev;		/**< Source dev. */
 	struct net_device *dest_dev;		/**< Destination dev. */
+	uint8_t flow_dscp;			/**< DSCP value for flow direction. */
+	uint8_t return_dscp;			/**< DSCP value for return direction. */
 };
 
 /**
@@ -99,6 +89,7 @@ struct ecm_classifier_emesh_sawf_flow_info {
 	uint32_t rule_id;
 	uint8_t sawf_rule_type;
 	bool is_mc_flow;
+	bool is_scs_mscs;
 };
 
 /**
@@ -368,6 +359,15 @@ uint8_t ecm_classifier_emesh_sawf_get_iface_names_ipv4(struct nf_conn *ct, char 
  * None.
  */
 uint8_t ecm_classifier_emesh_sawf_get_iface_names_ipv6(struct nf_conn *ct, char *from_buff, char *to_buff);
+
+/**
+ * Gets dscp used by fls for sdwf + mesh setups for ipv4/ipv6 connections
+ *
+ * @return
+ * The status of fetching the connection info (1 in case of success, 0 in case of failure).
+ */
+bool ecm_classifier_emesh_sawf_get_connection_info(struct nf_conn *ct, uint32_t *orig_dscp, uint32_t *ret_dscp,
+				bool *is_src_wiphy, bool *is_dst_wiphy);
 
 /**
  * @}

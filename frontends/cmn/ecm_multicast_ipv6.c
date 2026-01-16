@@ -1,7 +1,7 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -60,7 +60,6 @@
 #include <net/netfilter/ipv6/nf_defrag_ipv6.h>
 #include <net/vxlan.h>
 #ifdef ECM_INTERFACE_VLAN_ENABLE
-#include <linux/../../net/8021q/vlan.h>
 #include <linux/if_vlan.h>
 #endif
 
@@ -356,7 +355,7 @@ static struct ecm_db_node_instance *ecm_multicast_ipv6_node_establish_and_ref(st
 #ifdef ECM_INTERFACE_L2TPV2_ENABLE
 			ecm_db_iface_pppol2tpv2_session_info_get(interface_list[i], &pppol2tpv2_info);
 			ECM_HIN4_ADDR_TO_IP_ADDR(remote_ip, pppol2tpv2_info.ip.daddr);
-			if (unlikely(!ecm_interface_mac_addr_get(remote_ip, node_addr, &on_link, gw_addr))) {
+			if (unlikely(!ecm_interface_mac_addr_get(remote_ip, node_addr, &on_link, gw_addr, skb->mark))) {
 				DEBUG_TRACE("Failed to obtain mac for host " ECM_IP_ADDR_OCTAL_FMT "\n", ECM_IP_ADDR_TO_OCTAL(addr));
 				return NULL;
 			}
@@ -375,13 +374,32 @@ static struct ecm_db_node_instance *ecm_multicast_ipv6_node_establish_and_ref(st
 			DEBUG_TRACE("VLAN interface unsupported\n");
 			return NULL;
 #endif
+		case ECM_DB_IFACE_TYPE_DSA:
+#ifdef ECM_INTERFACE_DSA_ENABLE
+			/*
+			 * DSA handled same along with bridge etc.
+			 */
+#else
+			/*
+			 * Additional check is required for cases where DSA interface is not enabled.
+			 * and VLAN case fall through happens. In that scenario, it's important to
+			 * cross-check if we are correctly returning.
+			 */
+			if (type == ECM_DB_IFACE_TYPE_DSA) {
+				DEBUG_TRACE("DSA interface unsupported\n");
+				return NULL;
+			}
+#if __has_attribute(__fallthrough__)
+			__attribute__((__fallthrough__));
+#endif
+#endif
 		case ECM_DB_IFACE_TYPE_ETHERNET:
 		case ECM_DB_IFACE_TYPE_LAG:
 		case ECM_DB_IFACE_TYPE_BRIDGE:
 #ifdef ECM_INTERFACE_OVS_BRIDGE_ENABLE
 		case ECM_DB_IFACE_TYPE_OVS_BRIDGE:
 #endif
-			if (!ecm_interface_mac_addr_get(addr, node_addr, &on_link, gw_addr)) {
+			if (!ecm_interface_mac_addr_get(addr, node_addr, &on_link, gw_addr, skb->mark)) {
 				DEBUG_TRACE("Failed to obtain mac for host " ECM_IP_ADDR_OCTAL_FMT "\n", ECM_IP_ADDR_TO_OCTAL(addr));
 
 				/*

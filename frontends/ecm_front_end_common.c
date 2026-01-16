@@ -1,7 +1,7 @@
 /*
  **************************************************************************
  * Copyright (c) 2015, 2016, 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -548,6 +548,34 @@ int ecm_front_end_common_connection_state_get(struct ecm_front_end_connection_in
 	if ((result = ecm_state_write(sfi, "ae_selection_done", "%s", ae_selection_done))) {
 		return result;
 	}
+#ifdef ECM_FRONT_END_PPE_ENABLE
+	uint16_t ppe_fail_reason = (0x7FFF & atomic64_read(&feci->ppe_accel_fail_reason));
+	bool ppe_ae_failure = atomic64_read(&feci->ppe_accel_fail_reason) >> ECM_FRONT_END_FAIL_REASON_SHIFT;
+	if (ppe_ae_failure) {
+		if ((result = ecm_state_write(sfi, "ppe_fail_reason", "%s %u", " AE", ppe_fail_reason))) {
+			return result;
+		}
+	} else if (ppe_fail_reason) {
+		if ((result = ecm_state_write(sfi, "ppe_fail_reason", "%s %u", " ECM", ppe_fail_reason))) {
+			return result;
+		}
+	}
+#endif
+
+#ifdef ECM_FRONT_END_SFE_ENABLE
+	uint16_t sfe_fail_reason = (0x7FFF & atomic64_read(&feci->sfe_accel_fail_reason));
+	bool sfe_ae_failure = atomic64_read(&feci->sfe_accel_fail_reason) >> ECM_FRONT_END_FAIL_REASON_SHIFT;
+	if (sfe_ae_failure) {
+		if ((result = ecm_state_write(sfi, "sfe_fail_reason", "%s %u", " AE", sfe_fail_reason))) {
+			return result;
+		}
+	} else if (sfe_fail_reason) {
+                if ((result = ecm_state_write(sfi, "sfe_fail_reason", "%s %u", " ECM", sfe_fail_reason))) {
+			return result;
+		}
+	}
+#endif
+
 	return ecm_state_prefix_remove(sfi);
 }
 #endif
@@ -905,7 +933,7 @@ uint64_t ecm_front_end_get_slow_packet_count(struct ecm_front_end_connection_ins
  * ecm_front_end_ppe_fse_enable_limit_handler()
  *	Sysctl to enable/disable FSE programming through PPE.
  */
-int ecm_front_end_ppe_fse_enable_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+int ecm_front_end_ppe_fse_enable_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret;
 
@@ -940,7 +968,7 @@ int ecm_front_end_ppe_fse_enable_handler(struct ctl_table *ctl, int write, void 
  * ecm_front_end_db_conn_limit_handler()
  *	Database connection limit sysctl node handler.
  */
-int ecm_front_end_db_conn_limit_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+int ecm_front_end_db_conn_limit_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret;
 	int current_value;
@@ -975,7 +1003,7 @@ int ecm_front_end_db_conn_limit_handler(struct ctl_table *ctl, int write, void _
  * ecm_front_end_denied_ports_read()
  *	Reads the denied ports from the denied ports array and prints.
  */
-static void ecm_front_end_denied_ports_read(void __user *buffer, size_t *lenp, loff_t *ppos, struct hlist_head *denied_ports)
+static void ecm_front_end_denied_ports_read(void *buffer, size_t *lenp, loff_t *ppos, struct hlist_head *denied_ports)
 {
 	char *read_buf;
 	int i, len;
@@ -1011,7 +1039,7 @@ static void ecm_front_end_denied_ports_read(void __user *buffer, size_t *lenp, l
 	len = scnprintf(read_buf + bytes, 4, "\n");
 	bytes += len;
 
-	bytes = simple_read_from_buffer(buffer, *lenp, ppos, read_buf, bytes);
+	bytes = memory_read_from_buffer(buffer, *lenp, ppos, read_buf, bytes);
 	*lenp = bytes;
 	kfree(read_buf);
 }
@@ -1038,7 +1066,7 @@ static inline bool ecm_front_end_is_port_in_denied_list(int port, struct hlist_h
  * ecm_front_end_denied_ports_handler()
  *	Proc handler function for denied ports read/write operation.
  */
-static int ecm_front_end_denied_ports_handler(int write, void __user *buffer, size_t *lenp, loff_t *ppos, struct hlist_head *denied_ports, bool is_udp)
+static int ecm_front_end_denied_ports_handler(int write, void *buffer, size_t *lenp, loff_t *ppos, struct hlist_head *denied_ports, bool is_udp)
 {
 
 	char *buf;
@@ -1063,10 +1091,9 @@ static int ecm_front_end_denied_ports_handler(int write, void __user *buffer, si
 		count = ECM_FRONT_END_DENIED_PORTS_HTABLE_SIZE * 8 * sizeof(char);
 	}
 
-	if (copy_from_user(buf, buffer, count)) {
-		kfree(pfree);
-		return -EFAULT;
-	}
+	memcpy(buf, buffer, count);
+	*lenp = count;
+	*ppos += count;
 
 	token = strsep(&buf, " ");
 	if (strlen(token) != 3) {
@@ -1160,7 +1187,7 @@ static int ecm_front_end_denied_ports_handler(int write, void __user *buffer, si
  * ecm_front_end_udp_denied_ports_handler()
  *	Proc handler function for UDP denied ports read/write operation.
  */
-static int ecm_front_end_udp_denied_ports_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_front_end_udp_denied_ports_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	/*
 	 * Usage:
@@ -1180,7 +1207,7 @@ static int ecm_front_end_udp_denied_ports_handler(struct ctl_table *ctl, int wri
  * ecm_front_end_tcp_denied_ports_handler()
  *	Proc handler function for TCP denied ports read/write operation.
  */
-static int ecm_front_end_tcp_denied_ports_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_front_end_tcp_denied_ports_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	/*
 	 * Usage:
@@ -1754,6 +1781,41 @@ bool ecm_front_end_check_tcp_denied_ports(uint16_t src_port, uint16_t dest_port)
 	 * Then check the dest port.
 	 */
 	return ecm_front_end_is_port_in_denied_list(dest_port, ecm_front_end_tcp_denied_ports);
+}
+
+/*
+ * ecm_front_end_is_port_in_default denied_list()
+ */
+static inline bool ecm_front_end_is_port_in_default_denied_list(int port)
+{
+	bool ret = false;
+
+	/*
+	 * Avoid the acceleration of DHCP flows
+	 */
+	switch (port) {
+	case 67:
+	case 68:
+		ret = true;
+		break;
+	default:
+	}
+
+	return ret;
+}
+
+/*
+ * ecm_front_end_check_default_denied_ports()
+ *	Checks if any given port number is in the default acceleration denied list.
+ */
+bool ecm_front_end_check_default_denied_ports(int src_port, int dest_port)
+{
+
+	if (ecm_front_end_is_port_in_default_denied_list(src_port)) {
+		return true;
+	}
+
+	return ecm_front_end_is_port_in_default_denied_list(dest_port);
 }
 
 /*

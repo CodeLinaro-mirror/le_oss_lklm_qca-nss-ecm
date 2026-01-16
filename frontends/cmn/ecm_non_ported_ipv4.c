@@ -1,20 +1,9 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- **************************************************************************
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
+ ***************************************************************************
  */
 
 #include <linux/version.h>
@@ -55,7 +44,6 @@
 #include <net/netfilter/ipv4/nf_conntrack_ipv4.h>
 #include <net/netfilter/ipv4/nf_defrag_ipv4.h>
 #ifdef ECM_INTERFACE_VLAN_ENABLE
-#include <linux/../../net/8021q/vlan.h>
 #include <linux/if_vlan.h>
 #endif
 
@@ -419,7 +407,7 @@ feci_alloc_done:
 		ecm_db_connection_interfaces_reset(nci, from_list, from_list_first, ECM_DB_OBJ_DIR_FROM);
 
 		DEBUG_TRACE("%px: Create source node\n", nci);
-		ni[ECM_DB_OBJ_DIR_FROM] = ecm_ipv4_node_establish_and_ref(feci, efeici.from_dev, efeici.from_mac_lookup_ip_addr, from_list, from_list_first, src_node_addr, skb);
+		ni[ECM_DB_OBJ_DIR_FROM] = ecm_ipv4_node_establish_and_ref(feci, efeici.from_dev, efeici.from_mac_lookup_ip_addr, efeici.to_nat_mac_lookup_ip_addr, from_list, from_list_first, src_node_addr, skb);
 		ecm_db_connection_interfaces_deref(from_list, from_list_first);
 		if (!ni[ECM_DB_OBJ_DIR_FROM]) {
 			DEBUG_WARN("Failed to establish source node\n");
@@ -445,7 +433,7 @@ feci_alloc_done:
 		ecm_db_connection_interfaces_reset(nci, to_list, to_list_first, ECM_DB_OBJ_DIR_TO);
 
 		DEBUG_TRACE("%px: Create dest node\n", nci);
-		ni[ECM_DB_OBJ_DIR_TO] = ecm_ipv4_node_establish_and_ref(feci, efeici.to_dev, efeici.to_mac_lookup_ip_addr, to_list, to_list_first, dest_node_addr, skb);
+		ni[ECM_DB_OBJ_DIR_TO] = ecm_ipv4_node_establish_and_ref(feci, efeici.to_dev, efeici.to_mac_lookup_ip_addr, efeici.from_nat_mac_lookup_ip_addr, to_list, to_list_first, dest_node_addr, skb);
 		ecm_db_connection_interfaces_deref(to_list, to_list_first);
 		if (!ni[ECM_DB_OBJ_DIR_TO]) {
 			DEBUG_WARN("Failed to establish dest node\n");
@@ -486,7 +474,7 @@ feci_alloc_done:
 		ecm_db_connection_interfaces_reset(nci, from_nat_list, from_nat_list_first, ECM_DB_OBJ_DIR_FROM_NAT);
 
 		DEBUG_TRACE("%px: Create source nat node\n", nci);
-		ni[ECM_DB_OBJ_DIR_FROM_NAT] = ecm_ipv4_node_establish_and_ref(feci, efeici.from_nat_dev, efeici.from_nat_mac_lookup_ip_addr, from_nat_list, from_nat_list_first, src_node_addr_nat, skb);
+		ni[ECM_DB_OBJ_DIR_FROM_NAT] = ecm_ipv4_node_establish_and_ref(feci, efeici.from_nat_dev, efeici.from_nat_mac_lookup_ip_addr, efeici.to_nat_mac_lookup_ip_addr, from_nat_list, from_nat_list_first, src_node_addr_nat, skb);
 		ecm_db_connection_interfaces_deref(from_nat_list, from_nat_list_first);
 		if (!ni[ECM_DB_OBJ_DIR_FROM_NAT]) {
 			DEBUG_WARN("Failed to establish source nat node\n");
@@ -511,7 +499,7 @@ feci_alloc_done:
 		ecm_db_connection_interfaces_reset(nci, to_nat_list, to_nat_list_first, ECM_DB_OBJ_DIR_TO_NAT);
 
 		DEBUG_TRACE("%px: Create dest nat node\n", nci);
-		ni[ECM_DB_OBJ_DIR_TO_NAT] = ecm_ipv4_node_establish_and_ref(feci, efeici.to_nat_dev, efeici.to_nat_mac_lookup_ip_addr, to_nat_list, to_nat_list_first, dest_node_addr_nat, skb);
+		ni[ECM_DB_OBJ_DIR_TO_NAT] = ecm_ipv4_node_establish_and_ref(feci, efeici.to_nat_dev, efeici.to_nat_mac_lookup_ip_addr, efeici.from_nat_mac_lookup_ip_addr, to_nat_list, to_nat_list_first, dest_node_addr_nat, skb);
 
 		ecm_db_connection_interfaces_deref(to_nat_list, to_nat_list_first);
 		if (!ni[ECM_DB_OBJ_DIR_TO_NAT]) {
@@ -691,8 +679,10 @@ done:
 	 */
 	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_FROM, match_addr);
 	if (ECM_IP_ADDR_MATCH(ip_src_addr, match_addr)) {
+		DEBUG_TRACE("%px: sender is SRC relative to ci direction\n", ci);
 		sender = ECM_TRACKER_SENDER_TYPE_SRC;
 	} else {
+		DEBUG_TRACE("%px: sender is DEST relative to ci direction\n", ci);
 		sender = ECM_TRACKER_SENDER_TYPE_DEST;
 	}
 

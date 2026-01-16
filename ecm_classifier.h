@@ -17,6 +17,8 @@
  **************************************************************************
  */
 
+#define ECM_CLASSIFIER_UDP_IPSEC_PORT 5200	/* Default port for UDP IPsec */
+
 extern int ecm_classifier_accel_delay_pkts;	/* Default slow path packets allowed before the acceleration */
 
 struct ecm_classifier_instance;
@@ -93,12 +95,10 @@ typedef enum ecm_classifier_acceleration_modes ecm_classifier_acceleration_mode_
 #define ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE 0x00000004	/* Contains an accel mode */
 #define ECM_CLASSIFIER_PROCESS_ACTION_TIMER_GROUP 0x00000008	/* Contains a timer group change */
 
-#ifdef ECM_CLASSIFIER_DSCP_ENABLE
 #define ECM_CLASSIFIER_PROCESS_ACTION_DSCP 0x00000010		/* Contains DSCP marking information */
 #define ECM_CLASSIFIER_PROCESS_ACTION_DSCP_DENY 0x00000020	/* Denies any DSCP changes */
 
 #define ECM_CLASSIFIER_PROCESS_ACTION_IGS_QOS_TAG 0x00000040	/* Contains flow & return ingress qos tags */
-#endif
 
 #ifdef ECM_CLASSIFIER_OVS_ENABLE
 #define ECM_CLASSIFIER_PROCESS_ACTION_OVS_VLAN_TAG 0x00000080	/* Contains OVS VLAN tags */
@@ -126,7 +126,7 @@ typedef enum ecm_classifier_acceleration_modes ecm_classifier_acceleration_mode_
 #define ECM_CLASSIFIER_PROCESS_ACTION_EMESH_SAWF_LEGACY_SCS_TAG	0x00040000	/* Mark the E-MESH SAWF legacy scs tag */
 #endif
 
-#ifdef ECM_CLASSIFIER_MSCS_ENABLE
+#if defined(ECM_CLASSIFIER_MSCS_ENABLE) || defined(ECM_CLASSIFIER_WIFI_ENABLE)
 #define ECM_CLASSIFIER_PROCESS_ACTION_HLOS_TID_VALID 0x00080000	/* Mark the HLOS TID tag */
 #endif
 

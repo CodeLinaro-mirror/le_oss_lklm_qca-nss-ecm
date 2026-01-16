@@ -54,6 +54,10 @@
 #include <net/netfilter/ipv4/nf_conntrack_ipv4.h>
 #include <net/netfilter/ipv4/nf_defrag_ipv4.h>
 #include <linux/netfilter/nf_conntrack_tftp.h>
+#ifdef ECM_INTERFACE_DSA_ENABLE
+#include <linux/dsa/8021q.h>
+#include <net/dsa.h>
+#endif
 #ifdef ECM_INTERFACE_VLAN_ENABLE
 #include <linux/if_vlan.h>
 #endif
@@ -335,6 +339,11 @@ static void ecm_sfe_ported_ipv4_connection_callback(void *app_data, struct sfe_i
 				if (status) {
 					if (feci->accel_mode == ECM_FRONT_END_ACCELERATION_MODE_ACCEL) {
 						feci->fse_configure = true;
+						/*
+						 * Here netdev reference is taken to prevent netdevice getting released before fse rule is deleted.
+						 */
+						dev_hold(fse_info.src_dev);
+						dev_hold(fse_info.dest_dev);
 					} else {
 						spin_unlock_bh(&feci->lock);
 
@@ -435,6 +444,9 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	struct ecm_classifier_rule_create ecrc;
 	uint32_t l2_accel_bits = (ECM_SFE_COMMON_FLOW_L2_ACCEL_ALLOWED | ECM_SFE_COMMON_RETURN_L2_ACCEL_ALLOWED);
 	ecm_sfe_common_l2_accel_check_callback_t l2_accel_check;
+#ifdef ECM_FRONT_END_PPE_ENABLE
+	int vp;
+#endif
 
 	DEBUG_CHECK_MAGIC(feci, ECM_FRONT_END_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", feci);
 
@@ -449,14 +461,14 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	 * Test if acceleration is permitted
 	 */
 	if (!ecm_sfe_ipv4_accel_pending_set(feci)) {
-		ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_ACCEL_NOT_PERMITTED);
+		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_ACCEL_NOT_PERMITTED);
 		DEBUG_TRACE("%px: Acceleration not permitted: %px skb=%px\n", feci, feci->ci, skb);
 		return;
 	}
 
 	nim = (struct sfe_ipv4_msg *)kzalloc(sizeof(struct sfe_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
 	if (!nim) {
-		ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_NO_MEM);
+		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_NO_MEM);
 		DEBUG_WARN("%px: no memory for sfe ipv4 message structure instance: %px\n", feci, feci->ci);
 		ecm_sfe_ipv4_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		return;
@@ -490,14 +502,14 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	 */
 	from_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, from_ifaces, ECM_DB_OBJ_DIR_FROM);
 	if (from_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
-		ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_NO_FROM_INTERFACES);
+		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_NO_FROM_INTERFACES);
 		DEBUG_WARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
 		goto ported_accel_bad_rule;
 	}
 
 	to_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, to_ifaces, ECM_DB_OBJ_DIR_TO);
 	if (to_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
-		ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_NO_TO_INTERFACES);
+		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_NO_TO_INTERFACES);
 		DEBUG_WARN("%px: Accel attempt failed - no interfaces in to_interfaces list!\n", feci);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		goto ported_accel_bad_rule;
@@ -510,11 +522,11 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	to_sfe_iface = to_ifaces[to_ifaces_first];
 	from_sfe_iface_id = ecm_db_iface_interface_identifier_get(from_sfe_iface);
 	to_sfe_iface_id = ecm_db_iface_interface_identifier_get(to_sfe_iface);
-	if ((from_sfe_iface_id < 0) || (to_sfe_iface_id < 0)) {
-		ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_INVALID_BOTTOM_IFACE);
-		DEBUG_TRACE("%px: from_sfe_iface_id: %d, to_sfe_iface_id: %d\n", feci, from_sfe_iface_id, to_sfe_iface_id);
+	if (from_sfe_iface_id < 0 || to_sfe_iface_id < 0) {
+		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_INVALID_BOTTOM_IFACE);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
+		DEBUG_TRACE("%px: from_sfe_iface_id: %d, to_sfe_iface_id: %d\n", feci, from_sfe_iface_id, to_sfe_iface_id);
 		goto ported_accel_bad_rule;
 	}
 
@@ -604,7 +616,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Cannot cascade bridges
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_BRIDGE_CASCADE);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_BRIDGE_CASCADE);
 				DEBUG_TRACE("%px: Bridge - ignore additional\n", feci);
 				break;
 			}
@@ -631,7 +643,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Cannot cascade bridges
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_OVS_BRIDGE_CASCADE);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_OVS_BRIDGE_CASCADE);
 				DEBUG_TRACE("%px: OVS Bridge - ignore additional\n", feci);
 				break;
 			}
@@ -650,7 +662,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			DEBUG_TRACE("%px: OVS Bridge - mac: %pM\n", feci, from_sfe_iface_address);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_OVS_BRIDGE_UNSUPPORTED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_OVS_BRIDGE_UNSUPPORTED);
 #endif
 			break;
 
@@ -662,7 +674,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Cannot cascade OVS internal ports
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_OVS_INTERNAL_CASCADE);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_OVS_INTERNAL_CASCADE);
 				DEBUG_TRACE("%px: OVS Internal - ignore additional\n", feci);
 				break;
 			}
@@ -682,7 +694,30 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			DEBUG_TRACE("%px: OVS Internal - mac: %pM\n", feci, from_sfe_iface_address);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_OVS_BRIDGE_UNSUPPORTED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_OVS_BRIDGE_UNSUPPORTED);
+#endif
+			break;
+
+		case ECM_DB_IFACE_TYPE_DSA:
+#ifdef ECM_INTERFACE_DSA_ENABLE
+			DEBUG_TRACE("%px: DSA\n", feci);
+			if (interface_type_counts[ii_type] != 0) {
+				/*
+				 * We can't have multiple DSA interface in the same heirarchy.
+				 */
+				DEBUG_TRACE("%px: DSA - ignore additional\n", feci);
+				break;
+			}
+
+			/*
+			 * Can only handle one MAC, the first outermost mac.
+			 */
+			ecm_db_iface_dsa_address_get(ii, from_sfe_iface_address);
+			DEBUG_TRACE("%px: DSA - mac: %pM\n", feci, from_sfe_iface_address);
+#else
+			rule_invalid = true;
+			DEBUG_TRACE("%px: DSA interface is not supported\n", feci);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_DSA_UNSUPPORTED);
 #endif
 			break;
 
@@ -702,14 +737,28 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			 */
 			ecm_db_iface_ethernet_address_get(ii, from_sfe_iface_address);
 			DEBUG_TRACE("%px: Ethernet - mac: %pM\n", feci, from_sfe_iface_address);
-			break;
+#ifdef ECM_FRONT_END_PPE_ENABLE
+			/*
+			 * Check if the destination interface is tunnel end point which has tunnel vp active.
+			 */
+			vp = ecm_sfe_common_get_vp_from_iface_id(ii->interface_identifier);
+			if (vp > 0) {
+				/*
+				 * Set flag to notify tunnel VP being active to queue the
+				 * packets to PPE VP post inner flow lookup
+				 */
+				nircm->rule_flags |= SFE_RULE_CREATE_FLAG_RETURN_DEST_TUN_VP;
+			}
+#endif
+	break;
+
 		case ECM_DB_IFACE_TYPE_PPPOE:
 #ifdef ECM_INTERFACE_PPPOE_ENABLE
 			/*
 			 * More than one PPPoE in the list is not valid!
 			 */
 			if (interface_type_counts[ii_type] != 0) {
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
 				DEBUG_TRACE("%px: PPPoE - additional unsupported\n", feci);
 				rule_invalid = true;
 				break;
@@ -749,7 +798,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 					nircm->pppoe_rule.flow_pppoe_remote_mac);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_PPPOE_FLOW_INVALID);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_PPPOE_FLOW_INVALID);
 #endif
 			break;
 		case ECM_DB_IFACE_TYPE_VLAN:
@@ -760,7 +809,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Can only support two vlans
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_ONLY_TWO_VLANS_SUPPORTED);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_ONLY_TWO_VLANS_SUPPORTED);
 				DEBUG_TRACE("%px: VLAN - additional unsupported\n", feci);
 				break;
 			}
@@ -809,7 +858,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_VLAN_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_VLAN_NOT_ENABLED);
 			DEBUG_TRACE("%px: VLAN - unsupported\n", feci);
 #endif
 			break;
@@ -828,7 +877,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			DEBUG_TRACE("%px: Macvlan - mac: %pM\n", feci, from_sfe_iface_address);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_MACVLAN_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_MACVLAN_NOT_ENABLED);
 			DEBUG_TRACE("%px: MACVLAN - unsupported\n", feci);
 #endif
 			break;
@@ -841,13 +890,13 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Can only support one ipsec
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_ONLY_ONE_IPSEC_SUPPORTED);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_ONLY_ONE_IPSEC_SUPPORTED);
 				DEBUG_TRACE("%px: IPSEC - additional unsupported\n", feci);
 				break;
 			}
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_IPSEC_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_IPSEC_NOT_ENABLED);
 			DEBUG_TRACE("%px: IPSEC - unsupported\n", feci);
 #endif
 			break;
@@ -873,7 +922,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			}
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_LAG_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_LAG_NOT_ENABLED);
 			DEBUG_TRACE("%px: LAG - unsupported\n", feci);
 #endif
 			break;
@@ -886,7 +935,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			 * For VxLAN device, 4-tuple connection rule is added only for outer flow,
 			 * where source port is set to zero.
 			 */
-			if (!vxlan_info.if_type) {
+			if (vxlan_info.if_type == ECM_DB_IFACE_VXLAN_OUTER) {
 				nircm->rule_flags |= SFE_RULE_CREATE_FLAG_NO_SRC_IDENT;
 			}
 
@@ -895,7 +944,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			 * As per draft rfc vxlan-gpe packet should not be fragmented, set flag to skip this.
 			 */
 			if (vxlan_info.extension == ECM_DB_IFACE_VXLAN_EXTENSION_GPE) {
-				if (vxlan_info.if_type) {
+				if (vxlan_info.if_type == ECM_DB_IFACE_VXLAN_INNER) {
 					nircm->rule_flags |= SFE_RULE_CREATE_FLAG_RETURN_VXLAN_GPE;
 				}
 
@@ -904,7 +953,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			}
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_VXLAN_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_VXLAN_NOT_ENABLED);
 			DEBUG_TRACE("%px: VXLAN - unsupported\n", feci);
 #endif
 			break;
@@ -944,7 +993,6 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		uint32_t vlan_value = 0;
 		struct net_device *vlan_out_dev = NULL;
 #endif
-
 		ii = to_ifaces[list_index];
 		ii_type = ecm_db_iface_type_get(ii);
 		ii_name = ecm_db_interface_type_to_string(ii_type);
@@ -966,7 +1014,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Cannot cascade bridges
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_BRIDGE_CASCADE);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_BRIDGE_CASCADE);
 				DEBUG_TRACE("%px: Bridge - ignore additional\n", feci);
 				break;
 			}
@@ -994,7 +1042,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Cannot cascade bridges
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_OVS_BRIDGE_CASCADE);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_OVS_BRIDGE_CASCADE);
 				DEBUG_TRACE("%px: OVS Bridge - ignore additional\n", feci);
 				break;
 			}
@@ -1013,7 +1061,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			DEBUG_TRACE("%px: OVS Bridge - mac: %pM\n", feci, to_sfe_iface_address);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_OVS_BRIDGE_UNSUPPORTED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_OVS_BRIDGE_UNSUPPORTED);
 #endif
 			break;
 
@@ -1025,7 +1073,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Cannot cascade OVS internal ports
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_OVS_INTERNAL_CASCADE);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_OVS_INTERNAL_CASCADE);
 				DEBUG_TRACE("%px: OVS Internal - ignore additional\n", feci);
 				break;
 			}
@@ -1045,7 +1093,30 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			DEBUG_TRACE("%px: OVS Internal - mac: %pM\n", feci, to_sfe_iface_address);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_OVS_BRIDGE_UNSUPPORTED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_OVS_BRIDGE_UNSUPPORTED);
+#endif
+			break;
+
+		case ECM_DB_IFACE_TYPE_DSA:
+#ifdef ECM_INTERFACE_DSA_ENABLE
+			DEBUG_TRACE("%px: DSA\n", feci);
+			if (interface_type_counts[ii_type] != 0) {
+				/*
+				 * We can't have multiple DSA interface in the same heirarchy.
+				 */
+				DEBUG_TRACE("%px: DSA - ignore additional\n", feci);
+				break;
+			}
+
+			/*
+			 * Can only handle one MAC, the first outermost mac.
+			 */
+			ecm_db_iface_dsa_address_get(ii, to_sfe_iface_address);
+			DEBUG_TRACE("%px: DSA - mac: %pM\n", feci, to_sfe_iface_address);
+#else
+			rule_invalid = true;
+			DEBUG_TRACE("%px: DSA interface is not supported\n", feci);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_DSA_UNSUPPORTED);
 #endif
 			break;
 
@@ -1065,6 +1136,20 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			 */
 			ecm_db_iface_ethernet_address_get(ii, to_sfe_iface_address);
 			DEBUG_TRACE("%px: Ethernet - mac: %pM\n", feci, to_sfe_iface_address);
+
+#ifdef ECM_FRONT_END_PPE_ENABLE
+			/*
+			 * Check if the destination interface is tunnel end point which has tunnel vp active.
+			 */
+			vp = ecm_sfe_common_get_vp_from_iface_id(ii->interface_identifier);
+			if (vp > 0) {
+				/*
+				 * Set flag to notify tunnel VP being active to queue the
+				 * packets to PPE VP post inner flow lookup
+				 */
+				nircm->rule_flags |= SFE_RULE_CREATE_FLAG_FLOW_DEST_TUN_VP;
+			}
+#endif
 			break;
 		case ECM_DB_IFACE_TYPE_PPPOE:
 #ifdef ECM_INTERFACE_PPPOE_ENABLE
@@ -1072,7 +1157,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			 * More than one PPPoE in the list is not valid!
 			 */
 			if (interface_type_counts[ii_type] != 0) {
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
 				DEBUG_TRACE("%px: PPPoE - additional unsupported\n", feci);
 				rule_invalid = true;
 				break;
@@ -1111,7 +1196,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				    nircm->pppoe_rule.return_pppoe_remote_mac);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_PPPOE_FLOW_INVALID);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_PPPOE_FLOW_INVALID);
 #endif
 			break;
 		case ECM_DB_IFACE_TYPE_VLAN:
@@ -1122,7 +1207,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Can only support two vlans
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_ONLY_TWO_VLANS_SUPPORTED);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_ONLY_TWO_VLANS_SUPPORTED);
 				DEBUG_TRACE("%px: VLAN - additional unsupported\n", feci);
 				break;
 			}
@@ -1171,7 +1256,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_VLAN_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_VLAN_NOT_ENABLED);
 			DEBUG_TRACE("%px: VLAN - unsupported\n", feci);
 #endif
 			break;
@@ -1191,7 +1276,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			DEBUG_TRACE("%px: Macvlan - mac: %pM\n", feci, to_sfe_iface_address);
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_MACVLAN_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_MACVLAN_NOT_ENABLED);
 			DEBUG_TRACE("%px: MACVLAN - unsupported\n", feci);
 #endif
 			break;
@@ -1212,13 +1297,13 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 				 * Can only support one ipsec
 				 */
 				rule_invalid = true;
-				ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_ONLY_ONE_IPSEC_SUPPORTED);
+				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_ONLY_ONE_IPSEC_SUPPORTED);
 				DEBUG_TRACE("%px: IPSEC - additional unsupported\n", feci);
 				break;
 			}
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_IPSEC_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_IPSEC_NOT_ENABLED);
 			DEBUG_TRACE("%px: IPSEC - unsupported\n", feci);
 #endif
 			break;
@@ -1244,7 +1329,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			}
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_LAG_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_LAG_NOT_ENABLED);
 			DEBUG_TRACE("%px: LAG - unsupported\n", feci);
 #endif
 			break;
@@ -1259,14 +1344,14 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			 * Set VxLAN-GPE flag for inner flow going TO VXLAN-GPE device.
 			 * As per draft rfc vxlan-gpe packet should not be fragmented, set flag to skip this.
 			 */
-			if (vxlan_info.if_type && vxlan_info.extension == ECM_DB_IFACE_VXLAN_EXTENSION_GPE) {
+			if ((vxlan_info.if_type == ECM_DB_IFACE_VXLAN_INNER) && (vxlan_info.extension == ECM_DB_IFACE_VXLAN_EXTENSION_GPE)) {
 				nircm->rule_flags |= SFE_RULE_CREATE_FLAG_FLOW_VXLAN_GPE;
 				nircm->valid_flags |= SFE_RULE_CREATE_SKIP_FRAG_OFFLOAD_VALID;
 				DEBUG_TRACE("%px: VXLAN-GPE\n", feci);
 			}
 #else
 			rule_invalid = true;
-			ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_VXLAN_NOT_ENABLED);
+			ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TO_IFACE_VXLAN_NOT_ENABLED);
 			DEBUG_TRACE("%px: VXLAN - unsupported\n", feci);
 #endif
 			break;
@@ -1312,6 +1397,12 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		DEBUG_INFO("%px: Source interface check flag is enabled\n", feci);
 		nircm->rule_flags |= SFE_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK;
 		nircm->rule_flags |= SFE_RULE_CREATE_FLAG_RETURN_SRC_INTERFACE_CHECK;
+
+		if (ecm_interface_src_check_no_flush) {
+			DEBUG_INFO("%px: Source interface check no flush flag is enabled\n", feci);
+			nircm->rule_flags |= SFE_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK_NO_FLUSH;
+			nircm->rule_flags |= SFE_RULE_CREATE_FLAG_RETURN_SRC_INTERFACE_CHECK_NO_FLUSH;
+		}
 	}
 
 	/*
@@ -1471,7 +1562,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 		ecm_sfe_ipv4_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
-		ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_MHT_PORT_FAIL);
+		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_MHT_PORT_FAIL);
 		kfree(nim);
 		return;
 	}
@@ -1788,7 +1879,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	 * after this check passes, the connection will be decelerated and refreshed very quickly.
 	 */
 	if (regen_occurrances != ecm_db_connection_regeneration_occurrances_get(feci->ci)) {
-		ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_REGEN_OCCURRED);
+		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_REGEN_OCCURRED);
 		DEBUG_INFO("%px: connection:%px regen occurred - aborting accel rule.\n", feci, feci->ci);
 		ecm_sfe_ipv4_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		return;
@@ -1844,8 +1935,10 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		return;
 	}
 
-	kfree(nim);
+	ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TX_FAILED);
+	atomic64_set(&feci->sfe_accel_fail_reason, ecm_front_end_set_ae_failure_reason(nim->cm.error));
 
+	kfree(nim);
 	/*
 	 * Release that ref!
 	 */
@@ -1865,12 +1958,18 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		result_mode = ECM_FRONT_END_ACCELERATION_MODE_DECEL;
 	}
 
+	/*
+	 * If connection is now defunct then set mode to ensure no further accel attempts occur
+	 */
+	if (feci->is_defunct) {
+		result_mode = ECM_FRONT_END_ACCELERATION_MODE_FAIL_DEFUNCT;
+	}
+
 	spin_lock_bh(&ecm_sfe_ipv4_lock);
 	_ecm_sfe_ipv4_accel_pending_clear(feci, result_mode);
 	spin_unlock_bh(&ecm_sfe_ipv4_lock);
 
 	spin_unlock_bh(&feci->lock);
-	ecm_sfe_stats_v4_inc(ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_TX_FAILED);
 	return;
 
 ported_accel_bad_rule:
@@ -2020,6 +2119,11 @@ static void ecm_sfe_ported_ipv4_connection_destroy_callback(void *app_data, stru
 			spin_lock_bh(&feci->lock);
 			if (status)
 				feci->fse_configure = false;
+			/*
+			 * Release dev reference which we hold after creating the FSE rule.
+			 */
+			dev_put(fse_info.src_dev);
+			dev_put(fse_info.dest_dev);
 		}
 	}
 	spin_unlock_bh(&feci->lock);
@@ -2165,6 +2269,8 @@ static bool ecm_sfe_ported_ipv4_connection_decelerate(struct ecm_front_end_conne
 bool ecm_sfe_ported_ipv4_connection_defunct_callback(void *arg, int *accel_mode)
 {
 	bool ret;
+	bool is_defunct __maybe_unused;
+	bool decel_pending __maybe_unused;
 	struct ecm_front_end_connection_instance *feci = (struct ecm_front_end_connection_instance *)arg;
 	DEBUG_CHECK_MAGIC(feci, ECM_FRONT_END_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", feci);
 
@@ -2174,15 +2280,24 @@ bool ecm_sfe_ported_ipv4_connection_defunct_callback(void *arg, int *accel_mode)
 	 */
 	if (!ecm_front_end_common_connection_defunct_check(feci)) {
 		*accel_mode = feci->accel_mode;
+		is_defunct = feci->is_defunct;
+		decel_pending = feci->stats.decelerate_pending;
 		spin_unlock_bh(&feci->lock);
+		DEBUG_TRACE("%px: Cannot defunct connection, accel_mode: %d, is_defunct: %d,  decel_pending: %d \n",
+				feci, *accel_mode, is_defunct, decel_pending);
 		return false;
 	}
 
 	if (!ecm_front_end_common_connection_decelerate_accel_mode_check(feci)) {
 		*accel_mode = feci->accel_mode;
+		is_defunct = feci->is_defunct;
+		decel_pending = feci->stats.decelerate_pending;
 		spin_unlock_bh(&feci->lock);
+		DEBUG_TRACE("%px: Cannot decelerate connection, accel_mode: %d, is_defunct: %d, decel_pending: %d \n",
+				feci, *accel_mode, is_defunct, decel_pending);
 		return false;
 	}
+
 	feci->accel_mode = ECM_FRONT_END_ACCELERATION_MODE_DECEL_PENDING;
 	spin_unlock_bh(&feci->lock);
 
@@ -2303,6 +2418,11 @@ static void ecm_sfe_ported_ipv4_connection_accel_ceased(struct ecm_front_end_con
 			spin_lock_bh(&feci->lock);
 			if (status)
 				feci->fse_configure = false;
+			/*
+			 * Release dev reference which we hold after creating the FSE rule.
+			 */
+			dev_put(fse_info.src_dev);
+			dev_put(fse_info.dest_dev);
 		}
 	}
 	spin_unlock_bh(&feci->lock);

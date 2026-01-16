@@ -24,9 +24,8 @@ endif
 ifeq ($(EXAMPLES_BUILD_OVS),y)
 obj-m += examples/ecm_ovs.o
 endif
-
 ifeq ($(EXAMPLES_BUILD_SDX),y)
-obj-m +=examples/ecm_sdx_pcc.o
+obj-m += examples/ecm_sdx_pcc.o
 endif
 
 ecm-y := \
@@ -234,6 +233,11 @@ ECM_INTERFACE_VLAN_ENABLE=y
 ccflags-$(ECM_INTERFACE_VLAN_ENABLE) += -DECM_INTERFACE_VLAN_ENABLE
 
 # #############################################################################
+# Define ECM_INTERFACE_DSA_ENABLE=y in order to enable support for DSA Accel
+# #############################################################################
+ccflags-$(ECM_INTERFACE_DSA_ENABLE) += -DECM_INTERFACE_DSA_ENABLE
+
+# #############################################################################
 # Define ECM_INTERFACE_MACVLAN_ENABLE=y in order to enable support for MACVLAN
 # #############################################################################
 ccflags-$(ECM_INTERFACE_MACVLAN_ENABLE) += -DECM_INTERFACE_MACVLAN_ENABLE
@@ -242,6 +246,11 @@ ccflags-$(ECM_INTERFACE_MACVLAN_ENABLE) += -DECM_INTERFACE_MACVLAN_ENABLE
 # Define ECM_INTERFACE_IPSEC_ENABLE=y in order to enable support for IPSEC
 # #############################################################################
 ccflags-$(ECM_INTERFACE_IPSEC_ENABLE) += -DECM_INTERFACE_IPSEC_ENABLE
+
+# #############################################################################
+# Define ECM_INTERFACE_SKIP_ACCEL_ENABLE=y in order to support for disable acceleration
+# #############################################################################
+ccflags-$(ECM_INTERFACE_SKIP_ACCEL_ENABLE) += -DECM_INTERFACE_SKIP_ACCEL_ENABLE
 
 ECM_INTERFACE_IPSEC_GLUE_LAYER_SUPPORT_ENABLE=n
 ifeq ($(SoC),$(filter $(SoC), ipq807x ipq807x_64 ipq60xx ipq60xx_64 ipq50xx \

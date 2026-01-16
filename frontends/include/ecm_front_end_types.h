@@ -1,7 +1,7 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -33,10 +33,11 @@
 #define ECM_FRONT_END_INVALID_VLAN_PCP 0xFF
 
 /*
- * FLOW DEPRIO flag
+ * FLOW PRIO/DEPRIO flag
  */
 #define ECM_FRONT_END_PRIO_UPDATE_FLOW 0x1
 #define ECM_FRONT_END_PRIO_UPDATE_RETURN 0x2
+#define ECM_FRONT_END_DEPRIO 0x4
 
 /*
  * Bridge device macros
@@ -311,6 +312,12 @@ struct ecm_front_end_connection_instance {
 	bool can_accel;						/* RO: True when the connection can be accelerated */
 	bool is_defunct;					/* True if the connection has become defunct */
 	bool destroy_fail_handle_pending;			/* Set while handling the connection destroy failure */
+#ifdef ECM_FRONT_END_PPE_ENABLE
+	atomic64_t ppe_accel_fail_reason;			/* PPE accel fail reason */
+#endif
+#ifdef ECM_FRONT_END_SFE_ENABLE
+	atomic64_t sfe_accel_fail_reason;			/* SFE accel fail reason */
+#endif
 #ifdef ECM_FRONT_END_FSE_ENABLE
 	bool fse_configure;					/* Flag to indicate if the connection is configured in Wi-Fi FSE block */
 #endif
@@ -373,6 +380,7 @@ struct ecm_front_end_flowsawf_msg {
 	uint8_t ip_version;
 	uint8_t protocol;
 	uint32_t flags;
+	bool status;
 
 	/*
 	 * SAWF meta
@@ -462,6 +470,8 @@ static inline enum ecm_front_end_type ecm_front_end_type_select(void)
 	 */
 	if ((front_end_selection == ECM_FRONT_END_TYPE_PPE_SFE)
 		|| ((front_end_selection == ECM_FRONT_END_TYPE_AUTO) && of_machine_is_compatible("qcom,ipq9574"))
+		|| ((front_end_selection == ECM_FRONT_END_TYPE_AUTO) && of_machine_is_compatible("qcom,ipq9679"))
+		|| ((front_end_selection == ECM_FRONT_END_TYPE_AUTO) && of_machine_is_compatible("qcom,ipq5200"))
 		|| ((front_end_selection == ECM_FRONT_END_TYPE_AUTO) && of_machine_is_compatible("qcom,ipq5332"))
 		|| ((front_end_selection == ECM_FRONT_END_TYPE_AUTO) && of_machine_is_compatible("qcom,devsoc"))
 		|| ((front_end_selection == ECM_FRONT_END_TYPE_AUTO) && of_machine_is_compatible("qcom,ipq5424"))) {
@@ -469,7 +479,11 @@ static inline enum ecm_front_end_type ecm_front_end_type_select(void)
 	}
 
 	if ((front_end_selection == ECM_FRONT_END_TYPE_SFE_PPE) &&
-	    (of_machine_is_compatible("qcom,ipq9574") || of_machine_is_compatible("qcom,ipq5332"))) {
+	    (of_machine_is_compatible("qcom,ipq9574")
+	     || of_machine_is_compatible("qcom,ipq5332")
+	     || of_machine_is_compatible("qcom,ipq9679")
+	     || of_machine_is_compatible("qcom,ipq5200")
+	     || of_machine_is_compatible("qcom,ipq5424"))) {
 		return ECM_FRONT_END_TYPE_SFE_PPE;
 	}
 #endif

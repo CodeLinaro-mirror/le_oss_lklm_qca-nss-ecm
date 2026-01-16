@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2024, 2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -24,6 +24,11 @@
 
 #define DEBUG_LEVEL ECM_SFE_STATS_DEBUG_LEVEL
 #include "ecm_types.h"
+#include "ecm_db_types.h"
+#include "ecm_state.h"
+#include "ecm_tracker.h"
+#include "ecm_classifier.h"
+#include "ecm_front_end_types.h"
 #include "ecm_sfe_stats_v4.h"
 
 struct ecm_sfe_stats_v4 sfe_v4_stats;
@@ -38,6 +43,8 @@ static const char *ecm_sfe_stats_v4_exception_multicast_name_str[] = {
 	"v4_exception_multicast_from_iface_vlan_not_enabled",
 	"v4_exception_multicast_from_iface_more_than_one_pppoe_unsupported",
 	"v4_exception_multicast_from_iface_pppoe_flow_invalid",
+	"v4_exception_multicast_from_iface_dsa_unsupported",
+	"v4_exception_multicast_from_iface_dsa_qinq_unsupported",
 	"v4_exception_multicast_no_to_interfaces",
 	"v4_exception_multicast_to_iface_type_bridge_ignore",
 	"v4_exception_multicast_to_iface_invalid_iface_id",
@@ -49,6 +56,8 @@ static const char *ecm_sfe_stats_v4_exception_multicast_name_str[] = {
 	"v4_exception_multicast_to_iface_pppoe_flow_invalid",
 	"v4_exception_multicast_to_iface_only_two_vlans_supported",
 	"v4_exception_multicast_to_iface_vlan_not_enabled",
+	"v4_exception_multicast_to_iface_dsa_unsupported",
+	"v4_exception_multicast_to_iface_dsa_qinq_unsupported",
 	"v4_exception_multicast_regen_occurred",
 	"v4_exception_multicast_tx_failed"
 };
@@ -72,6 +81,8 @@ static const char *ecm_sfe_stats_v4_exception_ported_name_str[] = {
 	"v4_exception_ported_from_iface_ipsec_not_enabled",
 	"v4_exception_ported_from_iface_lag_not_enabled",
 	"v4_exception_ported_from_iface_vxlan_not_enabled",
+	"v4_exception_ported_from_iface_dsa_qinq_unsupported",
+	"v4_exception_ported_from_iface_dsa_unsupported",
 	"v4_exception_ported_to_iface_bridge_cascade",
 	"v4_exception_ported_to_iface_ovs_bridge_cascade",
 	"v4_exception_ported_to_iface_ovs_internal_cascade",
@@ -85,6 +96,8 @@ static const char *ecm_sfe_stats_v4_exception_ported_name_str[] = {
 	"v4_exception_ported_to_iface_ipsec_not_enabled",
 	"v4_exception_ported_to_iface_lag_not_enabled",
 	"v4_exception_ported_to_iface_vxlan_not_enabled",
+	"v4_exception_ported_to_iface_dsa_qinq_unsupported",
+	"v4_exception_ported_to_iface_dsa_unsupported",
 	"v4_exception_ported_mht_port_failed",
 	"v4_exception_ported_regen_occurred",
 	"v4_exception_ported_tx_failed"
@@ -127,7 +140,7 @@ static const char *ecm_sfe_stats_v4_exception_non_ported_name_str[] = {
 };
 #endif
 
-void ecm_sfe_stats_v4_inc(ecm_sfe_stats_v4_exception_type_t stat_type, int stat_idx)
+void ecm_sfe_stats_v4_inc(struct ecm_front_end_connection_instance *feci, ecm_sfe_stats_v4_exception_type_t stat_type, int stat_idx)
 {
 	switch (stat_type) {
 	case ECM_SFE_STATS_V4_EXCEPTION_MULTICAST:
@@ -145,6 +158,12 @@ void ecm_sfe_stats_v4_inc(ecm_sfe_stats_v4_exception_type_t stat_type, int stat_
 		DEBUG_TRACE("SFE Fallback Event type unknown.\n");
 		break;
 	}
+
+	/*
+	 * In ECM exceptions 0 means ACCEL_NOT_PERMITTED, it may overwrite the actual AE failure
+	 */
+	if (stat_idx)
+		atomic64_set(&feci->sfe_accel_fail_reason, stat_idx);
 }
 
 static int ecm_sfe_stats_v4_exception_show(struct seq_file *m, void __attribute__((unused))*ptr)

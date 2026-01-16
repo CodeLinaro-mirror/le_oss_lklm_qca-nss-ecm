@@ -83,6 +83,7 @@
 #endif
 
 #define ECM_WIFI_PLUGIN_METADATA_INVALID_DS_NODE 0xFF
+#define ECM_WIFI_PLUGIN_METADATA_INVALID_HLOS_TID 0
 
 /*
  * ecm_wifi_plugin_emesh_register()
@@ -126,6 +127,7 @@ int ecm_wifi_plugin_adm_ctrl_cb_register(void);
  *	API to unregister the admission control callbacks.
  */
 void ecm_wifi_plugin_adm_ctrl_cb_unregister(void);
+#endif
 
 /*
  * ecm_wifi_plugin_mscs_register()
@@ -138,7 +140,6 @@ int ecm_wifi_plugin_mscs_register(void);
  *	API to unregister the mscs callbacks.
  */
 void ecm_wifi_plugin_mscs_unregister(void);
-#endif
 
 /*
  * ecm_wifi_plugin_wifi_cb_register()

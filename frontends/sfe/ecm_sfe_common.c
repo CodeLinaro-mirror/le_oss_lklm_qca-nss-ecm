@@ -45,7 +45,9 @@
 #ifdef ECM_MHT_ENABLE
 #include "ppe_drv.h"
 #endif
-
+#ifdef ECM_FRONT_END_PPE_ENABLE
+#include<ppe_tun.h>
+#endif
 
 /*
  * Callback object to support SFE frontend interaction with external code
@@ -57,6 +59,9 @@ struct ecm_sfe_common_callbacks ecm_sfe_cb;
  */
 static struct ctl_table_header *ecm_sfe_ctl_tbl_hdr;
 
+/*
+ * Flag to indicate fast_xmit is enabled for rule push from SFE frontend.
+ */
 static int ecm_sfe_fast_xmit_enable = 1;
 
 /*
@@ -72,14 +77,20 @@ unsigned int ecm_sfe_mht_enable = 1;
 #endif
 
 /*
+ * Flag to indicate fast_xmit is enabled for tunnel interfaces.
+ * This works only when global "ecm_sfe_fast_xmit_enable" flag is enabled.
+ */
+static int ecm_sfe_tun_fast_xmit_enable = 1;
+
+/*
  * ecm_sfe_common_fast_xmit_check()
  *	Check the fast transmit feasibility.
  *
- * It only check device related attribute:
+ * It checks for source and destination interface type.
  */
-static bool ecm_sfe_common_fast_xmit_check(s32 interface_num) {
-
-	struct net_device *dev;
+static bool ecm_sfe_common_fast_xmit_check(struct ecm_db_iface_instance *to_ii, struct ecm_db_iface_instance *from_ii)
+{
+	ecm_db_iface_type_t type;
 
 	/*
 	 * Return failure if user has disabled SFE fast_xmit
@@ -88,22 +99,45 @@ static bool ecm_sfe_common_fast_xmit_check(s32 interface_num) {
 		return false;
 	}
 
-	dev = dev_get_by_index(&init_net, interface_num);
-	if (!dev) {
-		DEBUG_INFO("device-ifindex[%d] is not present\n", interface_num);
-		return false;
-	}
-
 	BUG_ON(!rcu_read_lock_bh_held());
 
+	type = ecm_db_iface_type_get(to_ii);
+	switch (type) {
 #ifdef ECM_INTERFACE_IPSEC_ENABLE
-	if (dev->type == ECM_ARPHRD_IPSEC_TUNNEL_TYPE) {
-		DEBUG_INFO("Fast xmit is not enabled for ipsec device[%s]\n", dev->name);
-		dev_put(dev);
+	case ECM_DB_IFACE_TYPE_IPSEC_TUNNEL:
+		DEBUG_INFO("%px: Fast xmit is not enabled for ipsec device\n", to_ii);
 		return false;
-	}
 #endif
-	dev_put(dev);
+	default:
+		break;
+	}
+
+	/*
+	 * Do not set fast_xmit for flow coming from tunnel interface where host may
+	 * modify more than 256B of skb content. With fast_xmit flag set, complete
+	 * cache flush does not happen in WLAN.
+	 */
+	if (!ecm_sfe_tun_fast_xmit_enable) {
+		type = ecm_db_iface_type_get(from_ii);
+		switch (type) {
+		case ECM_DB_IFACE_TYPE_SIT:
+		case ECM_DB_IFACE_TYPE_TUNIPIP6:
+		case ECM_DB_IFACE_TYPE_PPPOL2TPV2:
+		case ECM_DB_IFACE_TYPE_PPTP:
+		case ECM_DB_IFACE_TYPE_MAP_T:
+		case ECM_DB_IFACE_TYPE_GRE_TUN:
+		case ECM_DB_IFACE_TYPE_GRE_TAP:
+		case ECM_DB_IFACE_TYPE_VXLAN:
+		case ECM_DB_IFACE_TYPE_OVPN:
+		case ECM_DB_IFACE_TYPE_L2TPV3:
+			DEBUG_INFO("%px: Fast xmit is not enabled for: %s", from_ii, ecm_db_interface_type_to_string(type));
+			return false;
+
+		default:
+			break;
+		}
+	}
+
 	return true;
 }
 
@@ -180,12 +214,27 @@ fail:
  */
 void ecm_sfe_common_fast_xmit_set(uint32_t *rule_flags, uint32_t *valid_flags, struct sfe_qdisc_rule *qdisc_rule, struct ecm_db_iface_instance *from_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX], struct ecm_db_iface_instance *to_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX], int32_t from_interfaces_first, int32_t to_interfaces_first)
 {
-	s32 interface_num;
+	struct ecm_db_iface_instance *from_ii;
+	struct ecm_db_iface_instance *to_ii;
 	bool qdisc_found = false;
 	bool is_ppeq = false;
+	s32 interface_num;
 	int list_index;
 
 	rcu_read_lock_bh();
+
+	/*
+	 * Get FROM and TO interface instance (top/bottom).
+	 */
+	from_ii = from_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX - 1];
+        if (*rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE) {
+		from_ii = from_ifaces[from_interfaces_first];
+	}
+
+	to_ii = to_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX - 1];
+        if (*rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE) {
+		to_ii = to_ifaces[to_interfaces_first];
+	}
 
 	/*
 	 * Check if a single qdisc is enabled in the interface heirarchy. If yes, configure qdisc rule
@@ -222,15 +271,11 @@ void ecm_sfe_common_fast_xmit_set(uint32_t *rule_flags, uint32_t *valid_flags, s
 	}
 
 	/*
-	 * Check if we can enable fast transmit for the destination interface (top/bottom)
+	 * Check if we can enable fast transmit for destination (FROM) interface.
+	 * This depends on qdisc and source (TO) interface also.
 	 */
-	interface_num = ecm_db_iface_interface_identifier_get(from_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX - 1]);
-        if (*rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE) {
-		interface_num = ecm_db_iface_interface_identifier_get(from_ifaces[from_interfaces_first]);
-	}
-
 	if ((!qdisc_found || (qdisc_rule->valid_flags & SFE_QDISC_RULE_FLOW_PPE_QDISC_FAST_XMIT))
-		&& ecm_sfe_common_fast_xmit_check(interface_num)) {
+		&& ecm_sfe_common_fast_xmit_check(from_ii, to_ii)) {
 		*rule_flags |= SFE_RULE_CREATE_FLAG_RETURN_TRANSMIT_FAST;
 	}
 	qdisc_found = false;
@@ -271,15 +316,11 @@ void ecm_sfe_common_fast_xmit_set(uint32_t *rule_flags, uint32_t *valid_flags, s
 	}
 
 	/*
-	 * Check if we can enable fast transmit for the destination interface (top/bottom)
+	 * Check if we can enable fast transmit for destination (TO) interface.
+	 * This depends on qdisc and source (FROM) interface also.
 	 */
-	interface_num = ecm_db_iface_interface_identifier_get(to_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX-1]);
-        if (*rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE) {
-		interface_num = ecm_db_iface_interface_identifier_get(to_ifaces[to_interfaces_first]);
-	}
-
 	if ((!qdisc_found || (qdisc_rule->valid_flags & SFE_QDISC_RULE_RETURN_PPE_QDISC_FAST_XMIT))
-		&& ecm_sfe_common_fast_xmit_check(interface_num)) {
+		&& ecm_sfe_common_fast_xmit_check(to_ii, from_ii)) {
 		*rule_flags |= SFE_RULE_CREATE_FLAG_FLOW_TRANSMIT_FAST;
 	}
 
@@ -380,6 +421,30 @@ int ecm_sfe_mht_enable_handler(struct ctl_table *ctl, int write, void __user *bu
 #endif
 
 /*
+ * ecm_sfe_tun_fast_xmit_enable_handler()
+ *	Tunnel fast transmit enable sysctl node handler.
+ */
+int ecm_sfe_tun_fast_xmit_enable_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	/*
+	 * Write the variable with user input
+	 */
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if ((ecm_sfe_tun_fast_xmit_enable != 0) && (ecm_sfe_tun_fast_xmit_enable != 1)) {
+		DEBUG_WARN("Invalid input. Valid values 0/1\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+/*
  * ecm_sfe_ipv4_is_conn_limit_reached()
  *	Connection limit is reached or not ?
  */
@@ -456,6 +521,13 @@ static struct ctl_table ecm_sfe_sysctl_tbl[] = {
 		.proc_handler   = &ecm_sfe_mht_enable_handler,
 	},
 #endif
+	{
+		.procname	= "sfe_tun_fast_xmit_enable",
+		.data		= &ecm_sfe_tun_fast_xmit_enable,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_sfe_tun_fast_xmit_enable_handler,
+	},
 	{}
 };
 
@@ -692,11 +764,19 @@ void ecm_sfe_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 		mark.protocol = msg->protocol;
 		mark.src_port = msg->flow_src_port;
 		mark.dest_port = msg->flow_dest_port;
+		if (msg->flags & ECM_FRONT_END_DEPRIO) {
+			mark.flags |= SFE_SAWF_MARK_DEPRIO;
+		}
+
 		if (msg->ip_version == 4) {
 			mark.src_ip[0] = msg->flow_src_ip[0];
 			mark.dest_ip[0] = msg->flow_dest_ip[0];
 
-			sfe_ipv4_mark_rule_update(&mark);
+			msg->status = sfe_ipv4_mark_rule_update(&mark);
+			if (!msg->status) {
+				DEBUG_WARN("%px: Failed to update mark value in SFE", feci);
+				return;
+			}
 
 			DEBUG_TRACE("%px: sawf flow/return mark=0x%08x/0x%08x %pI4:%u -> %pI4:%u protocol=%u\n",
 					feci, mark.flow_mark, mark.return_mark,
@@ -707,7 +787,11 @@ void ecm_sfe_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 			ECM_IP_ADDR_COPY(mark.src_ip, msg->flow_src_ip);
 			ECM_IP_ADDR_COPY(mark.dest_ip, msg->flow_dest_ip);
 
-			sfe_ipv6_mark_rule_update(&mark);
+			msg->status = sfe_ipv6_mark_rule_update(&mark);
+			if (!msg->status) {
+				DEBUG_WARN("%px: Failed to update mark value in SFE", feci);
+				return;
+			}
 
 			DEBUG_TRACE("%px: sawf flow/return mark=0x%08x/0x%08x %pI6c@%u -> %pI6c@%u protocol=%u\n",
 					feci, mark.flow_mark, mark.return_mark,
@@ -946,5 +1030,32 @@ bool ecm_sfe_common_get_mht_port_id(struct ecm_front_end_connection_instance *fe
 
 	dev_put(dev);
 	return true;
+}
+#endif
+
+#ifdef ECM_FRONT_END_PPE_ENABLE
+/*
+ * ecm_sfe_common_get_vp_from_iface_id()
+ *	Looks up for a tunnel VP in PPE.
+ */
+int ecm_sfe_common_get_vp_from_iface_id(int32_t iface_id)
+{
+	int vp = -1;
+	struct net_device *dev = NULL;
+
+	dev = dev_get_by_index(&init_net, iface_id);
+	if (!dev) {
+		goto done;
+	}
+
+#ifdef ECM_INTERFACE_GRE_TAP_ENABLE
+	if (dev->priv_flags_ext & (IFF_EXT_GRE_V4_TAP | IFF_EXT_GRE_V6_TAP)) {
+		vp = ppe_tun_hybrid_ol_ctx_get(dev);
+	}
+#endif
+	dev_put(dev);
+
+done:
+	return vp;
 }
 #endif

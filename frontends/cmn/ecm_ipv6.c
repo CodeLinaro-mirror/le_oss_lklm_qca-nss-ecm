@@ -1,20 +1,9 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- **************************************************************************
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
+ ***************************************************************************
  */
 
 #include <linux/version.h>
@@ -120,13 +109,17 @@ DEFINE_SPINLOCK(ecm_ipv6_lock);			/* Protect against SMP access between netfilte
  */
 bool ecm_ipv6_terminate_pending = false;		/* True when the user has signalled we should quit */
 
+extern int register_ip_post_routing;			/* Module param to indicate if ECM should register for post routing*/
+extern int register_br_post_routing;			/* Module param to indicate if ECM should register for bridge post routing*/
+
 /*
  * ecm_ipv6_dev_has_ipaddr()
- *	Returns true if dev has an IPv6 address
+ *	Returns true if dev has an IPv6 address with greater scope than link-local
  */
 bool ecm_ipv6_dev_has_ipaddr(struct net_device *dev)
 {
 	struct inet6_dev *ip6_inetdev;
+	struct inet6_ifaddr *ip6_ifaddr;
 
 	ip6_inetdev = __in6_dev_get(dev);
 	if (!ip6_inetdev) {
@@ -140,7 +133,54 @@ bool ecm_ipv6_dev_has_ipaddr(struct net_device *dev)
 		DEBUG_TRACE("%px: dev->ip6_ptr->addr_list is empty for %s\n", dev, dev->name);
 		return false;
 	}
+
+	/*
+	 * Each device address list is sorted in order of scope -
+	 * global before linklocal.
+	 */
+	list_for_each_entry(ip6_ifaddr, &ip6_inetdev->addr_list, if_list) {
+		if (ipv6_addr_src_scope(&ip6_ifaddr->addr) > IPV6_ADDR_SCOPE_LINKLOCAL) {
+			/*
+			 * This address has greater scope than link-local
+			 */
+			read_unlock_bh(&ip6_inetdev->lock);
+
+			DEBUG_TRACE("%px: interface %s has IPv6 address %pI6 with > linklocal scope\n",
+					dev, dev->name, &ip6_ifaddr->addr);
+			return true;
+		}
+		break;
+	}
 	read_unlock_bh(&ip6_inetdev->lock);
+
+	DEBUG_TRACE("%px: interface %s has no IPv6 global scope address\n", dev, dev->name);
+	return false;
+}
+
+/*
+ * ecm_ipv6_is_ns_allowed()
+ *	Check if Neighbor Solicitation is allowed for a given tunnel interface.
+ */
+static bool ecm_ipv6_is_ns_allowed(struct net_device *dev, struct sk_buff *skb)
+{
+	struct ipv6hdr *iph;
+	uint8_t proto;
+
+	iph = ipv6_hdr(skb);
+	proto = iph->nexthdr;
+
+	/*
+	 * For tunnels, sending a Neighbor Solicitation while the
+	 * packet is being transmitted can lead to a deadlock.
+	 * Dont send NS frames on tunnel interface if the IP protocol is of tunnel type
+	 */
+	if ((dev->priv_flags_ext & IFF_EXT_ETH_L2TPV3) && (proto == IPPROTO_L2TP)) {
+		return false;
+	}
+
+	if ((dev->priv_flags_ext & IFF_EXT_GRE_V6_TAP) && (proto == IPPROTO_GRE)) {
+		return false;
+	}
 
 	return true;
 }
@@ -352,7 +392,7 @@ struct ecm_db_node_instance *ecm_ipv6_node_establish_and_ref(struct ecm_front_en
 				if (unlikely(!ecm_interface_mac_addr_get_no_route(local_dev, remote_ip, node_addr))) {
 					ip_addr_t gw_addr = ECM_IP_ADDR_NULL;
 
-					if (!ecm_interface_find_gateway(remote_ip, NULL, gw_addr)) {
+					if (!ecm_interface_find_gateway(remote_ip, NULL, gw_addr, skb->mark)) {
 						DEBUG_WARN("%px: failed to obtain Gateway address for host " ECM_IP_ADDR_DOT_FMT "\n", feci, ECM_IP_ADDR_TO_DOT(remote_ip));
 						dev_put(local_dev);
 						return NULL;
@@ -480,6 +520,25 @@ struct ecm_db_node_instance *ecm_ipv6_node_establish_and_ref(struct ecm_front_en
 			DEBUG_TRACE("%px: VLAN interface unsupported\n", feci);
 			return NULL;
 #endif
+		case ECM_DB_IFACE_TYPE_DSA:
+#ifdef ECM_INTERFACE_DSA_ENABLE
+			/*
+			 * DSA handled same along with ethernet, lag, bridge etc.
+			 */
+#else
+			/*
+			 * Additional check is required for cases where DSA interface is not enabled.
+			 * and VLAN case fall through happens. In that scenario, it's important to
+			 * cross-check if we are correctly returning.
+			 */
+			if (type == ECM_DB_IFACE_TYPE_DSA) {
+				DEBUG_TRACE("DSA interface unsupported\n");
+				return NULL;
+			}
+#if __has_attribute(__fallthrough__)
+			__attribute__((__fallthrough__));
+#endif
+#endif
 		case ECM_DB_IFACE_TYPE_IPSEC_TUNNEL:
 #ifdef ECM_XFRM_ENABLE
 			if (dst_xfrm(skb_dst(skb))) {
@@ -517,7 +576,7 @@ struct ecm_db_node_instance *ecm_ipv6_node_establish_and_ref(struct ecm_front_en
 				/*
 				 * Try one more time with gateway ip address if it exists.
 				 */
-				if (!ecm_interface_find_gateway(addr, saddr, gw_addr)) {
+				if (!ecm_interface_find_gateway(addr, saddr, gw_addr, skb->mark)) {
 					DEBUG_WARN("%px: Node establish failed, there is no gateway address for 2nd mac lookup try\n", feci);
 					return NULL;
 				}
@@ -547,7 +606,7 @@ struct ecm_db_node_instance *ecm_ipv6_node_establish_and_ref(struct ecm_front_en
 					}
 					ecm_interface_send_neighbour_solicitation(master, gw_addr);
 					dev_put(master);
-				} else {
+				} else if (ecm_ipv6_is_ns_allowed(dev, skb)) {
 					ecm_interface_send_neighbour_solicitation(dev, gw_addr);
 				}
 
@@ -855,26 +914,35 @@ void ecm_ipv6_connection_regenerate(struct ecm_db_connection_instance *ci, ecm_t
 	struct ecm_front_end_ovs_params *to_ovs_params = NULL;
 	struct ecm_front_end_ovs_params *from_nat_ovs_params = NULL;
 	struct ecm_front_end_ovs_params *to_nat_ovs_params = NULL;
+	struct nf_conn *ct;
+	enum ip_conntrack_info ctinfo;
 
 	DEBUG_INFO("%px: re-gen needed\n", ci);
 
 	/*
-	 * We may need to swap the devices around depending on who the sender of the packet that triggered the re-gen is
+	 * If packet is in the reverse direction relative to the established ECM connection,
+	 * we cannot re-construct the interface with this packet. We need a packet in the same
+	 * direction of connection instance.
 	 */
 	if (sender == ECM_TRACKER_SENDER_TYPE_DEST) {
-		struct net_device *tmp_dev;
+		DEBUG_TRACE("%px: Re-gen can be done with the same ci direction packet\n", ci);
+		ecm_db_connection_regeneration_failed(ci);
+		return ;
+	}
 
-		/*
-		 * This is a packet sent by the destination of the connection, i.e. it is a packet issued by the 'from' side of the connection.
-		 */
-		DEBUG_TRACE("%px: Re-gen swap devs\n", ci);
-		tmp_dev = out_dev;
-		out_dev = in_dev;
-		in_dev = tmp_dev;
-
-		tmp_dev = out_dev_nat;
-		out_dev_nat = in_dev_nat;
-		in_dev_nat = tmp_dev;
+	/*
+	 * This regenerate function is called after the connection is established. At that time,
+	 * sender is normalized relative to the connection direction. Here, we use sender in the
+	 * ecm_front_end_ipv6_interface_construct_set_and_hold() function to set the input interfaces
+	 * for the hierarchy re-construct function. So, we need to use the sender value relative to the
+	 * conntarck direction as we used it while creating the new ECM database connection.
+	 */
+	ct = nf_ct_get(skb, &ctinfo);
+	if (likely(ct) && likely(ctinfo != IP_CT_UNTRACKED)) {
+		if (IP_CT_DIR_ORIGINAL != CTINFO2DIR(ctinfo)) {
+			DEBUG_TRACE("%px: Normalize the sender to DEST relative to conntrack\n", ci);
+			sender = ECM_TRACKER_SENDER_TYPE_DEST;
+		}
 	}
 
 	/*
@@ -1051,7 +1119,7 @@ ecm_ipv6_retry_regen:
  */
 unsigned int ecm_ipv6_ip_process(struct net_device *out_dev, struct net_device *in_dev,
 							uint8_t *src_node_addr, uint8_t *dest_node_addr,
-							bool can_accel, bool is_routed, bool is_l2_encap,
+							bool can_accel, bool is_routed, bool is_l2_encap, bool is_v6_hairpin_nat,
 							struct sk_buff *skb, uint16_t l2_encap_proto)
 {
 	struct ecm_tracker_ip_header ip_hdr;
@@ -1175,8 +1243,10 @@ unsigned int ecm_ipv6_ip_process(struct net_device *out_dev, struct net_device *
 		orig_tuple = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
 		reply_tuple = ct->tuplehash[IP_CT_DIR_REPLY].tuple;
 		if (IP_CT_DIR_ORIGINAL == CTINFO2DIR(ctinfo)) {
+			DEBUG_TRACE("%px: sender is SRC relative to conntrack\n", skb);
 			sender = ECM_TRACKER_SENDER_TYPE_SRC;
 		} else {
+			DEBUG_TRACE("%px: sender is DEST relative to conntrack\n", skb);
 			sender = ECM_TRACKER_SENDER_TYPE_DEST;
 		}
 
@@ -1253,7 +1323,12 @@ vxlan_done:
 	 * Work out if this packet involves NAT or not.
 	 * If it does involve NAT then work out if this is an ingressing or egressing packet.
 	 */
-	if (ipv6_addr_cmp(&orig_tuple.src.u3.in6, &reply_tuple.dst.u3.in6)) {
+	if (is_v6_hairpin_nat) {
+		/*
+		 * Hairpin NAT
+		 */
+		ecm_dir = ECM_DB_DIRECTION_HAIRPIN_NAT;
+	} else if (ipv6_addr_cmp(&orig_tuple.src.u3.in6, &reply_tuple.dst.u3.in6)) {
 		/*
 		 * Egressing NAT
 		 */
@@ -1432,6 +1507,38 @@ vxlan_done:
 	 *
 	 *	dest_node_addr refers to node address of ip_dest_addr
 	 *	dest_node_addr_nat is set to dest_node_addr
+	 *
+	 * Example 7:
+	 * An 'original' direction packet to an Hairpin connection from one client of br-lan:4AAA::Z to the other client connecting to 4aaa::Y
+	 * via NAT'ing router mapping br-lan:6aaa::/64 looks like:
+	 *	orig_tuple->src == 4aaa::Z		This becomes ip_src_addr
+	 *	orig_tuple->dst == 6aaa::Y		This becomes ip_dest_addr_nat
+	 *	reply_tuple->src == 4aaa::Y		This becomes ip_dest_addr
+	 *	reply_tuple->dest == 6aaa::Z		This becomes ip_src_addr_nat
+	 *
+	 *	in_dev would be br-lan - i.e. the device of ip_src_addr
+	 *	out_dev would be br-lan - i.e. the device of ip_dest_addr
+	 *	in_dev_nat would be br-lan - i.e. out_dev, the device of ip_src_addr_nat
+	 *	out_dev_nat would be br-lan - i.e. out_dev, the device of ip_dest_addr_nat
+	 *
+	 *	From a node MAC address perspective we are at position X in the following topology:
+	 *	(4aaa::Z)LAN PC======ETH1___ETH2====X====LAN PC(4aaa::Y)
+	 *
+	 * Example 8:
+	 * A 'reply' direction packet to the Hairpin connection from one client for br-lan 4aaa::Y to the other client connecting to 4aaa::Z
+	 * via NAT'ing router mapping br-lan:6aaa::/64 looks like:
+	 *	orig_tuple->src == 4aaa::Z		This becomes ip_dest_addr
+	 *	orig_tuple->dst == 6aaa::Y		This becomes ip_src_addr_nat
+	 *	reply_tuple->src == 4aaa::Y		This becomes ip_src_addr
+	 *	reply_tuple->dest == 6aaa::Z		This becomes ip_dest_addr_nat
+	 *
+	 *	in_dev would be br-lan - i.e. the device of ip_src_addr
+	 *	out_dev would be br-lan - i.e. the device of ip_dest_addr
+	 *	in_dev_nat would be br-lan - i.e. out_dev, the device of ip_src_addr_nat
+	 *	out_dev_nat would be br-lan - i.e. out_dev, the device of ip_dest_addr_nat
+	 *
+	 *	From a Node address perspective we are at position X in the following topology:
+	 *	(4aaa::Z)LAN PC======ETH1___ETH2====X====LAN PC(4aaa::Y)
 	 */
 	if (sender == ECM_TRACKER_SENDER_TYPE_SRC) {
 		if (ecm_dir == ECM_DB_DIRECTION_EGRESS_NAT) {
@@ -1479,6 +1586,19 @@ vxlan_done:
 
 			src_node_addr_nat = src_node_addr;
 			dest_node_addr_nat = dest_node_addr;
+		} else if (ecm_dir == ECM_DB_DIRECTION_HAIRPIN_NAT) {
+			/*
+			 * Example 7
+			 */
+			ECM_NIN6_ADDR_TO_IP_ADDR(ip_src_addr, orig_tuple.src.u3.in6);
+                        ECM_NIN6_ADDR_TO_IP_ADDR(ip_dest_addr_nat, orig_tuple.dst.u3.in6);
+                        ECM_NIN6_ADDR_TO_IP_ADDR(ip_dest_addr, reply_tuple.src.u3.in6);
+                        ECM_NIN6_ADDR_TO_IP_ADDR(ip_src_addr_nat, reply_tuple.dst.u3.in6);
+
+			in_dev_nat = out_dev;
+			out_dev_nat = out_dev;
+			src_node_addr_nat = src_node_addr = NULL;
+			dest_node_addr_nat = dest_node_addr = NULL;
 		} else {
 			DEBUG_ASSERT(false, "Unhandled ecm_dir: %d\n", ecm_dir);
 		}
@@ -1528,7 +1648,20 @@ vxlan_done:
 
 			src_node_addr_nat = src_node_addr;
 			dest_node_addr_nat = dest_node_addr;
-		} else {
+		} else if (ecm_dir == ECM_DB_DIRECTION_HAIRPIN_NAT) {
+			/*
+			 * Example 8
+			 */
+			ECM_NIN6_ADDR_TO_IP_ADDR(ip_dest_addr, orig_tuple.src.u3.in6);
+			ECM_NIN6_ADDR_TO_IP_ADDR(ip_src_addr_nat, orig_tuple.dst.u3.in6);
+			ECM_NIN6_ADDR_TO_IP_ADDR(ip_src_addr, reply_tuple.src.u3.in6);
+			ECM_NIN6_ADDR_TO_IP_ADDR(ip_dest_addr_nat, reply_tuple.dst.u3.in6);
+
+			in_dev_nat = out_dev;
+                        out_dev_nat = out_dev;
+			src_node_addr_nat = src_node_addr = NULL;
+			dest_node_addr_nat = dest_node_addr = NULL;
+                } else {
 			DEBUG_ASSERT(false, "Unhandled ecm_dir: %d\n", ecm_dir);
 		}
 	}
@@ -1546,9 +1679,11 @@ vxlan_done:
 			protonum = IPPROTO_RAW;
 		}
 	}
-	DEBUG_TRACE("IP Packet src: " ECM_IP_ADDR_OCTAL_FMT "dst: " ECM_IP_ADDR_OCTAL_FMT " protocol: %u, sender: %d ecm_dir: %d\n",
+	DEBUG_TRACE("IP Packet src: " ECM_IP_ADDR_OCTAL_FMT "dst: " ECM_IP_ADDR_OCTAL_FMT "src_nat: " ECM_IP_ADDR_OCTAL_FMT "dst_nat " ECM_IP_ADDR_OCTAL_FMT " protocol: %u, sender: %d ecm_dir: %d\n",
 			ECM_IP_ADDR_TO_OCTAL(ip_src_addr),
 			ECM_IP_ADDR_TO_OCTAL(ip_dest_addr),
+			ECM_IP_ADDR_TO_OCTAL(ip_src_addr_nat),
+			ECM_IP_ADDR_TO_OCTAL(ip_dest_addr_nat),
 			protonum, sender, ecm_dir);
 	/*
 	 * Non-unicast source or destination packets are ignored
@@ -1632,6 +1767,48 @@ static bool ecm_ipv6_is_bridge_pkt(struct net_device *in, struct net_device *out
 }
 
 /*
+ * ecm_ipv6_is_hairpin_nat()
+ *	Check if this is a hairpin NAT data connection.
+ */
+static bool ecm_ipv6_is_hairpin_nat(struct sk_buff *skb, struct net_device **in, struct net_device *out)
+{
+	struct nf_conntrack_tuple orig_tuple;
+	struct nf_conntrack_tuple reply_tuple;
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn *ct;
+
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct) {
+		DEBUG_TRACE("%px: no ct\n", skb);
+		return false;
+	}
+
+	orig_tuple = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	reply_tuple = ct->tuplehash[IP_CT_DIR_REPLY].tuple;
+
+	/*
+	 * For Hairpin NAT flows, the Linux nf-conntrack will contain both SNAT and DNAT tuple information.
+	 * (orig_tuple->src) --> (reply_tuple->dst) indicates Source IPv6 adddress NATTing
+	 * (orig_tuple->dst) --> (reply_tuple->src) indicates Destination IPv6 adddress NATTing.
+	 */
+	if (ipv6_addr_cmp(&orig_tuple.src.u3.in6, &reply_tuple.dst.u3.in6) &&
+		ipv6_addr_cmp(&orig_tuple.dst.u3.in6, &reply_tuple.src.u3.in6)) {
+
+		/*
+		 * For Hairpin NAT flows, in/out devices should be a bridge device.
+		 * Since (out) dev is a bridge, point (in) device to (out) device.
+		 */
+		dev_put(*in);
+		*in = out;
+		dev_hold(*in);
+
+		return true;
+	}
+
+	return false;
+}
+
+/*
  * ecm_ipv6_post_routing_hook()
  *	Called for IP packets that are going out to interfaces after IP routing stage.
  */
@@ -1641,7 +1818,7 @@ static unsigned int ecm_ipv6_post_routing_hook(void *priv,
 {
 	struct net_device *out = nhs->out;
 	struct net_device *in;
-	bool can_accel = true;
+	bool can_accel = true, is_v6_hairpin_nat = false;
 	unsigned int result;
 
 	DEBUG_TRACE("%px: Routing: %s\n", out, out->name);
@@ -1725,13 +1902,17 @@ static unsigned int ecm_ipv6_post_routing_hook(void *priv,
 	}
 
 	/*
-	 * Skip bridge flow packet
+	 * Skip bridge flow packet when it is not a hairpin NAT flow.
 	 */
 	if (ecm_ipv6_is_bridge_pkt(in, out)) {
-		DEBUG_TRACE("Bridge flow, ignoring: %px\n", skb);
-		dev_put(in);
-		ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_CMN, ECM_STATS_V6_EXCEPTION_BRIDGE_PACKET_WRONG_HOOK);
-		return NF_ACCEPT;
+		if (!ecm_ipv6_is_hairpin_nat(skb, &in, out)) {
+			DEBUG_TRACE("Bridge flow, ignoring: %px\n", skb);
+			dev_put(in);
+			ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_CMN, ECM_STATS_V6_EXCEPTION_BRIDGE_PACKET_WRONG_HOOK);
+			return NF_ACCEPT;
+		}
+
+		is_v6_hairpin_nat = true;
 	}
 
 #ifndef ECM_INTERFACE_OVS_BRIDGE_ENABLE
@@ -1746,7 +1927,7 @@ static unsigned int ecm_ipv6_post_routing_hook(void *priv,
 #endif
 
 	DEBUG_TRACE("Post routing process skb %px, out: %px, in: %px\n", skb, out, in);
-	result = ecm_ipv6_ip_process((struct net_device *)out, in, NULL, NULL, can_accel, true, false, skb, 0);
+	result = ecm_ipv6_ip_process((struct net_device *)out, in, NULL, NULL, can_accel, true, false, is_v6_hairpin_nat, skb, 0);
 	dev_put(in);
 	return result;
 }
@@ -1795,7 +1976,7 @@ static unsigned int ecm_ipv6_pppoe_bridge_process(struct net_device *out,
 
 	result = ecm_ipv6_ip_process(out, in, skb_eth_hdr->h_source,
 					 skb_eth_hdr->h_dest, can_accel,
-					 false, true, skb, ETH_P_PPP_SES);
+					 false, true, false, skb, ETH_P_PPP_SES);
 skip_ipv6_process:
 	ecm_front_end_push_l2_encap_header(skb, encap_header_len);
 	skb->protocol = htons(ETH_P_PPP_SES);
@@ -1838,7 +2019,7 @@ static unsigned int ecm_ipv6_vlan_bridge_process(struct net_device *out,
 
 	result = ecm_ipv6_ip_process(out, in, skb_eth_hdr->h_source,
 					 skb_eth_hdr->h_dest, can_accel,
-					 false, true, skb, ETH_P_8021Q);
+					 false, true, false, skb, ETH_P_8021Q);
 skip_ipv6_vlan_process:
 	ecm_front_end_push_l2_encap_header(skb, encap_header_len);
 	skb->protocol = htons(ETH_P_8021Q);
@@ -2073,7 +2254,7 @@ static unsigned int ecm_ipv6_bridge_post_routing_hook(void *priv,
 		goto skip_ipv6_bridge_flow;
 	}
 	result = ecm_ipv6_ip_process((struct net_device *)out, in,
-							skb_eth_hdr->h_source, skb_eth_hdr->h_dest, can_accel, false, false, skb, 0);
+							skb_eth_hdr->h_source, skb_eth_hdr->h_dest, can_accel, false, false, false, skb, 0);
 skip_ipv6_bridge_flow:
 	dev_put(in);
 	dev_put(bridge);
@@ -2189,7 +2370,7 @@ unsigned int ecm_ipv6_ovs_dp_process(struct sk_buff *skb, struct net_device *out
 	}
 
 	ecm_ipv6_ip_process((struct net_device *)out, in,
-			skb_eth_hdr->h_source, skb_eth_hdr->h_dest, can_accel, false, false, skb, ETH_P_IPV6);
+			skb_eth_hdr->h_source, skb_eth_hdr->h_dest, can_accel, false, false, false, skb, ETH_P_IPV6);
 	dev_put(in);
 
 	return 0;
@@ -2232,27 +2413,25 @@ int ecm_ipv6_init(struct dentry *dentry)
 	}
 
 	/*
+	 * Based on the module param register for post routing hook.
+	 * Now packets that are being routed at the IP layer
+	 * will be accelerated.
+	 * eg ETH <---> 5GFWA and WLAN<-->5GFWA flows.
 	 * Register netfilter routing hooks
 	 */
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-	result = nf_register_hooks(ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
-#else
-	result = nf_register_net_hooks(&init_net, ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
-#endif
-	if (result < 0) {
-		DEBUG_ERROR("Can't register common netfilter routing hooks.\n");
-		goto nf_register_failed_1;
+	if (register_ip_post_routing) {
+		result = nf_register_net_hooks(&init_net, ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
+		if (result < 0) {
+			DEBUG_ERROR("Can't register common netfilter routing hooks.\n");
+			goto nf_register_failed_1;
+		}
 	}
 
 	/*
-	 * Register netfilter bridge hooks, if the frontend type supports it. SFE only mode doesn't support it.
+	 * Register netfilter bridge hooks based on the module param register_br_post_routing.
 	 */
-	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_BRIDGE)) {
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-		result = nf_register_hooks(ecm_ipv6_netfilter_bridge_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_bridge_hooks));
-#else
+	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_BRIDGE) && register_br_post_routing) {
 		result = nf_register_net_hooks(&init_net, ecm_ipv6_netfilter_bridge_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_bridge_hooks));
-#endif
 		if (result < 0) {
 			DEBUG_ERROR("Can't register common netfilter bridge hooks.\n");
 			goto nf_register_failed_2;
@@ -2270,11 +2449,9 @@ int ecm_ipv6_init(struct dentry *dentry)
 	return 0;
 
 nf_register_failed_2:
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-	nf_unregister_hooks(ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
-#else
-	nf_unregister_net_hooks(&init_net, ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
-#endif
+	if (register_ip_post_routing) {
+		nf_unregister_net_hooks(&init_net, ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
+	}
 nf_register_failed_1:
 	ecm_sfe_ipv6_exit();
 
@@ -2302,24 +2479,19 @@ void ecm_ipv6_exit(void)
 	spin_unlock_bh(&ecm_ipv6_lock);
 
 	/*
-	 * Unregister netfilter bridge hooks, if the frontend type supports it. SFE only mode doesn't support it.
+	 * Unregister netfilter bridge hook, based on module param register_br_post_routing.
 	 */
-	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_BRIDGE)) {
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-		nf_unregister_hooks(ecm_ipv6_netfilter_bridge_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_bridge_hooks));
-#else
+	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_BRIDGE) && register_br_post_routing) {
 		nf_unregister_net_hooks(&init_net, ecm_ipv6_netfilter_bridge_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_bridge_hooks));
-#endif
 	}
 
 	/*
 	 * Unregister the netfilter routing hooks.
 	 */
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-	nf_unregister_hooks(ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
-#else
-	nf_unregister_net_hooks(&init_net, ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
-#endif
+	if (register_ip_post_routing) {
+		nf_unregister_net_hooks(&init_net, ecm_ipv6_netfilter_routing_hooks, ARRAY_SIZE(ecm_ipv6_netfilter_routing_hooks));
+	}
+
 #ifdef ECM_INTERFACE_OVS_BRIDGE_ENABLE
 	if (ecm_front_end_is_feature_supported(ECM_FE_FEATURE_OVS_BRIDGE)) {
 		ovsmgr_dp_hook_unregister(&ecm_ipv6_dp_hooks);

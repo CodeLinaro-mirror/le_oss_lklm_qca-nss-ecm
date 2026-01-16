@@ -106,6 +106,8 @@ enum ecm_db_connection_defunct_by_5tuple_options {
 enum ecm_db_connection_defunct_type {
 	ECM_DB_CONNECTION_DEFUNCT_TYPE_STA_JOIN,		/* Defunct connection on STA join notification */
 	ECM_DB_CONNECTION_DEFUNCT_TYPE_IGNORE,			/* Ignore the defunct type while defuncting the connection */
+	ECM_DB_CONNECTION_DEFUNCT_TYPE_SCS_MSCS_TEARDOWN,	/* Defunct connection on SCS/MSCS Teardown */
+	ECM_DB_CONNECTION_DEFUNCT_TYPE_ARP_DELETE,		/* Defunct only routed connection in case of ARP delete event */
 	ECM_DB_CONNECTION_DEFUNCT_TYPE_MAX,
 };
 typedef enum ecm_db_connection_defunct_type ecm_db_connection_defunct_type_t;
@@ -137,6 +139,8 @@ struct ecm_db_connection_defunct_info {
 	ecm_db_connection_defunct_type_t type;			/* Connection defunct event type */
 	uint8_t mac[ETH_ALEN];					/* MAC address */
 	bool should_keep_connection;				/* should keep connection decision of classifer */
+	uint8_t wifi_qm_id;						/* Wi-Fi QoS management id like SCS id */
+	uint8_t wifi_qm_type;					/* Wi-Fi QoS management type like SCS/MSCS */
 };
 
 /*
@@ -163,6 +167,7 @@ struct ecm_db_connection_instance {
 	bool timer_no_touch;					/* RO: Do no update timer when this flag is set */
 	uint16_t l2_encap_proto;				/* L2 encap protocol of the flow of this connection */
 	uint32_t mark;						/* The result value of mark classifier on this connection */
+	bool is_rtp;						/* RTP is present in UDP if this flag is set */
 
 	/*
 	 * Connection endpoint mapping
@@ -492,11 +497,15 @@ void ecm_db_connection_flag_set(struct ecm_db_connection_instance *ci, uint32_t 
 
 void ecm_db_connection_l2_encap_proto_set(struct ecm_db_connection_instance *ci, uint16_t l2_encap_proto);
 uint16_t ecm_db_connection_l2_encap_proto_get(struct ecm_db_connection_instance *ci);
+void ecm_db_connection_rtp_set(struct ecm_db_connection_instance *ci, bool is_rtp);
+bool ecm_db_connection_is_rtp(struct ecm_db_connection_instance *ci);
+
 void ecm_db_connection_mark_set(struct ecm_db_connection_instance *ci, uint32_t mark);
 uint32_t ecm_db_connection_mark_get(struct ecm_db_connection_instance *ci);
 
 void ecm_db_connection_defunct_by_classifier(int ip_ver, ip_addr_t src_addr, uint16_t src_port, ip_addr_t dest_addr,
 						uint16_t dest_port, int proto, bool is_routed, ecm_classifier_type_t ca_type);
 bool ecm_db_connection_defunct_5tuple_buffer(char *buf);
+
 bool ecm_db_connection_init(struct dentry *dentry);
 void ecm_db_connection_exit(void);

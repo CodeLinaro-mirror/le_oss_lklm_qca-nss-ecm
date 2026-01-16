@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2016-2017, 2019-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -86,6 +75,11 @@
 #endif
 
 /*
+ * Default path for sysctl
+ */
+#define ECM_CONNTRACK_NOTIFIER_PATH "net/ecm/ecm_conntrack_notifier"
+
+/*
  * Locking of the classifier - concurrency control
  */
 static DEFINE_SPINLOCK(ecm_conntrack_notifier_lock __attribute__((unused)));	/* Protect against SMP access between netfilter, events and private threaded function. */
@@ -94,6 +88,11 @@ static DEFINE_SPINLOCK(ecm_conntrack_notifier_lock __attribute__((unused)));	/* 
  * Debugfs dentry object.
  */
 static struct dentry *ecm_conntrack_notifier_dentry;
+
+/*
+ * Sysctl table header.
+ */
+static struct ctl_table_header *ecm_conntrack_notifier_ctl_table_header;
 
 /*
  * General operational control
@@ -328,6 +327,13 @@ int ecm_conntrack_ipv4_event(unsigned long events, struct nf_conn *ct)
 EXPORT_SYMBOL(ecm_conntrack_ipv4_event);
 
 #ifdef CONFIG_NF_CONNTRACK_EVENTS
+#ifndef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
+static int ecm_conntrack_expect_event(unsigned int events, const struct nf_exp_event *item)
+{
+	return 0;
+}
+#endif
+
 /*
  * ecm_conntrack_event()
  *	Callback event invoked when conntrack connection state changes, currently we handle destroy events to quickly release state
@@ -335,7 +341,7 @@ EXPORT_SYMBOL(ecm_conntrack_ipv4_event);
 #ifdef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
 static int ecm_conntrack_event(struct notifier_block *this, unsigned long events, void *ptr)
 #else
-static int ecm_conntrack_event(unsigned int events, struct nf_ct_event *item)
+static int ecm_conntrack_event(unsigned int events, const struct nf_ct_event *item)
 #endif
 {
 #ifdef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
@@ -360,20 +366,6 @@ static int ecm_conntrack_event(unsigned int events, struct nf_ct_event *item)
 	}
 
 	/*
-	 * Fake untracked conntrack objects were removed on 4.12 kernel version
-	 * and onwards.
-	 */
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 12, 0))
-	if (unlikely(ct == nf_ct_untracked_get())) {
-		/*
-		 * Special untracked connection is not monitored
-		 */
-		DEBUG_TRACE("Fake connection event - ignoring\n");
-		return NOTIFY_DONE;
-	}
-#endif
-
-	/*
 	 * Only interested if this is IPv4 or IPv6.
 	 */
 	if (nf_ct_l3num(ct) == AF_INET) {
@@ -385,6 +377,49 @@ static int ecm_conntrack_event(unsigned int events, struct nf_ct_event *item)
 	}
 #endif
 	return NOTIFY_DONE;
+}
+
+/*
+ * ecm_conntrack_notifier_stop_handler()
+ * 	Proc handler to stop conntrack notifier
+ */
+static int ecm_conntrack_notifier_stop_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	/*
+	 * Usage:
+	 *
+	 * Stop conntrack notifier
+	 * echo 1 > /proc/sys/net/ecm/ecm_conntrack_notifier/stop
+	 *
+	 * Start conntrack notifier
+	 * echo 0 > /proc/sys/net/ecm/ecm_conntrack_notifier/stop
+	 *
+	 * To read status:
+	 * cat /proc/sys/net/ecm/ecm_conntrack_notifier/stop
+	 */
+
+	int ret;
+	int current_val;
+
+	/*
+	 * Write the value with user input
+	 */
+	current_val = ecm_conntrack_notifier_stopped;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		/*
+		 * Return if failure or read operations
+		 */
+		return ret;
+	}
+
+	if ((ecm_conntrack_notifier_stopped != 0) && (ecm_conntrack_notifier_stopped != 1)) {
+		ecm_conntrack_notifier_stopped = current_val;
+		DEBUG_ERROR("Invalid input, valid input 0/1\n");
+		return -EINVAL;
+	}
+
+	return ret;
 }
 
 #ifdef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
@@ -401,10 +436,22 @@ static struct notifier_block ecm_conntrack_notifier = {
  *	Netfilter conntrack event system to monitor connection tracking changes
  */
 static struct nf_ct_event_notifier ecm_conntrack_notifier = {
-	.fcn	= ecm_conntrack_event,
+	.ct_event	= ecm_conntrack_event,
+	.exp_event	= ecm_conntrack_expect_event
 };
 #endif
 #endif
+
+static struct ctl_table ecm_conntrack_notifier_ctl_table[] = {
+	{
+		.procname	= "stop",
+		.data		= &ecm_conntrack_notifier_stopped,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_conntrack_notifier_stop_handler,
+	},
+	{ }
+};
 
 /*
  * ecm_conntrack_notifier_stop()
@@ -423,29 +470,41 @@ int ecm_conntrack_notifier_init(struct dentry *dentry)
 	int result __attribute__((unused));
 	DEBUG_INFO("ECM Conntrack Notifier init\n");
 
+	/*
+	 * Register sysctl table for Conntrack notifier
+	 */
+	ecm_conntrack_notifier_ctl_table_header = register_sysctl(ECM_CONNTRACK_NOTIFIER_PATH, ecm_conntrack_notifier_ctl_table);
+	if (!ecm_conntrack_notifier_ctl_table_header) {
+		DEBUG_ERROR("Failed to create ecm conntrack notifier directory in sysctl\n");
+		return -1;
+	}
+
 	ecm_conntrack_notifier_dentry = debugfs_create_dir("ecm_conntrack_notifier", dentry);
 	if (!ecm_conntrack_notifier_dentry) {
 		DEBUG_ERROR("Failed to create ecm conntrack notifier directory in debugfs\n");
+		unregister_sysctl_table(ecm_conntrack_notifier_ctl_table_header);
 		return -1;
 	}
 
 	if (!ecm_debugfs_create_u32("stop", S_IRUGO | S_IWUSR, ecm_conntrack_notifier_dentry,
 					(u32 *)&ecm_conntrack_notifier_stopped)) {
 		DEBUG_ERROR("Failed to create ecm conntrack notifier stopped file in debugfs\n");
-		debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
-		return -1;
+		goto init_cleanup_1;
 	}
 
 #ifdef CONFIG_NF_CONNTRACK_EVENTS
 	/*
 	 * Eventing subsystem is available so we register a notifier hook to get fast notifications of expired connections
 	 */
+#ifdef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
 	result = nf_conntrack_register_notifier(&init_net, &ecm_conntrack_notifier);
 	if (result < 0) {
 		DEBUG_ERROR("Can't register nf notifier hook.\n");
-		debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
-		return result;
+		goto init_cleanup_1;
 	}
+#else
+	nf_conntrack_register_notifier(&init_net, &ecm_conntrack_notifier);
+#endif
 
 	/*
 	 * Hold netns reference to keep the basic conntrack alive and
@@ -454,21 +513,31 @@ int ecm_conntrack_notifier_init(struct dentry *dentry)
 	result = nf_ct_netns_get(&init_net, NFPROTO_IPV4);
 	if (result < 0) {
 		DEBUG_ERROR("Can't hold ipv4 netns.\n");
-		debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
-		return result;
+		goto init_cleanup_2;
 	}
 #ifdef ECM_IPV6_ENABLE
 	result = nf_ct_netns_get(&init_net, NFPROTO_IPV6);
 	if (result < 0) {
 		DEBUG_ERROR("Can't hold ipv6 netns.\n");
 		nf_ct_netns_put(&init_net, NFPROTO_IPV4);
-		debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
-		return result;
+		goto init_cleanup_2;
 	}
 #endif
 #endif
 
 	return 0;
+
+init_cleanup_2:
+#ifdef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
+	nf_conntrack_unregister_notifier(&init_net, &ecm_conntrack_notifier);
+#else
+	nf_conntrack_unregister_notifier(&init_net);
+#endif
+
+init_cleanup_1:
+	debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
+	unregister_sysctl_table(ecm_conntrack_notifier_ctl_table_header);
+	return -1;
 }
 EXPORT_SYMBOL(ecm_conntrack_notifier_init);
 
@@ -487,13 +556,24 @@ void ecm_conntrack_notifier_exit(void)
 #ifdef ECM_IPV6_ENABLE
 	nf_ct_netns_put(&init_net, NFPROTO_IPV6);
 #endif
+#ifdef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
 	nf_conntrack_unregister_notifier(&init_net, &ecm_conntrack_notifier);
+#else
+	nf_conntrack_unregister_notifier(&init_net);
+#endif
 #endif
 	/*
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_conntrack_notifier_dentry) {
 		debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
+	}
+
+	/*
+	 * Unregister the sysctl table header
+	 */
+	if (ecm_conntrack_notifier_ctl_table_header) {
+		unregister_sysctl_table(ecm_conntrack_notifier_ctl_table_header);
 	}
 }
 EXPORT_SYMBOL(ecm_conntrack_notifier_exit);

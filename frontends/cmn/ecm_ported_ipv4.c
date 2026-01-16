@@ -3,7 +3,7 @@
  * Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: ISC
- **************************************************************************
+ ***************************************************************************
  */
 
 #include <linux/version.h>
@@ -126,6 +126,7 @@ unsigned int ecm_ported_ipv4_process(struct net_device *out_dev, struct net_devi
 	int src_port_nat;
 	int dest_port;
 	int dest_port_nat;
+	bool is_rtp = false;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci = NULL;
 	ip_addr_t match_addr;
@@ -244,7 +245,8 @@ unsigned int ecm_ported_ipv4_process(struct net_device *out_dev, struct net_devi
 		/*
 		 * Check if any of the ports are in the acceleration denied list.
 		 */
-		if (ecm_front_end_check_tcp_denied_ports(src_port, dest_port)) {
+		if (ecm_front_end_check_default_denied_ports(src_port, dest_port) ||
+		    ecm_front_end_check_tcp_denied_ports(src_port, dest_port)) {
 			DEBUG_TRACE("src/dest port is in the TCP denied port list\n");
 			ecm_stats_v4_inc(ECM_STATS_V4_EXCEPTION_PORTED, ECM_STATS_V4_EXCEPTION_PORTED_TCP_DENIED_PORT);
 			return NF_ACCEPT;
@@ -262,6 +264,7 @@ unsigned int ecm_ported_ipv4_process(struct net_device *out_dev, struct net_devi
 		}
 
 		layer4hdr = (__be16 *)udp_hdr;
+		is_rtp = ecm_tracker_udp_check_is_rtp(skb, udp_hdr);
 
 		/*
 		 * Now extract information, if we have conntrack then use that (which would already be in the tuples)
@@ -328,7 +331,7 @@ unsigned int ecm_ported_ipv4_process(struct net_device *out_dev, struct net_devi
 		 * Override the source port for VxLAN/VxLAN-GPE outer connection.
 		 * Inner and outer flow for VxLAN-GPE (in L3 mode) is routed, hence we cannot use that to determine outer flow.
 		 */
-		if (vxlan_tun && !ecm_interface_vxlan_type_get(skb, vxlan_tun)) {
+		if (vxlan_tun && (ecm_interface_vxlan_type_get(skb, vxlan_tun) == ECM_DB_IFACE_VXLAN_OUTER)) {
 			DEBUG_TRACE("%px: VxLAN outer connection, make src and dest idents same\n", vxlan_tun);
 			src_port = src_port_nat = dest_port;
 		}
@@ -345,7 +348,8 @@ unsigned int ecm_ported_ipv4_process(struct net_device *out_dev, struct net_devi
 		/*
 		 * Check if any of the ports are in the acceleration denied list.
 		 */
-		if (ecm_front_end_check_udp_denied_ports(src_port, dest_port)) {
+		if (ecm_front_end_check_default_denied_ports(src_port, dest_port) ||
+		    ecm_front_end_check_udp_denied_ports(src_port, dest_port)) {
 			DEBUG_TRACE("src/dest port is in the UDP denied port list\n");
 			ecm_stats_v4_inc(ECM_STATS_V4_EXCEPTION_PORTED, ECM_STATS_V4_EXCEPTION_PORTED_UDP_DENIED_PORT);
 			return NF_ACCEPT;
@@ -611,7 +615,7 @@ feci_alloc_done:
 		ecm_db_connection_interfaces_reset(nci, from_list, from_list_first, ECM_DB_OBJ_DIR_FROM);
 
 		DEBUG_TRACE("%px: Create source node\n", nci);
-		ni[ECM_DB_OBJ_DIR_FROM] = ecm_ipv4_node_establish_and_ref(feci, efeici.from_dev, efeici.from_mac_lookup_ip_addr, from_list, from_list_first, src_node_addr, skb);
+		ni[ECM_DB_OBJ_DIR_FROM] = ecm_ipv4_node_establish_and_ref(feci, efeici.from_dev, efeici.from_mac_lookup_ip_addr, efeici.to_nat_mac_lookup_ip_addr, from_list, from_list_first, src_node_addr, skb);
 		ecm_db_connection_interfaces_deref(from_list, from_list_first);
 		if (!ni[ECM_DB_OBJ_DIR_FROM]) {
 			ecm_stats_v4_inc(ECM_STATS_V4_EXCEPTION_PORTED, ECM_STATS_V4_EXCEPTION_PORTED_FROM_NODE_FAIL);
@@ -637,7 +641,7 @@ feci_alloc_done:
 		ecm_db_connection_interfaces_reset(nci, to_list, to_list_first, ECM_DB_OBJ_DIR_TO);
 
 		DEBUG_TRACE("%px: Create dest node\n", nci);
-		ni[ECM_DB_OBJ_DIR_TO] = ecm_ipv4_node_establish_and_ref(feci, efeici.to_dev, efeici.to_mac_lookup_ip_addr, to_list, to_list_first, dest_node_addr, skb);
+		ni[ECM_DB_OBJ_DIR_TO] = ecm_ipv4_node_establish_and_ref(feci, efeici.to_dev, efeici.to_mac_lookup_ip_addr, efeici.from_nat_mac_lookup_ip_addr, to_list, to_list_first, dest_node_addr, skb);
 		ecm_db_connection_interfaces_deref(to_list, to_list_first);
 		if (!ni[ECM_DB_OBJ_DIR_TO]) {
 			ecm_stats_v4_inc(ECM_STATS_V4_EXCEPTION_PORTED, ECM_STATS_V4_EXCEPTION_PORTED_TO_NODE_FAIL);
@@ -683,7 +687,7 @@ feci_alloc_done:
 		ecm_db_connection_interfaces_reset(nci, from_nat_list, from_nat_list_first, ECM_DB_OBJ_DIR_FROM_NAT);
 
 		DEBUG_TRACE("%px: Create source nat node\n", nci);
-		ni[ECM_DB_OBJ_DIR_FROM_NAT] = ecm_ipv4_node_establish_and_ref(feci, efeici.from_nat_dev, efeici.from_nat_mac_lookup_ip_addr, from_nat_list, from_nat_list_first, src_node_addr_nat, skb);
+		ni[ECM_DB_OBJ_DIR_FROM_NAT] = ecm_ipv4_node_establish_and_ref(feci, efeici.from_nat_dev, efeici.from_nat_mac_lookup_ip_addr, efeici.to_nat_mac_lookup_ip_addr, from_nat_list, from_nat_list_first, src_node_addr_nat, skb);
 		ecm_db_connection_interfaces_deref(from_nat_list, from_nat_list_first);
 		if (!ni[ECM_DB_OBJ_DIR_FROM_NAT]) {
 			DEBUG_WARN("Failed to establish source nat node\n");
@@ -708,7 +712,7 @@ feci_alloc_done:
 		ecm_db_connection_interfaces_reset(nci, to_nat_list, to_nat_list_first, ECM_DB_OBJ_DIR_TO_NAT);
 
 		DEBUG_TRACE("%px: Create dest nat node\n", nci);
-		ni[ECM_DB_OBJ_DIR_TO_NAT] = ecm_ipv4_node_establish_and_ref(feci, efeici.to_nat_dev, efeici.to_nat_mac_lookup_ip_addr, to_nat_list, to_nat_list_first, dest_node_addr_nat, skb);
+		ni[ECM_DB_OBJ_DIR_TO_NAT] = ecm_ipv4_node_establish_and_ref(feci, efeici.to_nat_dev, efeici.to_nat_mac_lookup_ip_addr, efeici.from_nat_mac_lookup_ip_addr, to_nat_list, to_nat_list_first, dest_node_addr_nat, skb);
 
 		ecm_db_connection_interfaces_deref(to_nat_list, to_nat_list_first);
 		if (!ni[ECM_DB_OBJ_DIR_TO_NAT]) {
@@ -764,6 +768,10 @@ feci_alloc_done:
 		ecm_db_front_end_instance_ref_and_set(nci, feci);
 
 		ecm_db_connection_l2_encap_proto_set(nci, l2_encap_proto);
+
+		if (protocol == IPPROTO_UDP) {
+			ecm_db_connection_rtp_set(nci, is_rtp);
+		}
 
 		/*
 		 * Now add the connection into the database.
@@ -854,6 +862,17 @@ done:
 	}
 
 	/*
+	 * Unconfirmed connection may be dropped by Linux at the final step,
+	 * So we don't allow acceleration for the unconfirmed connections.
+	 */
+	if (protocol == IPPROTO_UDP && likely(ct) && !nf_ct_is_confirmed(ct)) {
+		DEBUG_WARN("%px: Unconfirmed UDP connection\n", ct);
+		ecm_db_connection_deref(ci);
+		ecm_stats_v4_inc(ECM_STATS_V4_EXCEPTION_PORTED, ECM_STATS_V4_EXCEPTION_PORTED_UDP_CONN_NOT_CONFIRM);
+		return NF_ACCEPT;
+	}
+
+	/*
 	 * Check if AE switch is needed.
 	 */
 	if (ecm_front_end_connection_check_and_switch_to_next_ae(ci->feci)) {
@@ -901,8 +920,10 @@ done:
 	 */
 	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_FROM, match_addr);
 	if (ECM_IP_ADDR_MATCH(ip_src_addr, match_addr)) {
+		DEBUG_TRACE("%px: sender is SRC relative to ci direction\n", ci);
 		sender = ECM_TRACKER_SENDER_TYPE_SRC;
 	} else {
+		DEBUG_TRACE("%px: sender is DEST relative to ci direction\n", ci);
 		sender = ECM_TRACKER_SENDER_TYPE_DEST;
 	}
 
@@ -1119,7 +1140,7 @@ done:
 			prevalent_pr.process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_QOS_TAG;
 		}
 
-#ifdef ECM_CLASSIFIER_MSCS_ENABLE
+#if defined(ECM_CLASSIFIER_MSCS_ENABLE) || defined(ECM_CLASSIFIER_WIFI_ENABLE)
 		/*
 		 * HLOS TID override mode
 		 */

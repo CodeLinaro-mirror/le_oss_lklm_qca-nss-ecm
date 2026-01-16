@@ -1,19 +1,8 @@
 /*
  ***************************************************************************
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  ***************************************************************************
  */
 
@@ -59,6 +48,11 @@
 #define ECM_CLASSIFIER_WIFI_INSTANCE_MAGIC 0xFE35
 
 /*
+ * Default path for sysctl
+ */
+#define ECM_CLASSIFIER_WIFI_PATH "net/ecm/ecm_classifier_wifi"
+
+/*
  * struct ecm_classifier_wifi_instance
  */
 struct ecm_classifier_wifi_instance {
@@ -68,10 +62,14 @@ struct ecm_classifier_wifi_instance {
 	struct ecm_classifier_wifi_instance *prev;		/* Prev classifier state instance (for accouting and reporting purposes) */
 
 	uint32_t ci_serial;					/* RO: Serial of the connection */
+	uint32_t pcp[ECM_CONN_DIR_MAX];				/* PCP values for the connections */
+	bool packet_seen[ECM_CONN_DIR_MAX];                     /* Per-direction packet seen flag */
 	struct ecm_classifier_process_response process_response;/* Last process response computed */
 
 	int refs;						/* Integer to trap we never go negative */
 
+	uint8_t wifi_qm_type;					/* Wi-Fi QoS management type like SCS/MSCS */
+	uint8_t wifi_qm_id;						/* Wi-Fi QoS management id like SCS id */
 #if (DEBUG_LEVEL > 0)
 	uint16_t magic;
 #endif
@@ -108,6 +106,8 @@ static struct ecm_classifier_wifi_callbacks ecm_wifi;
  * Debugfs dentry object.
  */
 static struct dentry *ecm_classifier_wifi_dentry;
+
+static struct ctl_table_header *ecm_classifier_wifi_ctl_table_header; /* Sysctl table header */
 
 /*
  * ecm_classifier_wifi_type_get()
@@ -180,6 +180,22 @@ static void ecm_classifier_wifi_fill_metadata(struct ecm_classifier_wifi_instanc
 }
 
 /*
+ * ecm_classifier_wifi_fill_pcp()
+ *	Save the PCP value in the classifier instance.
+ */
+static void ecm_classifier_wifi_fill_pcp(struct ecm_classifier_wifi_instance *cwifii,
+		 ecm_tracker_sender_type_t sender, struct sk_buff *skb)
+{
+	if (sender == ECM_TRACKER_SENDER_TYPE_SRC) {
+		cwifii->pcp[ECM_CONN_DIR_FLOW] = skb->priority;
+		cwifii->packet_seen[ECM_CONN_DIR_FLOW] = true;
+	} else {
+		cwifii->pcp[ECM_CONN_DIR_RETURN] = skb->priority;
+		cwifii->packet_seen[ECM_CONN_DIR_RETURN] = true;
+	}
+}
+
+/*
  * ecm_classifier_wifi_process()
  *	Process new data for connection
  */
@@ -203,6 +219,11 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 	struct net_device *src_dev = NULL;
 	struct net_device *dest_dev = NULL;
 	struct ecm_classifier_wifi_metadata wifi_metadata_info = {0};
+	uint8_t flow_hlos_tid_override = ECM_CLASSIFIER_WIFI_INVALID_HLOS_TID_OVERRIDE;
+	uint8_t return_hlos_tid_override = ECM_CLASSIFIER_WIFI_INVALID_HLOS_TID_OVERRIDE;
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn *ct;
+	uint64_t slow_pkts = 0;
 
 	cwifii = (struct ecm_classifier_wifi_instance *)aci;
 	DEBUG_CHECK_MAGIC(cwifii, ECM_CLASSIFIER_WIFI_INSTANCE_MAGIC, "%px: magic failed\n", cwifii);
@@ -235,6 +256,7 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 		/*
 		 * Lock still held
 		 */
+		DEBUG_WARN("%px: classifier not enabled serial:%u \n", cwifii, cwifii->ci_serial);
 		cwifii->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
 		goto process_wifi_classifier_out;
 	}
@@ -243,7 +265,7 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 
 	if (!ecm_wifi.get_wifi_metadata) {
 		spin_lock_bh(&ecm_classifier_wifi_lock);
-		DEBUG_WARN("%px: No callback registered to get metadata \n", cwifii);
+		DEBUG_WARN("%px: No callback registered to get metadata serial:%u \n", cwifii, cwifii->ci_serial);
 		cwifii->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
 		goto process_wifi_classifier_out;
 	}
@@ -253,7 +275,7 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 	 */
 	ci = ecm_db_connection_serial_find_and_ref(cwifii->ci_serial);
 	if (!ci) {
-		DEBUG_TRACE("%px: No ci found for %u\n", cwifii, cwifii->ci_serial);
+		DEBUG_TRACE("%px: No ci found for serial:%u\n", cwifii, cwifii->ci_serial);
 		spin_lock_bh(&ecm_classifier_wifi_lock);
 		cwifii->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
 		goto process_wifi_classifier_out;
@@ -261,12 +283,13 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 
 	feci = ecm_db_connection_front_end_get_and_ref(ci);
 	accel_mode = ecm_front_end_connection_accel_state_get(feci);
+	slow_pkts = ecm_front_end_get_slow_packet_count(feci);
 	ecm_front_end_connection_deref(feci);
 	ecm_db_connection_deref(ci);
 
 	if (ECM_FRONT_END_ACCELERATION_NOT_POSSIBLE(accel_mode)) {
 		spin_lock_bh(&ecm_classifier_wifi_lock);
-		cwifii->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
+		DEBUG_TRACE("%px: Accel not possible serial:%u\n", cwifii, cwifii->ci_serial);
 		goto process_wifi_classifier_out;
 	}
 
@@ -287,6 +310,7 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 	if ((protocol != IPPROTO_UDP) && (protocol != IPPROTO_TCP) && (protocol != IPPROTO_GRE)) {
 		spin_lock_bh(&ecm_classifier_wifi_lock);
 		cwifii->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
+		DEBUG_TRACE("%px: Invalid protocol 0x:%x serial:%u\n", cwifii, protocol, cwifii->ci_serial);
 		goto process_wifi_classifier_out;
 	}
 
@@ -302,6 +326,7 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 
 		wifi_flow_metadata = ecm_wifi.get_wifi_metadata(&wifi_metadata_info);
 		flow_ds_metadata = wifi_metadata_info.wifi_mdata.out_ppe_ds_node_id;
+		flow_hlos_tid_override = wifi_metadata_info.wifi_mdata.hlos_tid_override;
 	}
 
 	if (src_dev) {
@@ -311,6 +336,7 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 
 		wifi_return_metadata = ecm_wifi.get_wifi_metadata(&wifi_metadata_info);
 		return_ds_metadata = wifi_metadata_info.wifi_mdata.out_ppe_ds_node_id;
+		return_hlos_tid_override = wifi_metadata_info.wifi_mdata.hlos_tid_override;
 	}
 
 	/*
@@ -321,6 +347,8 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 			&& (return_ds_metadata == ECM_CLASSIFIER_WIFI_INVALID_DS_NODE_ID)) {
 		spin_lock_bh(&ecm_classifier_wifi_lock);
 		cwifii->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
+		DEBUG_TRACE("%px: WiFi classifier wifi_flow_mdata:0x%x Return_wifi_mdata:0x%x flow_ds_mdata:0x%x return_ds_mdata:0x%x serial:%u\n",
+				cwifii, wifi_flow_metadata, wifi_return_metadata, flow_ds_metadata, return_ds_metadata, cwifii->ci_serial);
 		goto process_wifi_classifier_out;
 	}
 
@@ -340,10 +368,64 @@ static void ecm_classifier_wifi_process(struct ecm_classifier_instance *aci, ecm
 	cwifii->process_response.process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
 	cwifii->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
 
-	DEBUG_TRACE("%px: flow mark: %x, return mark: %x, flow DS node id %d, return DS node id %d, sender %d\n",
+	if (flow_hlos_tid_override || return_hlos_tid_override) {
+
+		/*
+		 * Get the flow tag from skb priority only if hlos_tid_override is set.
+		 * These are used during certification cases where different dscp/tid values
+		 * are passed to the client.
+		 */
+		ct = nf_ct_get(skb, &ctinfo);
+		if (!ct) {
+			cwifii->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_NO;
+			DEBUG_TRACE("%px: WiFi classifier Conntrack is not established serial:%u\n", cwifii, cwifii->ci_serial);
+			goto process_wifi_classifier_out;
+		}
+
+		if (ecm_classifier_accel_delay_pkts) {
+
+			/*
+			 * Store the PCP value in the classifier instance and
+			 * deny acceleration until specified number of slow packets are seen.
+			 */
+			ecm_classifier_wifi_fill_pcp(cwifii, sender, skb);
+
+			if ((ecm_classifier_accel_delay_pkts == 1) || (slow_pkts < ecm_classifier_accel_delay_pkts)) {
+				DEBUG_TRACE("%px: accel_delay_pkts: %d slow_pkts: %llu accel is not allowed yet\n",
+						cwifii, ecm_classifier_accel_delay_pkts, slow_pkts);
+				cwifii->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
+				goto process_wifi_classifier_out;
+			}
+		}
+
+		/*
+		 * Store the skb priority in flow/return PCP value
+		 * of classifier instance if accel delay is not set.
+		 */
+		cwifii->pcp[ECM_CONN_DIR_FLOW] = skb->priority;
+		cwifii->pcp[ECM_CONN_DIR_RETURN] = skb->priority;
+
+		DEBUG_TRACE("%px: Protocol: %d, Flow Priority: %d, Return priority: %d, sender: %d\n",
+				cwifii, protocol, cwifii->pcp[ECM_CONN_DIR_FLOW],
+				cwifii->pcp[ECM_CONN_DIR_RETURN], sender);
+
+		if (((sender == ECM_TRACKER_SENDER_TYPE_SRC) && (IP_CT_DIR_ORIGINAL == CTINFO2DIR(ctinfo))) ||
+				((sender == ECM_TRACKER_SENDER_TYPE_DEST) && (IP_CT_DIR_REPLY == CTINFO2DIR(ctinfo)))) {
+			cwifii->process_response.flow_qos_tag = cwifii->pcp[ECM_CONN_DIR_FLOW];
+			cwifii->process_response.return_qos_tag = cwifii->pcp[ECM_CONN_DIR_RETURN];
+		} else {
+			cwifii->process_response.flow_qos_tag = cwifii->pcp[ECM_CONN_DIR_RETURN];
+			cwifii->process_response.return_qos_tag = cwifii->pcp[ECM_CONN_DIR_FLOW];
+		}
+
+		cwifii->process_response.process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_HLOS_TID_VALID;
+		cwifii->process_response.process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_QOS_TAG;
+	}
+
+	DEBUG_TRACE("%px: flow mark: %x, return mark: %x, flow DS node id %d, return DS node id %d, sender %d flow_hlos_tid_override: %d, return_hlos_tid_override: %d skb->priority:%d serial:%u\n",
 			cwifii, cwifii->process_response.flow_mark, cwifii->process_response.return_mark,
 			cwifii->process_response.flow_wifi_ds_node_id, cwifii->process_response.return_wifi_ds_node_id,
-			sender);
+			sender, flow_hlos_tid_override, return_hlos_tid_override, skb->priority, cwifii->ci_serial);
 
 process_wifi_classifier_out:
 
@@ -370,6 +452,7 @@ static int ecm_classifier_wifi_state_get(struct ecm_classifier_instance *ci, str
 	struct ecm_classifier_process_response process_response;
 	uint32_t flow_wifi_ds_node_id;
 	uint32_t return_wifi_ds_node_id;
+	uint8_t wifi_qm_id, wifi_qm_type;
 
 	cwifii = (struct ecm_classifier_wifi_instance *)ci;
 	DEBUG_CHECK_MAGIC(cwifii, ECM_CLASSIFIER_WIFI_INSTANCE_MAGIC, "%px: magic failed", cwifii);
@@ -382,6 +465,8 @@ static int ecm_classifier_wifi_state_get(struct ecm_classifier_instance *ci, str
 	process_response = cwifii->process_response;
 	flow_wifi_ds_node_id = cwifii->process_response.flow_wifi_ds_node_id;
 	return_wifi_ds_node_id = cwifii->process_response.return_wifi_ds_node_id;
+	wifi_qm_id = cwifii->wifi_qm_id;
+	wifi_qm_type = cwifii->wifi_qm_type;
 	spin_unlock_bh(&ecm_classifier_wifi_lock);
 
 	if ((result = ecm_classifier_process_response_state_get(sfi, &process_response))) {
@@ -392,6 +477,14 @@ static int ecm_classifier_wifi_state_get(struct ecm_classifier_instance *ci, str
 		return result;
 	}
 	if ((result = ecm_state_write(sfi, "return_wifi_ds_node_id", "0x%x", return_wifi_ds_node_id))) {
+		return result;
+	}
+
+	if ((result = ecm_state_write(sfi, "wifi_qm_id", "%u", wifi_qm_id))) {
+		return result;
+	}
+
+	if ((result = ecm_state_write(sfi, "wifi_qm_type", "%u", wifi_qm_type))) {
 		return result;
 	}
 
@@ -517,6 +610,122 @@ static int ecm_classifier_wifi_deref(struct ecm_classifier_instance *ci)
 }
 
 /*
+ * ecm_classifier_wifi_update()
+ *	Update Wi-Fi classifier related information
+ */
+void ecm_classifier_wifi_update(struct ecm_classifier_instance *aci, enum ecm_rule_update_type type, void *arg)
+{
+	struct ecm_front_end_flowsawf_msg *msg = (struct ecm_front_end_flowsawf_msg *)arg;
+	struct ecm_classifier_wifi_instance *cwifii;
+	uint8_t wifi_qm_id, wifi_qm_type;
+
+	if (type != ECM_RULE_UPDATE_TYPE_FLOWMARK_WIFI_QM) {
+		DEBUG_WARN("%px: unsupported update type: %d\n", aci, type);
+		return;
+	}
+
+	cwifii = (struct ecm_classifier_wifi_instance *)aci;
+	wifi_qm_id = (msg->flow_mark >> 8) & 0xFF;
+
+	/*
+	 * QM type 0 : SCS, QM type 1 : MSCS
+	 */
+	wifi_qm_type = ((msg->flow_mark & ECM_INTERFACE_WIFI_QOS_TAG_MASK) == ECM_INTERFACE_WIFI_QOS_SCS_TAG) ? 0 : 1;
+
+	spin_lock_bh(&ecm_classifier_wifi_lock);
+	cwifii->wifi_qm_id = wifi_qm_id;
+	cwifii->wifi_qm_type = wifi_qm_type;
+	spin_unlock_bh(&ecm_classifier_wifi_lock);
+	DEBUG_TRACE("aci=%px wifi classifier: set qm_id %d and qm_type : %d", aci, wifi_qm_id, wifi_qm_type);
+}
+
+/*
+ * ecm_classifier_wifi_should_keep_connection()
+ *	Check whether the connection needs to be maintained
+ */
+static void ecm_classifier_wifi_should_keep_connection(struct ecm_classifier_instance *aci,
+						       struct ecm_db_connection_defunct_info *info)
+{
+	struct ecm_classifier_wifi_instance *cwifii;
+
+	if (info->type != ECM_DB_CONNECTION_DEFUNCT_TYPE_SCS_MSCS_TEARDOWN) {
+		/*
+		 * Classifier does not care about the connection deletion.
+		 */
+		return;
+	}
+
+	/*
+	 * In case of SCS, MSCS tear down event, defunct the connections related to the SCS/MSCS
+	 */
+	cwifii = (struct ecm_classifier_wifi_instance *)aci;
+
+	spin_lock_bh(&ecm_classifier_wifi_lock);
+
+	if (cwifii->wifi_qm_id == info->wifi_qm_id && cwifii->wifi_qm_type == info->wifi_qm_type) {
+		info->should_keep_connection = false;
+	} else {
+		info->should_keep_connection = true;
+	}
+
+	spin_unlock_bh(&ecm_classifier_wifi_lock);
+}
+
+/*
+ * ecm_classifier_wifi_enable_handler
+ * 	Proc handler to enable or disable WIFI classifier
+ */
+static int ecm_classifier_wifi_enable_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	/*
+	 * Usage:
+	 *
+	 * Enable WIFI classifier
+	 * echo 1 > /proc/sys/net/ecm/ecm_classifier_wifi/enabled
+	 *
+	 * Disable WIFI classifier
+	 * echo 0 >/proc/sys/net/ecm/ecm_classifier_wifi/enabled
+	 *
+	 * To read status:
+	 * cat /proc/sys/net/ecm/ecm_classifier_wifi/enabled
+	 */
+
+	int ret;
+	int current_val;
+
+	/*
+	 * Write the value with user input
+	 */
+	current_val = ecm_classifier_wifi_enabled;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		/*
+		 * Return if failure or read operations
+		 */
+		return ret;
+	}
+
+	if ((ecm_classifier_wifi_enabled != 0) && (ecm_classifier_wifi_enabled != 1)) {
+		ecm_classifier_wifi_enabled = current_val;
+		DEBUG_ERROR("Invalid input, Valid input 0/1\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+static struct ctl_table ecm_classifier_wifi_ctl_table[] = {
+	{
+		.procname	= "enabled",
+		.data		= &ecm_classifier_wifi_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_classifier_wifi_enable_handler,
+	},
+	{ }
+};
+
+/*
  * ecm_classifier_wifi_instance_alloc()
  *	Allocate an instance of the wifi classifier
  */
@@ -549,6 +758,8 @@ struct ecm_classifier_wifi_instance *ecm_classifier_wifi_instance_alloc(struct e
 #endif
 	cwifii->base.ref = ecm_classifier_wifi_ref;
 	cwifii->base.deref = ecm_classifier_wifi_deref;
+	cwifii->base.update = ecm_classifier_wifi_update;
+	cwifii->base.should_keep_connection = ecm_classifier_wifi_should_keep_connection;
 	cwifii->ci_serial = ecm_db_connection_serial_get(ci);
 	cwifii->process_response.process_actions = 0;
 	cwifii->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_MAYBE;
@@ -620,10 +831,20 @@ EXPORT_SYMBOL(ecm_classifier_wifi_callback_unregister);
 int ecm_classifier_wifi_init(struct dentry *dentry)
 {
 	DEBUG_INFO("Wi-fi classifier Module init\n");
-	ecm_classifier_wifi_dentry = debugfs_create_dir("ecm_classifier_wifi", dentry);
 
+	/*
+	 * Register sysctl table for WIFI classifier
+	 */
+	ecm_classifier_wifi_ctl_table_header = register_sysctl(ECM_CLASSIFIER_WIFI_PATH, ecm_classifier_wifi_ctl_table);
+	if (!ecm_classifier_wifi_ctl_table_header) {
+		DEBUG_ERROR("Failed to create ecm wifi directory in sysctl\n");
+		return -1;
+	}
+
+	ecm_classifier_wifi_dentry = debugfs_create_dir("ecm_classifier_wifi", dentry);
 	if (!ecm_classifier_wifi_dentry) {
 		DEBUG_ERROR("Failed to create ecm wifi directory in debugfs\n");
+		unregister_sysctl_table(ecm_classifier_wifi_ctl_table_header);
 		return -1;
 	}
 
@@ -631,6 +852,7 @@ int ecm_classifier_wifi_init(struct dentry *dentry)
 					(u32 *)&ecm_classifier_wifi_enabled)) {
 		DEBUG_ERROR("Failed to create ecm wifi classifier enabled file in debugfs\n");
 		debugfs_remove_recursive(ecm_classifier_wifi_dentry);
+		unregister_sysctl_table(ecm_classifier_wifi_ctl_table_header);
 		return -1;
 	}
 
@@ -653,5 +875,12 @@ void ecm_classifier_wifi_exit(void)
 	 */
 	if (ecm_classifier_wifi_dentry) {
 		debugfs_remove_recursive(ecm_classifier_wifi_dentry);
+	}
+
+	/*
+	 * Unregister sysclt table header
+	 */
+	if (ecm_classifier_wifi_ctl_table_header) {
+		unregister_sysctl_table(ecm_classifier_wifi_ctl_table_header);
 	}
 }
