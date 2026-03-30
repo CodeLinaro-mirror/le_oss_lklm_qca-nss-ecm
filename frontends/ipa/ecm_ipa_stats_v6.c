@@ -133,7 +133,7 @@ void ecm_ipa_stats_v6_inc(ecm_ipa_stats_v6_exception_type_t stat_type, int stat_
 		break;
 #endif
 	default:
-		DEBUG_TRACE("IPA Fallback Event type unknown.\n");
+		IPAFEDBG_LOW("IPA Fallback Event type unknown.\n");
 		break;
 	}
 }
