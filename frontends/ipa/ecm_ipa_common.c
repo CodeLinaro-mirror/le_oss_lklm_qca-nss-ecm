@@ -55,10 +55,6 @@ struct ecm_ipa_common_callbacks ecm_ipa_cb;
  */
 bool ecm_ipa_feature_check(struct sk_buff *skb, struct ecm_tracker_ip_header *ip_hdr, bool is_routed)
 {
-	if (!is_routed && !ipa_is_l2_feature_enabled()) {
-		return false;
-	}
-
 	return ecm_front_end_feature_check(skb, ip_hdr);
 }
 
