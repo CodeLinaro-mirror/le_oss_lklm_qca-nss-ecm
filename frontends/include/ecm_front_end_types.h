@@ -433,6 +433,8 @@ static inline enum ecm_front_end_type ecm_front_end_type_get(void)
 	return selected_front_end;
 }
 
+extern int front_end_selection;
+
 /*
  * ecm_front_end_type_select()
  *	Detects and sets which front end to run
@@ -452,7 +454,6 @@ static inline enum ecm_front_end_type ecm_front_end_type_get(void)
  */
 static inline enum ecm_front_end_type ecm_front_end_type_select(void)
 {
-	extern int front_end_selection;
 
 #ifdef ECM_FRONT_END_NSS_ENABLE
 	bool nss_supported = false;
