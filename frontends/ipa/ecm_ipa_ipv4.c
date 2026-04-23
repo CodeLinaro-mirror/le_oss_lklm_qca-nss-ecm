@@ -78,6 +78,7 @@
 #include "ecm_front_end_common.h"
 #include "ecm_front_end_ipv4.h"
 #include "ecm_ipa_stats_v4.h"
+#include "ecm_ipa_log.h"
 
 int ecm_ipa_ipv4_no_action_limit_default = 250;		/* Default no-action limit. */
 int ecm_ipa_ipv4_driver_fail_limit_default = 250;		/* Default driver fail limit. */
@@ -212,7 +213,7 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	 * Note that we use _xlate versions for destination - for egressing connections this would be the wan IP address,
 	 * but for ingressing this would be the LAN side (non-nat'ed) address and is what we need for lookup of our connection.
 	 */
-	DEBUG_INFO("%px: IPA Sync, lookup connection using\n"
+	IPAFEDBG("%px: IPA Sync, lookup connection using\n"
 			"Protocol: %d\n" \
 			"src_addr: %pI4n:%d\n" \
 			"dest_addr: %pI4n:%d\n",
@@ -240,10 +241,10 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	ci = ecm_db_connection_find_and_ref(flow_ip, return_ip_xlate, sync->protocol, ntohs(flow_ident), ntohs(return_ident_xlate));
 
 	if (!ci) {
-		DEBUG_TRACE("%px: IPA Sync: no connection\n", sync);
+		IPAFEDBG_LOW("%px: IPA Sync: no connection\n", sync);
 		return;
 	}
-	DEBUG_TRACE("%px: Sync conn %px\n", sync, ci);
+	IPAFEDBG_LOW("%px: Sync conn %px\n", sync, ci);
 
 	/*
 	 * Copy the sync data to the classifier sync structure to
@@ -266,7 +267,7 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	for (aci_index = 0; aci_index < assignment_count; ++aci_index) {
 		struct ecm_classifier_instance *aci;
 		aci = assignments[aci_index];
-		DEBUG_TRACE("%px: sync to: %px, type: %d\n", ci, aci, aci->type_get(aci));
+		IPAFEDBG_LOW("%px: sync to: %px, type: %d\n", ci, aci, aci->type_get(aci));
 		aci->sync_to_v4(aci, &class_sync);
 	}
 	ecm_db_connection_assignments_release(assignment_count, assignments);
@@ -278,7 +279,7 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	 */
 	elapsed = ecm_db_connection_elapsed_defunct_timer(ci);
         if (elapsed < 0) {
-		DEBUG_TRACE("%px: Defunct timer is expired or not in a valid state\n", ci);
+		IPAFEDBG_LOW("%px: Defunct timer is expired or not in a valid state\n", ci);
 		ecm_db_connection_deref(ci);
 		return;
 	}
@@ -300,9 +301,9 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	feci = ecm_db_connection_front_end_get_and_ref(ci);
 
 	if (sync->flow_tx_packet_count || sync->return_tx_packet_count) {
-		DEBUG_TRACE("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %u, return_rx_packet_count: %u, return_rx_byte_count: %u\n",
+		IPAFEDBG_LOW("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %u, return_rx_packet_count: %u, return_rx_byte_count: %u\n",
 				ci, sync->flow_rx_packet_count, sync->flow_rx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
-		DEBUG_TRACE("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %u, return_tx_packet_count: %u, return_tx_byte_count: %u\n",
+		IPAFEDBG_LOW("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %u, return_tx_packet_count: %u, return_tx_byte_count: %u\n",
 				ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->return_tx_packet_count, sync->return_tx_byte_count);
 
 #ifdef ECM_MULTICAST_ENABLE
@@ -357,7 +358,7 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 		 * terminated by the ecm.
 		 * NOTE: We take no action here since that is performed by the destroy message ack.
 		 */
-		DEBUG_INFO("%px: ECM initiated final sync seen: %d\n", ci, sync->reason);
+		IPAFEDBG("%px: ECM initiated final sync seen: %d\n", ci, sync->reason);
 
 		/*
 		 * If there is no tx/rx packets to update the other linux subsystems, we shouldn't continue
@@ -380,7 +381,7 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 		/*
 		 * IPA has ended acceleration without instruction from the ECM.
 		 */
-		DEBUG_INFO("%px: IPA Initiated final sync seen: %d cause:%d\n", ci, sync->reason, sync->cause);
+		IPAFEDBG("%px: IPA Initiated final sync seen: %d cause:%d\n", ci, sync->reason, sync->cause);
 
 		/*
 		 * IPA Decelerated the connection
@@ -394,10 +395,10 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 			 */
 			neigh = ecm_interface_ipv4_neigh_get(flow_ip);
 			if (!neigh) {
-				DEBUG_WARN("Neighbour entry for %pI4n not found\n", &sync->flow_ip);
+				IPAFEWARN("Neighbour entry for %pI4n not found\n", &sync->flow_ip);
 			} else {
 				if (sync->flow_tx_packet_count) {
-					DEBUG_TRACE("Neighbour entry event send for %pI4n: %px\n", &sync->flow_ip, neigh);
+					IPAFEDBG_LOW("Neighbour entry event send for %pI4n: %px\n", &sync->flow_ip, neigh);
 					neigh_event_send(neigh, NULL);
 				}
 
@@ -409,10 +410,10 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 			 */
 			neigh = ecm_interface_ipv4_neigh_get(return_ip);
 			if (!neigh) {
-				DEBUG_WARN("Neighbour entry for %pI4n not found\n", &sync->return_ip);
+				IPAFEWARN("Neighbour entry for %pI4n not found\n", &sync->return_ip);
 			} else {
 				if (sync->return_tx_packet_count) {
-					DEBUG_TRACE("Neighbour entry event send for %pI4n: %px\n", &sync->return_ip, neigh);
+					IPAFEDBG_LOW("Neighbour entry event send for %pI4n: %px\n", &sync->return_ip, neigh);
 					neigh_event_send(neigh, NULL);
 				}
 
@@ -425,7 +426,7 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	 * If connection should be re-generated then we need to force a deceleration
 	 */
 	if (unlikely(ecm_db_connection_regeneration_required_peek(ci))) {
-		DEBUG_TRACE("%px: Connection generation changing, terminating acceleration", ci);
+		IPAFEDBG_LOW("%px: Connection generation changing, terminating acceleration", ci);
 		feci->decelerate(feci);
 	}
 
@@ -448,7 +449,7 @@ sync_conntrack:
 	tuple.dst.protonum = (uint8_t)sync->protocol;
 	tuple.dst.u.all = sync->return_ident;
 
-	DEBUG_TRACE("Conntrack sync, lookup conntrack connection using\n"
+	IPAFEDBG_LOW("Conntrack sync, lookup conntrack connection using\n"
 			"Protocol: %d\n"
 			"src_addr: %pI4:%d\n"
 			"dest_addr: %pI4:%d\n",
@@ -461,7 +462,7 @@ sync_conntrack:
 	 */
 	h = nf_conntrack_find_get(&init_net, &nf_ct_zone_dflt, &tuple);
 	if (!h) {
-		DEBUG_WARN("%px: IPA Sync: no conntrack connection\n", sync);
+		IPAFEWARN("%px: IPA Sync: no conntrack connection\n", sync);
 		return;
 	}
 
@@ -469,7 +470,7 @@ sync_conntrack:
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0))
 	NF_CT_ASSERT(ct->timeout.data == (unsigned long)ct);
 #endif
-	DEBUG_TRACE("%px: IPA Sync: conntrack connection\n", ct);
+	IPAFEDBG_LOW("%px: IPA Sync: conntrack connection\n", ct);
 
 	ecm_front_end_flow_and_return_directions_get(ct, flow_ip, 4, &flow_dir, &return_dir);
 
@@ -594,7 +595,7 @@ static void ecm_ipa_ipv4_stats_sync_callback(void *app_data, struct ipa_ipv4_msg
 	 * Only respond to sync messages
 	 */
 	if (nim->cm.type != IPA_RX_CONN_STATS_SYNC_MSG) {
-		DEBUG_TRACE("Ignoring nim: %px - not sync: %d", nim, nim->cm.type);
+		IPAFEDBG_LOW("Ignoring nim: %px - not sync: %d", nim, nim->cm.type);
 		return;
 	}
 	ecm_ipa_ipv4_process_one_conn_sync_msg(&nim->msg.conn_stats);
@@ -615,14 +616,14 @@ static int ecm_ipa_ipv4_get_accel_limit_mode(void *data, u64 *val)
  */
 static int ecm_ipa_ipv4_set_accel_limit_mode(void *data, u64 val)
 {
-	DEBUG_TRACE("ecm_ipa_ipv4_accel_limit_mode = %x\n", (int)val);
+	IPAFEDBG_LOW("ecm_ipa_ipv4_accel_limit_mode = %x\n", (int)val);
 
 	/*
 	 * Check that only valid bits are set.
 	 * It's fine for no bits to be set as that suggests no modes are wanted.
 	 */
 	if (val && (val ^ (ECM_FRONT_END_ACCEL_LIMIT_MODE_FIXED | ECM_FRONT_END_ACCEL_LIMIT_MODE_UNLIMITED))) {
-		DEBUG_WARN("ecm_ipa_ipv4_accel_limit_mode = %x bad\n", (int)val);
+		IPAFEWARN("ecm_ipa_ipv4_accel_limit_mode = %x bad\n", (int)val);
 		return -EINVAL;
 	}
 
@@ -804,7 +805,7 @@ static void ecm_ipa_ipv4_connection_sync_many_callback(void *app_data, struct ip
 		/*
 		 * We get a NACK from FW, which should not happen, restart the request
 		 */
-		DEBUG_WARN("IPv4 conn stats request failed, restarting\n");
+		IPAFEWARN("IPv4 conn stats request failed, restarting\n");
 		ecm_ipa_ipv4_stats_request_nack++;
 		ecm_ipa_ipv4_sync_req_msg->msg.conn_stats_many.index = 0;
 	}
@@ -828,7 +829,7 @@ static void ecm_ipa_ipv4_stats_sync_req_work(struct work_struct *work)
 	spin_lock_bh(&ecm_ipa_ipv4_lock);
 	if (ecm_ipa_ipv4_accelerated_count == 0) {
 		spin_unlock_bh(&ecm_ipa_ipv4_lock);
-		DEBUG_TRACE("There is no accelerated IPv4 connection\n");
+		IPAFEDBG_LOW("There is no accelerated IPv4 connection\n");
 		goto reschedule;
 	}
 	spin_unlock_bh(&ecm_ipa_ipv4_lock);
@@ -868,7 +869,7 @@ static void ecm_ipa_ipv4_stats_sync_req_work(struct work_struct *work)
 		} else {
         		ecm_ipa_ipv4_stats_request_fail++;
         		retry--;
-                	DEBUG_TRACE("TX_NOT_OKAY, try again later\n");
+			IPAFEDBG_LOW("TX_NOT_OKAY, try again later\n");
                 	usleep_range(100, 200);
                 }
 	}
@@ -946,108 +947,120 @@ int ecm_ipa_ipv4_init(struct dentry *dentry)
 
 	struct dentry *ecm_stats_dentry = NULL;
 
+	if(log_buf == NULL) {
+		log_buf = ipc_log_context_create(50, "ipa_fe", 0x10000);
+	 	if (log_buf == NULL)
+			pr_err("failed to create IPC IPA FE log, continue...\n");
+	}
+
+	if(log_buf_low == NULL) {
+		log_buf_low = ipc_log_context_create(50, "ipa_fe_low", 0x10000);
+ 		if (log_buf_low == NULL)
+			pr_err("failed to create IPC IPA FE low log, continue...\n");
+	}
+
 	if (!ecm_front_end_is_feature_supported(ECM_FE_FEATURE_IPA)) {
-		DEBUG_INFO("IPA IPv4 is disabled\n");
+		IPAFEERR("IPA IPv4 is disabled\n");
 		return 0;
 	}
 
-	DEBUG_INFO("ECM IPA IPv4 init\n");
+	IPAFEDBG("ECM IPA IPv4 init\n");
 
 	ecm_ipa_ipv4_dentry = debugfs_create_dir("ecm_ipa_ipv4", dentry);
 	if (!ecm_ipa_ipv4_dentry) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 directory in debugfs\n");
+		IPAFEERR_RL("Failed to create ecm ipa ipv4 directory in debugfs\n");
 		return result;
 	}
 
 #ifdef CONFIG_XFRM
 	if (!ecm_debugfs_create_u32("reject_acceleration_for_ipsec", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_reject_acceleration_for_ipsec)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 reject_acceleration_for_ipsec file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 reject_acceleration_for_ipsec file in debugfs\n");
 		goto task_cleanup;
 	}
 #endif
 
 	if (!ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_no_action_limit_default)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 no_action_limit_default file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 no_action_limit_default file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_driver_fail_limit_default)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 driver_fail_limit_default file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 driver_fail_limit_default file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_nack_limit_default)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 nack_limit_default file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 nack_limit_default file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 accelerated_count file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 accelerated_count file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_pending_accel_count)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 pending_accel_count file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 pending_accel_count file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_pending_decel_count)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 pending_decel_count file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 pending_decel_count file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
 					NULL, &ecm_ipa_ipv4_accel_limit_mode_fops)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 accel_limit_mode file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 accel_limit_mode file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv4_dentry,
 					NULL, &ecm_ipa_ipv4_accel_cmd_avg_millis_fops)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 accel_cmd_avg_millis file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 accel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv4_dentry,
 					NULL, &ecm_ipa_ipv4_decel_cmd_avg_millis_fops)) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 decel_cmd_avg_millis file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 decel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!ecm_ipa_ported_ipv4_debugfs_init(ecm_ipa_ipv4_dentry)) {
-		DEBUG_ERROR("Failed to create ecm ported files in debugfs\n");
+		IPAFEERR("Failed to create ecm ported files in debugfs\n");
 		goto task_cleanup;
 	}
 
 	if (!debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ipa_ipv4_dentry,
 					NULL, &ecm_ipa_ipv4_stats_request_counter_fops))
 	{
-		DEBUG_ERROR("Failed to create ecm ipa ipv4 stats request ounter file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv4 stats request ounter file in debugfs\n");
 		goto task_cleanup;
 	}
 
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE
 	if (!ecm_ipa_non_ported_ipv4_debugfs_init(ecm_ipa_ipv4_dentry)) {
-		DEBUG_ERROR("Failed to create ecm non-ported files in debugfs\n");
+		IPAFEERR("Failed to create ecm non-ported files in debugfs\n");
 		goto task_cleanup;
 	}
 #endif
 
 	ecm_stats_dentry = debugfs_lookup("stats", dentry);
 	if (!ecm_stats_dentry) {
-		DEBUG_ERROR("Stats dentry not created\n");
+		IPAFEERR("Stats dentry not created\n");
 		goto task_cleanup;
 	}
 
 	if (ecm_ipa_stats_v4_debugfs_init(ecm_stats_dentry)) {
-		DEBUG_ERROR("Failed to create ecm_ipa_v4_exception_stats file in ecm\n");
+		IPAFEERR("Failed to create ecm_ipa_v4_exception_stats file in ecm\n");
 		goto task_cleanup;
 	}
 
@@ -1058,7 +1071,7 @@ int ecm_ipa_ipv4_init(struct dentry *dentry)
 	 * acceleration engine without having an acceleration engine manager.
 	 */
 	if (!ecm_ipa_ipv4_sync_queue_init()) {
-		DEBUG_ERROR("Failed to init queue\n");
+		IPAFEERR("Failed to init queue\n");
 		goto task_cleanup;
 	}
 	ecm_ipa_ipv4_mgr = ipa_ipv4_notify_register(ecm_ipa_ipv4_stats_sync_callback, ecm_ipa_ipv4_connection_sync_many_callback, NULL);
@@ -1066,7 +1079,7 @@ int ecm_ipa_ipv4_init(struct dentry *dentry)
 #ifdef ECM_MULTICAST_ENABLE
 #ifndef ECM_FRONT_END_NSS_ENABLE
 	if (ecm_ipa_multicast_ipv4_init(ecm_ipa_ipv4_dentry)) {
-		DEBUG_ERROR("Failed to init ipa multicast\n");
+		IPAFEERR("Failed to init ipa multicast\n");
 		goto task_cleanup;
 	}
 #endif
@@ -1086,7 +1099,7 @@ EXPORT_SYMBOL(ecm_ipa_ipv4_init);
 void ecm_ipa_ipv4_exit(void)
 {
 	if (!ecm_front_end_is_feature_supported(ECM_FE_FEATURE_IPA)) {
-		DEBUG_INFO("IPA IPv4 is disabled\n");
+		IPAFEDBG("IPA IPv4 is disabled\n");
 		return;
 	}
 
@@ -1095,7 +1108,7 @@ void ecm_ipa_ipv4_exit(void)
 	ecm_ipa_multicast_ipv4_exit();
 #endif
 #endif
-	DEBUG_INFO("ECM IPA IPv4 Module exit\n");
+	IPAFEDBG("ECM IPA IPv4 Module exit\n");
 	ipa_ipv4_notify_unregister();
 	ecm_ipa_ipv4_sync_queue_exit();
 

@@ -8,6 +8,8 @@
 #ifndef __ECM_IPA_STATS_V4_H
 #define __ECM_IPA_STATS_V4_H
 
+#include "ecm_ipa_log.h"
+
 enum ecm_ipa_stats_v4_exception_multicast_events {
 	ECM_IPA_STATS_V4_EXCEPTION_MULTICAST_ACCEL_NOT_PERMITTED,
 	/* Number of IPv4 packets ignored in multicast flow as accel not permitted */

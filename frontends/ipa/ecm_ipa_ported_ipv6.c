@@ -108,7 +108,7 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 	 * Is this a response to a create message?
 	 */
 	if (nim->cm.type != IPA_TX_CREATE_RULE_MSG) {
-		DEBUG_ERROR("%px: ported create callback with improper type: %d, serial: %u\n", nim, nim->cm.type, serial);
+		IPAFEERR("%px: ported create callback with improper type: %d, serial: %u\n", nim, nim->cm.type, serial);
 		return;
 	}
 
@@ -117,7 +117,7 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 	 */
 	ci = ecm_db_connection_serial_find_and_ref(serial);
 	if (!ci) {
-		DEBUG_TRACE("%px: create callback, connection not found, serial: %u\n", nim, serial);
+		IPAFEDBG_LOW("%px: create callback, connection not found, serial: %u\n", nim, serial);
 		return;
 	}
 
@@ -145,21 +145,21 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 	/*
 	 * Dump some useful trace information.
 	 */
-	DEBUG_TRACE("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, serial);
-	DEBUG_TRACE("%px: rule_flags: %x, valid_flags: %x\n", feci, nircm->rule_flags, nircm->valid_flags);
-	DEBUG_TRACE("%px: flow_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n", feci, ECM_IP_ADDR_TO_OCTAL(flow_ip), nircm->tuple.flow_ident);
-	DEBUG_TRACE("%px: return_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n", feci, ECM_IP_ADDR_TO_OCTAL(return_ip), nircm->tuple.return_ident);
-	DEBUG_TRACE("%px: protocol: %d\n", feci, nircm->tuple.protocol);
+	IPAFEDBG_LOW("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, serial);
+	IPAFEDBG_LOW("%px: rule_flags: %x, valid_flags: %x\n", feci, nircm->rule_flags, nircm->valid_flags);
+	IPAFEDBG_LOW("%px: flow_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n", feci, ECM_IP_ADDR_TO_OCTAL(flow_ip), nircm->tuple.flow_ident);
+	IPAFEDBG_LOW("%px: return_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n", feci, ECM_IP_ADDR_TO_OCTAL(return_ip), nircm->tuple.return_ident);
+	IPAFEDBG_LOW("%px: protocol: %d\n", feci, nircm->tuple.protocol);
 
 	/*
 	 * Handle the creation result code.
 	 */
-	DEBUG_TRACE("%px: response: %d\n", feci, nim->cm.response);
+	IPAFEDBG_LOW("%px: response: %d\n", feci, nim->cm.response);
 	if (nim->cm.response != IPA_CMN_RESPONSE_ACK) {
 		/*
 		 * Creation command failed (specific reason ignored).
 		 */
-		DEBUG_TRACE("%px: accel nack: %d\n", feci, nim->cm.error);
+		IPAFEDBG_LOW("%px: accel nack: %d\n", feci, nim->cm.error);
 		spin_lock_bh(&feci->lock);
 		DEBUG_ASSERT(feci->accel_mode == ECM_FRONT_END_ACCELERATION_MODE_ACCEL_PENDING, "%px: Unexpected mode: %d\n", ci, feci->accel_mode);
 		feci->stats.ae_nack++;
@@ -291,7 +291,7 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 		return;
 	}
 
-	DEBUG_INFO("%px: Decelerate was pending\n", ci);
+	IPAFEDBG("%px: Decelerate was pending\n", ci);
 
 	/*
 	 * Check if the pending decelerate was done with the defunct process.
@@ -381,14 +381,14 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	 */
 	if (!ecm_ipa_ipv6_accel_pending_set(feci)) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_ACCEL_NOT_PERMITTED);
-		DEBUG_TRACE("%px: Acceleration not permitted: %px skb=%px\n", feci, feci->ci, skb);
+		IPAFEDBG_LOW("%px: Acceleration not permitted: %px skb=%px\n", feci, feci->ci, skb);
 		return;
 	}
 
 	nim = (struct ipa_ipv6_msg *)kzalloc(sizeof(struct ipa_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
 	if (!nim) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_MEM);
-		DEBUG_WARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
+		IPAFEWARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
 		ecm_ipa_ipv6_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		return;
 	}
@@ -422,14 +422,14 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	from_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, from_ifaces, ECM_DB_OBJ_DIR_FROM);
 	if (from_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_FROM_INTERFACES);
-		DEBUG_WARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
+		IPAFEWARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
 		goto ported_accel_bad_rule;
 	}
 
 	to_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, to_ifaces, ECM_DB_OBJ_DIR_TO);
 	if (to_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_TO_INTERFACES);
-		DEBUG_WARN("%px: Accel attempt failed - no interfaces in to_interfaces list!\n", feci);
+		IPAFEWARN("%px: Accel attempt failed - no interfaces in to_interfaces list!\n", feci);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		goto ported_accel_bad_rule;
 	}
@@ -443,7 +443,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	to_ipa_iface_id = ecm_db_iface_interface_identifier_get(to_ipa_iface);
 	if ((from_ipa_iface_id < 0) || (to_ipa_iface_id < 0)) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_INVALID_BOTTOM_IFACE);
-		DEBUG_TRACE("%px: from_ipa_iface_id: %d, to_ipa_iface_id: %d\n", feci, from_ipa_iface_id, to_ipa_iface_id);
+		IPAFEDBG_LOW("%px: from_ipa_iface_id: %d, to_ipa_iface_id: %d\n", feci, from_ipa_iface_id, to_ipa_iface_id);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 		goto ported_accel_bad_rule;
@@ -496,7 +496,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	 * NOTE: The lists may contain a complex heirarchy of similar type of interface e.g. multiple vlans or tunnels within tunnels.
 	 * This IPA cannot handle that - there is no way to describe this in the rule - if we see multiple types that would conflict we have to abort.
 	 */
-	DEBUG_TRACE("%px: Examine from/src heirarchy list. skb=%px\n", feci, skb);
+	IPAFEDBG_LOW("%px: Examine from/src heirarchy list. skb=%px\n", feci, skb);
 	memset(interface_type_counts, 0, sizeof(interface_type_counts));
 	rule_invalid = false;
 	for (list_index = from_ifaces_first; !rule_invalid && (list_index < ECM_DB_IFACE_HEIRARCHY_MAX); list_index++) {
@@ -521,7 +521,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 		ii_type = ecm_db_iface_type_get(ii);
 		ii_name = ecm_db_interface_type_to_string(ii_type);
 
-		DEBUG_TRACE("%px: list_index: %d, ii: %px (%s %d %d), type: %d (%s)\n",
+		IPAFEDBG_LOW("%px: list_index: %d, ii: %px (%s %d %d), type: %d (%s)\n",
 				feci, list_index, ii,
 				ii->name, ii->interface_identifier, ii->ae_interface_identifier,
 				ii_type, ii_name);
@@ -532,14 +532,14 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 		 */
 		switch (ii_type) {
 		case ECM_DB_IFACE_TYPE_BRIDGE:
-			DEBUG_TRACE("%px: Bridge\n", feci);
+			IPAFEDBG_LOW("%px: Bridge\n", feci);
 			if (interface_type_counts[ii_type] != 0) {
 				/*
 				 * Cannot cascade bridges
 				 */
 				rule_invalid = true;
 				ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_BRIDGE_CASCADE);
-				DEBUG_TRACE("%px: Bridge - ignore additional\n", feci);
+				IPAFEDBG_LOW("%px: Bridge - ignore additional\n", feci);
 				break;
 			}
 
@@ -554,19 +554,18 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 				nircm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_FLOW_VALID;
 				nircm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
 			}
-			DEBUG_TRACE("%px: Bridge - mac: %pM\n", feci, from_ipa_iface_address);
+			IPAFEDBG_LOW("%px: Bridge - mac: %pM\n", feci, from_ipa_iface_address);
 			break;
 
 
-
 		case ECM_DB_IFACE_TYPE_ETHERNET:
-			DEBUG_TRACE("%px: Ethernet\n", feci);
+			IPAFEDBG_LOW("%px: Ethernet\n", feci);
 			if (interface_type_counts[ii_type] != 0) {
 				/*
 				 * Ignore additional mac addresses, these are usually as a result of address propagation
 				 * from bridges down to ports etc.
 				 */
-				DEBUG_TRACE("%px: Ethernet - ignore additional\n", feci);
+				IPAFEDBG_LOW("%px: Ethernet - ignore additional\n", feci);
 				break;
 			}
 
@@ -574,7 +573,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 * Can only handle one MAC, the first outermost mac.
 			 */
 			ecm_db_iface_ethernet_address_get(ii, from_ipa_iface_address);
-			DEBUG_TRACE("%px: Ethernet - mac: %pM\n", feci, from_ipa_iface_address);
+			IPAFEDBG_LOW("%px: Ethernet - mac: %pM\n", feci, from_ipa_iface_address);
 			break;
 		case ECM_DB_IFACE_TYPE_PPPOE:
 #ifdef ECM_INTERFACE_PPPOE_ENABLE
@@ -583,7 +582,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 */
 			if (interface_type_counts[ii_type] != 0) {
 				ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
-				DEBUG_TRACE("%px: PPPoE - additional unsupported\n", feci);
+				IPAFEDBG_LOW("%px: PPPoE - additional unsupported\n", feci);
 				rule_invalid = true;
 				break;
 			}
@@ -592,7 +591,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 * PPPoE is supported only when L2 feature flag is enabled
 			 */
 			if (!ipa_is_l2_feature_enabled()) {
-				DEBUG_TRACE("%px: PPPoE - unsupported\n", feci);
+				IPAFEDBG_LOW("%px: PPPoE - unsupported\n", feci);
 				break;
 			}
 
@@ -601,7 +600,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 * without setting PPPoE parameters.
 			 */
 			if (!(l2_accel_bits & ECM_IPA_COMMON_FLOW_L2_ACCEL_ALLOWED)) {
-				DEBUG_TRACE("%px: L2 acceleration is not allowed for the PPPoE interface\n", feci);
+				IPAFEDBG_LOW("%px: L2 acceleration is not allowed for the PPPoE interface\n", feci);
 				break;
 			}
 
@@ -617,7 +616,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			nircm->valid_flags |= IPA_RULE_CREATE_PPPOE_DECAP_VALID;
 			nircm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE;
 
-			DEBUG_TRACE("%px: PPPoE - session: %x, mac: %pM\n", feci,
+			IPAFEDBG_LOW("%px: PPPoE - session: %x, mac: %pM\n", feci,
 					nircm->pppoe_rule.flow_pppoe_session_id,
 					nircm->pppoe_rule.flow_pppoe_remote_mac);
 #else
@@ -627,14 +626,14 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			break;
 		case ECM_DB_IFACE_TYPE_VLAN:
 #ifdef ECM_INTERFACE_VLAN_ENABLE
-			DEBUG_TRACE("%px: VLAN\n", feci);
+			IPAFEDBG_LOW("%px: VLAN\n", feci);
 			if (interface_type_counts[ii_type] > 1) {
 				/*
 				 * Can only support two vlans
 				 */
 				rule_invalid = true;
 				ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_ONLY_TWO_VLANS_SUPPORTED);
-				DEBUG_TRACE("%px: VLAN - additional unsupported\n", feci);
+				IPAFEDBG_LOW("%px: VLAN - additional unsupported\n", feci);
 				break;
 			}
 			ecm_db_iface_vlan_info_get(ii, &vlan_info);
@@ -677,14 +676,14 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 */
 			if (interface_type_counts[ECM_DB_IFACE_TYPE_ETHERNET] == 0) {
 				interface_type_counts[ECM_DB_IFACE_TYPE_ETHERNET]++;
-				DEBUG_TRACE("%px: VLAN use mac: %pM\n", feci, vlan_info.address);
+				IPAFEDBG_LOW("%px: VLAN use mac: %pM\n", feci, vlan_info.address);
 			}
 
-			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
+			IPAFEDBG_LOW("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
 			ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_VLAN_NOT_ENABLED);
-			DEBUG_TRACE("%px: VLAN - unsupported\n", feci);
+			IPAFEDBG_LOW("%px: VLAN - unsupported\n", feci);
 #endif
 			break;
 
@@ -700,30 +699,30 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			nircm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_FLOW_VALID;
 			nircm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
 
-			DEBUG_TRACE("%px: Macvlan - mac: %pM\n", feci, from_ipa_iface_address);
+			IPAFEDBG_LOW("%px: Macvlan - mac: %pM\n", feci, from_ipa_iface_address);
 #else
 			rule_invalid = true;
 			ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_MACVLAN_NOT_ENABLED);
-			DEBUG_TRACE("%px: MACVLAN - unsupported\n", feci);
+			IPAFEDBG_LOW("%px: MACVLAN - unsupported\n", feci);
 #endif
 			break;
 
 		case ECM_DB_IFACE_TYPE_IPSEC_TUNNEL:
 #ifdef ECM_INTERFACE_IPSEC_ENABLE
-			DEBUG_TRACE("%px: IPSEC\n", feci);
+			IPAFEDBG_LOW("%px: IPSEC\n", feci);
 			if (interface_type_counts[ii_type] != 0) {
 				/*
 				 * Can only support one ipsec
 				 */
 				rule_invalid = true;
 				ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_ONLY_ONE_IPSEC_SUPPORTED);
-				DEBUG_TRACE("%px: IPSEC - additional unsupported\n", feci);
+				IPAFEDBG_LOW("%px: IPSEC - additional unsupported\n", feci);
 				break;
 			}
 #else
 			rule_invalid = true;
 			ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_IPSEC_NOT_ENABLED);
-			DEBUG_TRACE("%px: IPSEC - unsupported\n", feci);
+			IPAFEDBG_LOW("%px: IPSEC - unsupported\n", feci);
 #endif
 			break;
 
@@ -735,19 +734,19 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 				struct ip_tunnel *tunnel = netdev_priv(dev_6rd);
 				if (!(tunnel->parms.iph.daddr)) {
 					rule_invalid = true;
-					DEBUG_TRACE("%px: Tun6rd error tunnel parameter.\n", feci);
+					IPAFEDBG_LOW("%px: Tun6rd error tunnel parameter.\n", feci);
 				}
 				dev_put(dev_6rd);
 			}
 #else
 			rule_invalid = true;
 			ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_FROM_IFACE_TUN6RD_NOT_ENABLED);
-			DEBUG_TRACE("%px: Tun6rd - unsupported\n", feci);
+			IPAFEDBG_LOW("%px: Tun6rd - unsupported\n", feci);
 #endif
 			break;
 
 		default:
-			DEBUG_TRACE("%px: Ignoring: %d (%s)\n", feci, ii_type, ii_name);
+			IPAFEDBG_LOW("%px: Ignoring: %d (%s)\n", feci, ii_type, ii_name);
 		}
 
 		/*
@@ -757,7 +756,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	}
 
 	if (rule_invalid) {
-		DEBUG_WARN("%px: from/src Rule invalid\n", feci);
+		IPAFEWARN("%px: from/src Rule invalid\n", feci);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 		goto ported_accel_bad_rule;
@@ -766,7 +765,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	/*
 	 * Now examine the TO / DEST heirarchy list to construct the destination part of the rule
 	 */
-	DEBUG_TRACE("%px: Examine to/dest heirarchy list\n", feci);
+	IPAFEDBG_LOW("%px: Examine to/dest heirarchy list\n", feci);
 	memset(interface_type_counts, 0, sizeof(interface_type_counts));
 	rule_invalid = false;
 	for (list_index = to_ifaces_first; !rule_invalid && (list_index < ECM_DB_IFACE_HEIRARCHY_MAX); list_index++) {
@@ -788,7 +787,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 		ii_type = ecm_db_iface_type_get(ii);
 		ii_name = ecm_db_interface_type_to_string(ii_type);
 
-		DEBUG_TRACE("%px: list_index: %d, ii: %px (%s %d %d), type: %d (%s)\n",
+		IPAFEDBG_LOW("%px: list_index: %d, ii: %px (%s %d %d), type: %d (%s)\n",
 				feci, list_index, ii,
 				ii->name, ii->interface_identifier, ii->ae_interface_identifier,
 				ii_type, ii_name);
@@ -799,14 +798,14 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 		 */
 		switch (ii_type) {
 		case ECM_DB_IFACE_TYPE_BRIDGE:
-			DEBUG_TRACE("%px: Bridge\n", feci);
+			IPAFEDBG_LOW("%px: Bridge\n", feci);
 			if (interface_type_counts[ii_type] != 0) {
 				/*
 				 * Cannot cascade bridges
 				 */
 				rule_invalid = true;
 				ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_TO_IFACE_BRIDGE_CASCADE);
-				DEBUG_TRACE("%px: Bridge - ignore additional\n", feci);
+				IPAFEDBG_LOW("%px: Bridge - ignore additional\n", feci);
 				break;
 			}
 
@@ -822,19 +821,18 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 				nircm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_RETURN_VALID;
 				nircm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
 			}
-			DEBUG_TRACE("%px: Bridge - mac: %pM\n", feci, to_ipa_iface_address);
+			IPAFEDBG_LOW("%px: Bridge - mac: %pM\n", feci, to_ipa_iface_address);
 			break;
 
 
-
 		case ECM_DB_IFACE_TYPE_ETHERNET:
-			DEBUG_TRACE("%px: Ethernet\n", feci);
+			IPAFEDBG_LOW("%px: Ethernet\n", feci);
 			if (interface_type_counts[ii_type] != 0) {
 				/*
 				 * Ignore additional mac addresses, these are usually as a result of address propagation
 				 * from bridges down to ports etc.
 				 */
-				DEBUG_TRACE("%px: Ethernet - ignore additional\n", feci);
+				IPAFEDBG_LOW("%px: Ethernet - ignore additional\n", feci);
 				break;
 			}
 
@@ -842,7 +840,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 * Can only handle one MAC, the first outermost mac.
 			 */
 			ecm_db_iface_ethernet_address_get(ii, to_ipa_iface_address);
-			DEBUG_TRACE("%px: Ethernet - mac: %pM\n", feci, to_ipa_iface_address);
+			IPAFEDBG_LOW("%px: Ethernet - mac: %pM\n", feci, to_ipa_iface_address);
 			break;
 		case ECM_DB_IFACE_TYPE_PPPOE:
 #ifdef ECM_INTERFACE_PPPOE_ENABLE
@@ -851,7 +849,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 */
 			if (interface_type_counts[ii_type] != 0) {
 				ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_TO_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
-				DEBUG_TRACE("%px: PPPoE - additional unsupported\n", feci);
+				IPAFEDBG_LOW("%px: PPPoE - additional unsupported\n", feci);
 				rule_invalid = true;
 				break;
 			}
@@ -860,7 +858,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 * PPPoE is supported only when L2 feature flag is enabled
 			 */
 			if (!ipa_is_l2_feature_enabled()) {
-				DEBUG_TRACE("%px: PPPoE - unsupported\n", feci);
+				IPAFEDBG_LOW("%px: PPPoE - unsupported\n", feci);
 				break;
 			}
 
@@ -869,7 +867,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 * without setting PPPoE parameters.
 			 */
 			if (!(l2_accel_bits & ECM_IPA_COMMON_RETURN_L2_ACCEL_ALLOWED)) {
-				DEBUG_TRACE("%px: L2 acceleration is not allowed for the PPPoE interface\n", feci);
+				IPAFEDBG_LOW("%px: L2 acceleration is not allowed for the PPPoE interface\n", feci);
 				break;
 			}
 
@@ -884,7 +882,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			nircm->valid_flags |= IPA_RULE_CREATE_PPPOE_ENCAP_VALID;
 			nircm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE;
 
-			DEBUG_TRACE("%px: PPPoE - session: %x, mac: %pM\n", feci,
+			IPAFEDBG_LOW("%px: PPPoE - session: %x, mac: %pM\n", feci,
 				    nircm->pppoe_rule.return_pppoe_session_id,
 				    nircm->pppoe_rule.return_pppoe_remote_mac);
 #else
@@ -894,14 +892,14 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			break;
 		case ECM_DB_IFACE_TYPE_VLAN:
 #ifdef ECM_INTERFACE_VLAN_ENABLE
-			DEBUG_TRACE("%px: VLAN\n", feci);
+			IPAFEDBG_LOW("%px: VLAN\n", feci);
 			if (interface_type_counts[ii_type] > 1) {
 				/*
 				 * Can only support two vlans
 				 */
 				rule_invalid = true;
 				ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_TO_IFACE_ONLY_TWO_VLANS_SUPPORTED);
-				DEBUG_TRACE("%px: VLAN - additional unsupported\n", feci);
+				IPAFEDBG_LOW("%px: VLAN - additional unsupported\n", feci);
 				break;
 			}
 			ecm_db_iface_vlan_info_get(ii, &vlan_info);
@@ -944,13 +942,13 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			 */
 			if (interface_type_counts[ECM_DB_IFACE_TYPE_ETHERNET] == 0) {
 				interface_type_counts[ECM_DB_IFACE_TYPE_ETHERNET]++;
-				DEBUG_TRACE("%px: VLAN use mac: %pM\n", feci, vlan_info.address);
+				IPAFEDBG_LOW("%px: VLAN use mac: %pM\n", feci, vlan_info.address);
 			}
-			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
+			IPAFEDBG_LOW("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
 			ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_TO_IFACE_VLAN_NOT_ENABLED);
-			DEBUG_TRACE("%px: VLAN - unsupported\n", feci);
+			IPAFEDBG_LOW("%px: VLAN - unsupported\n", feci);
 #endif
 			break;
 
@@ -966,33 +964,32 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			nircm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_RETURN_VALID;
 			nircm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
 
-			DEBUG_TRACE("%px: Macvlan - mac: %pM\n", feci, to_ipa_iface_address);
+			IPAFEDBG_LOW("%px: Macvlan - mac: %pM\n", feci, to_ipa_iface_address);
 #else
 			rule_invalid = true;
 			ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_TO_IFACE_MACVLAN_NOT_ENABLED);
-			DEBUG_TRACE("%px: MACVLAN - unsupported\n", feci);
+			IPAFEDBG_LOW("%px: MACVLAN - unsupported\n", feci);
 #endif
 			break;
 
 		case ECM_DB_IFACE_TYPE_IPSEC_TUNNEL:
 #ifdef ECM_INTERFACE_IPSEC_ENABLE
-			DEBUG_TRACE("%px: IPSEC\n", feci);
+			IPAFEDBG_LOW("%px: IPSEC\n", feci);
 			if (interface_type_counts[ii_type] != 0) {
 				/*
 				 * Can only support one ipsec
 				 */
 				rule_invalid = true;
 				ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_TO_IFACE_ONLY_ONE_IPSEC_SUPPORTED);
-				DEBUG_TRACE("%px: IPSEC - additional unsupported\n", feci);
+				IPAFEDBG_LOW("%px: IPSEC - additional unsupported\n", feci);
 				break;
 			}
 #else
 			rule_invalid = true;
 			ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_TO_IFACE_IPSEC_NOT_ENABLED);
-			DEBUG_TRACE("%px: IPSEC - unsupported\n", feci);
+			IPAFEDBG_LOW("%px: IPSEC - unsupported\n", feci);
 #endif
 			break;
-
 
 
 		case ECM_DB_IFACE_TYPE_SIT:
@@ -1002,19 +999,19 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 				struct ip_tunnel *tunnel = netdev_priv(dev_6rd);
 				if (!(tunnel->parms.iph.daddr)) {
 					rule_invalid = true;
-					DEBUG_TRACE("%px: Tun6rd error tunnel parameter.\n", feci);
+					IPAFEDBG_LOW("%px: Tun6rd error tunnel parameter.\n", feci);
 				}
 				dev_put(dev_6rd);
 			}
 #else
 			rule_invalid = true;
 			ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_TO_IFACE_TUN6RD_NOT_ENABLED);
-			DEBUG_TRACE("%px: Tun6rd - unsupported\n", feci);
+			IPAFEDBG_LOW("%px: Tun6rd - unsupported\n", feci);
 #endif
 			break;
 
 		default:
-			DEBUG_TRACE("%px: Ignoring: %d (%s)\n", feci, ii_type, ii_name);
+			IPAFEDBG_LOW("%px: Ignoring: %d (%s)\n", feci, ii_type, ii_name);
 		}
 
 		/*
@@ -1024,7 +1021,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	}
 
 	if (rule_invalid) {
-		DEBUG_WARN("%px: to/dest Rule invalid\n", feci);
+		IPAFEWARN("%px: to/dest Rule invalid\n", feci);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 		goto ported_accel_bad_rule;
@@ -1052,7 +1049,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	}
 
 	if (ecm_interface_src_check) {
-		DEBUG_INFO("%px: Source interface check flag is enabled\n", feci);
+		IPAFEDBG("%px: Source interface check flag is enabled\n", feci);
 		nircm->rule_flags |= IPA_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK;
 		nircm->rule_flags |= IPA_RULE_CREATE_FLAG_RETURN_SRC_INTERFACE_CHECK;
 	}
@@ -1102,7 +1099,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 
 #ifdef ECM_BRIDGE_VLAN_FILTERING_ENABLE
 	if (feci->ci->vlan_filter_valid) {
-		DEBUG_INFO("%px: Bridge vlan filter is valid. Updating the create rule\n", feci);
+		IPAFEDBG("%px: Bridge vlan filter is valid. Updating the create rule\n", feci);
 		if (ecm_ipa_common_vlan_filter_set(feci->ci, &nircm->flow_vlan_filter_rule, true) &&
 			ecm_ipa_common_vlan_filter_set(feci->ci, &nircm->return_vlan_filter_rule, false)) {
 			/*
@@ -1276,7 +1273,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			/*
 			 * No conntrack so no need to check window sequence space
 			 */
-			DEBUG_TRACE("%px: TCP Accel no ct from conn %px to get window data\n", feci, feci->ci);
+			IPAFEDBG_LOW("%px: TCP Accel no ct from conn %px to get window data\n", feci, feci->ci);
 			nircm->rule_flags |= IPA_RULE_CREATE_FLAG_NO_SEQ_CHECK;
 		} else {
 			int flow_dir;
@@ -1291,7 +1288,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 #endif
 			ecm_front_end_flow_and_return_directions_get(ct, src_ip, 6, &flow_dir, &return_dir);
 
-			DEBUG_TRACE("%px: TCP Accel Get window data from ct %px for conn %px\n", feci, ct, feci->ci);
+			IPAFEDBG_LOW("%px: TCP Accel Get window data from ct %px for conn %px\n", feci, ct, feci->ci);
 			spin_lock_bh(&ct->lock);
 			nircm->tcp_rule.flow_window_scale = ct->proto.tcp.seen[flow_dir].td_scale;
 			nircm->tcp_rule.flow_max_window = ct->proto.tcp.seen[flow_dir].td_maxwin;
@@ -1336,11 +1333,11 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 		aci = assignments[aci_index];
 #ifdef ECM_CLASSIFIER_EMESH_ENABLE
 		if ((aci->type_get(aci)) != ECM_CLASSIFIER_TYPE_EMESH) {
-			DEBUG_TRACE("%px: sync from: %px, type: %d\n", feci, aci, aci->type_get(aci));
+			IPAFEDBG_LOW("%px: sync from: %px, type: %d\n", feci, aci, aci->type_get(aci));
 			aci->sync_from_v6(aci, &ecrc);
 		}
 #else
-		DEBUG_TRACE("%px: sync from: %px, type: %d\n", feci, aci, aci->type_get(aci));
+		IPAFEDBG_LOW("%px: sync from: %px, type: %d\n", feci, aci, aci->type_get(aci));
 		aci->sync_from_v6(aci, &ecrc);
 #endif
 	}
@@ -1359,7 +1356,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 	ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 
-	DEBUG_INFO("%px: Ported Accelerate connection %px\n"
+	IPAFEDBG("%px: Ported Accelerate connection %px\n"
 			"Protocol: %d\n"
 			"from_mtu: %u\n"
 			"to_mtu: %u\n"
@@ -1430,7 +1427,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			nircm->mark_rule.return_mark);
 
 #ifdef ECM_BRIDGE_VLAN_FILTERING_ENABLE
-	DEBUG_INFO("flow_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
+	IPAFEDBG("flow_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
 			"flow_vlan_filter_egress_vlan_tag: %x, flags: %x\n"
 			"return_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
 			"return_vlan_filter_egress_vlan_tag: %x, flags: %x\n",
@@ -1441,7 +1438,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 #endif
 
 	if (protocol == IPPROTO_TCP) {
-		DEBUG_INFO("flow_window_scale: %u\n"
+		IPAFEDBG("flow_window_scale: %u\n"
 			"flow_max_window: %u\n"
 			"flow_end: %u\n"
 			"flow_max_end: %u\n"
@@ -1471,7 +1468,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	 */
 	if (regen_occurrances != ecm_db_connection_regeneration_occurrances_get(feci->ci)) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_REGEN_OCCURRED);
-		DEBUG_INFO("%px: connection:%px regen occurred - aborting accel rule.\n", feci, feci->ci);
+		IPAFEDBG("%px: connection:%px regen occurred - aborting accel rule.\n", feci, feci->ci);
 		ecm_ipa_ipv6_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		kfree(nim);
 		return;
@@ -1518,7 +1515,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 		aci = ecm_db_connection_assigned_classifier_find_and_ref(feci->ci, ECM_CLASSIFIER_TYPE_EMESH);
 		if (aci) {
 			ecrc.skb = skb;
-			DEBUG_TRACE("%px: sync from: %px, type: %d\n", feci, aci, aci->type_get(aci));
+			IPAFEDBG_LOW("%px: sync from: %px, type: %d\n", feci, aci, aci->type_get(aci));
 			aci->sync_from_v6(aci, &ecrc);
 			aci->deref(aci);
 		}
@@ -1541,7 +1538,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	feci->stats.driver_fail_total++;
 	feci->stats.driver_fail++;
 	if (feci->stats.driver_fail >= feci->stats.driver_fail_limit) {
-		DEBUG_WARN("%px: Accel failed - driver fail limit\n", feci);
+		IPAFEWARN("%px: Accel failed - driver fail limit\n", feci);
 		result_mode = ECM_FRONT_END_ACCELERATION_MODE_FAIL_DRIVER;
 	} else {
 		result_mode = ECM_FRONT_END_ACCELERATION_MODE_DECEL;
@@ -1561,7 +1558,7 @@ ported_accel_bad_rule:
 	/*
 	 * Jump to here when rule data is bad and an offload command cannot be constructed
 	 */
-	DEBUG_WARN("%px: Accel failed - bad rule\n", feci);
+	IPAFEWARN("%px: Accel failed - bad rule\n", feci);
 	ecm_ipa_ipv6_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_FAIL_RULE);
 	kfree(nim);
 }
@@ -1583,7 +1580,7 @@ static void ecm_ipa_ported_ipv6_connection_destroy_callback(void *app_data, stru
 	 * Is this a response to a destroy message?
 	 */
 	if (nim->cm.type != IPA_TX_DESTROY_RULE_MSG) {
-		DEBUG_ERROR("%px: ported destroy callback with improper type: %d\n", nim, nim->cm.type);
+		IPAFEERR("%px: ported destroy callback with improper type: %d\n", nim, nim->cm.type);
 		return;
 	}
 
@@ -1592,7 +1589,7 @@ static void ecm_ipa_ported_ipv6_connection_destroy_callback(void *app_data, stru
 	 */
 	ci = ecm_db_connection_serial_find_and_ref(serial);
 	if (!ci) {
-		DEBUG_TRACE("%px: destroy callback, connection not found, serial: %u\n", nim, serial);
+		IPAFEDBG_LOW("%px: destroy callback, connection not found, serial: %u\n", nim, serial);
 		return;
 	}
 
@@ -1620,10 +1617,10 @@ static void ecm_ipa_ported_ipv6_connection_destroy_callback(void *app_data, stru
 	/*
 	 * Dump some useful trace information.
 	 */
-	DEBUG_TRACE("%px: decelerate response for connection: %px\n", feci, feci->ci);
-	DEBUG_TRACE("%px: flow_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n", feci, ECM_IP_ADDR_TO_OCTAL(flow_ip), nirdm->tuple.flow_ident);
-	DEBUG_TRACE("%px: return_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n", feci, ECM_IP_ADDR_TO_OCTAL(return_ip), nirdm->tuple.return_ident);
-	DEBUG_TRACE("%px: protocol: %d\n", feci, nirdm->tuple.protocol);
+	IPAFEDBG_LOW("%px: decelerate response for connection: %px\n", feci, feci->ci);
+	IPAFEDBG_LOW("%px: flow_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n", feci, ECM_IP_ADDR_TO_OCTAL(flow_ip), nirdm->tuple.flow_ident);
+	IPAFEDBG_LOW("%px: return_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n", feci, ECM_IP_ADDR_TO_OCTAL(return_ip), nirdm->tuple.return_ident);
+	IPAFEDBG_LOW("%px: protocol: %d\n", feci, nirdm->tuple.protocol);
 
 	/*
 	 * Drop decel pending counter
@@ -1650,7 +1647,7 @@ static void ecm_ipa_ported_ipv6_connection_destroy_callback(void *app_data, stru
 		return;
 	}
 
-	DEBUG_TRACE("%px: response: %d\n", feci, nim->cm.response);
+	IPAFEDBG_LOW("%px: response: %d\n", feci, nim->cm.response);
 	if (nim->cm.response != IPA_CMN_RESPONSE_ACK) {
 		feci->accel_mode = ECM_FRONT_END_ACCELERATION_MODE_FAIL_DECEL;
 	} else {
@@ -1708,7 +1705,7 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 
 	nim = (struct ipa_ipv6_msg *)kzalloc(sizeof(struct ipa_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
 	if (!nim) {
-		DEBUG_WARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
+		IPAFEWARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
 		return false;
 	}
 
@@ -1740,7 +1737,7 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 	nirdm->tuple.flow_ident = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_FROM));
 	nirdm->tuple.return_ident = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT));
 
-	DEBUG_INFO("%px: Ported Connection %px decelerate\n"
+	IPAFEDBG("%px: Ported Connection %px decelerate\n"
 			"protocol: %d\n"
 			"src_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
 			"dest_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
@@ -1754,13 +1751,13 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 	from_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, from_ifaces, ECM_DB_OBJ_DIR_FROM);
 	if (from_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_FROM_INTERFACES);
-		DEBUG_WARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
+		IPAFEWARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
 	}
 
 	to_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, to_ifaces, ECM_DB_OBJ_DIR_TO);
 	if (to_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_TO_INTERFACES);
-		DEBUG_WARN("%px: Accel attempt failed - no interfaces in to_interfaces list!\n", feci);
+		IPAFEWARN("%px: Accel attempt failed - no interfaces in to_interfaces list!\n", feci);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 	}
 
@@ -1789,7 +1786,7 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 
 	if ((from_ipa_iface_id < 0) || (to_ipa_iface_id < 0)) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_INVALID_BOTTOM_IFACE);
-		DEBUG_TRACE("%px: from_ipa_iface_id: %d, to_ipa_iface_id: %d\n", feci, from_ipa_iface_id, to_ipa_iface_id);
+		IPAFEDBG_LOW("%px: from_ipa_iface_id: %d, to_ipa_iface_id: %d\n", feci, from_ipa_iface_id, to_ipa_iface_id);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 	}
@@ -1961,7 +1958,7 @@ static bool ecm_ipa_ported_ipv6_connection_defunct_callback(void *arg, int *acce
 static void ecm_ipa_ported_ipv6_connection_accel_ceased(struct ecm_front_end_connection_instance *feci)
 {
 	DEBUG_CHECK_MAGIC(feci, ECM_FRONT_END_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", feci);
-	DEBUG_INFO("%px: accel ceased\n", feci);
+	IPAFEDBG("%px: accel ceased\n", feci);
 
 	spin_lock_bh(&feci->lock);
 
@@ -2083,7 +2080,7 @@ struct ecm_front_end_connection_instance *ecm_ipa_ported_ipv6_connection_instanc
 	bool can_accel = (accel_flags & ECM_FRONT_END_ENGINE_FLAG_CAN_ACCEL);
 
 	if (ecm_ipa_ipv6_is_conn_limit_reached()) {
-		DEBUG_TRACE("Reached connection limit\n");
+		IPAFEDBG_LOW("Reached connection limit\n");
 		return NULL;
 	}
 
@@ -2092,7 +2089,7 @@ struct ecm_front_end_connection_instance *ecm_ipa_ported_ipv6_connection_instanc
 	 */
 	*nci = ecm_db_connection_alloc();
 	if (!*nci) {
-		DEBUG_WARN("Failed to allocate connection\n");
+		IPAFEWARN("Failed to allocate connection\n");
 		return NULL;
 	}
 
@@ -2100,7 +2097,7 @@ struct ecm_front_end_connection_instance *ecm_ipa_ported_ipv6_connection_instanc
 
 	feci = (struct ecm_front_end_connection_instance *)kzalloc(sizeof(struct ecm_front_end_connection_instance), GFP_ATOMIC | __GFP_NOWARN);
 	if (!feci) {
-		DEBUG_WARN("Ported Front end alloc failed\n");
+		IPAFEWARN("Ported Front end alloc failed\n");
 		ecm_db_connection_deref(ci);
 		return NULL;
 	}
@@ -2131,7 +2128,7 @@ struct ecm_front_end_connection_instance *ecm_ipa_ported_ipv6_connection_instanc
 	} else if (protocol == IPPROTO_UDP) {
 		feci->ported_accelerated_count_index = ECM_FRONT_END_PORTED_PROTO_UDP;
 	} else {
-		DEBUG_WARN("%px: Wrong protocol: %d\n", feci, protocol);
+		IPAFEWARN("%px: Wrong protocol: %d\n", feci, protocol);
 		DEBUG_CLEAR_MAGIC(feci);
 		ecm_db_connection_deref(ci);
 		kfree(feci);
@@ -2148,13 +2145,13 @@ bool ecm_ipa_ported_ipv6_debugfs_init(struct dentry *dentry)
 {
 	if (!ecm_debugfs_create_u32("udp_accelerated_count", S_IRUGO, dentry,
 				    &ecm_ipa_ported_ipv6_accelerated_count[ECM_FRONT_END_PORTED_PROTO_UDP])) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv6 udp_accelerated_count file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv6 udp_accelerated_count file in debugfs\n");
 		return false;
 	}
 
 	if (!ecm_debugfs_create_u32("tcp_accelerated_count", S_IRUGO, dentry,
 					&ecm_ipa_ported_ipv6_accelerated_count[ECM_FRONT_END_PORTED_PROTO_TCP])) {
-		DEBUG_ERROR("Failed to create ecm ipa ipv6 tcp_accelerated_count file in debugfs\n");
+		IPAFEERR("Failed to create ecm ipa ipv6 tcp_accelerated_count file in debugfs\n");
 		return false;
 	}
 
