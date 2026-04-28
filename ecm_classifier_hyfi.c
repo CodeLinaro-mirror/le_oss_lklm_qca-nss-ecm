@@ -1093,23 +1093,19 @@ int ecm_classifier_hyfi_rules_init(struct dentry *dentry)
 {
 	DEBUG_INFO("HyFi classifier Module init\n");
 
-	ecm_classifier_hyfi_dentry = debugfs_create_dir("ecm_classifier_hyfi", dentry);
-	if (!ecm_classifier_hyfi_dentry) {
+	if (!ecm_debugfs_create_dir("ecm_classifier_hyfi", dentry, &ecm_classifier_hyfi_dentry)) {
 		DEBUG_ERROR("Failed to create ecm hyfi classifier directory in debugfs\n");
 		goto classifier_task_cleanup;
 	}
 
-	if (!ecm_debugfs_create_u32("enabled", S_IRUGO | S_IWUSR, ecm_classifier_hyfi_dentry,
-					(u32 *)&ecm_classifier_hyfi_enabled)) {
-		DEBUG_ERROR("Failed to create ecm hyfi classifier enabled file in debugfs\n");
-		goto classifier_task_cleanup;
-	}
-
-	if (!debugfs_create_file("cmd", S_IWUSR, ecm_classifier_hyfi_dentry,
+	if (!ecm_debugfs_create_file("cmd", S_IWUSR, ecm_classifier_hyfi_dentry,
 					NULL, &ecm_classifier_hyfi_cmd_fops)) {
 		DEBUG_ERROR("Failed to create ecm hyfi classifier cmd file in debugfs\n");
 		goto classifier_task_cleanup;
 	}
+
+	ecm_debugfs_create_u32("enabled", S_IRUGO | S_IWUSR, ecm_classifier_hyfi_dentry,
+				(u32 *)&ecm_classifier_hyfi_enabled);
 
 	/*
 	 * Allocate listener instance to listen for db events
@@ -1142,7 +1138,7 @@ int ecm_classifier_hyfi_rules_init(struct dentry *dentry)
 
 classifier_task_cleanup:
 
-	debugfs_remove_recursive(ecm_classifier_hyfi_dentry);
+	ecm_debugfs_remove_recursive(ecm_classifier_hyfi_dentry);
 	return -1;
 }
 EXPORT_SYMBOL(ecm_classifier_hyfi_rules_init);
@@ -1173,7 +1169,7 @@ void ecm_classifier_hyfi_rules_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_classifier_hyfi_dentry) {
-		debugfs_remove_recursive(ecm_classifier_hyfi_dentry);
+		ecm_debugfs_remove_recursive(ecm_classifier_hyfi_dentry);
 	}
 }
 EXPORT_SYMBOL(ecm_classifier_hyfi_rules_exit);

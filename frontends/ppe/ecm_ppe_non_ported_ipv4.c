@@ -1,18 +1,7 @@
 /*
  **************************************************************************
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -176,7 +165,8 @@ static bool ecm_ppe_non_ported_ipv4_accelerate_done(struct ecm_front_end_connect
  */
 static void ecm_ppe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_connection_instance *feci,
 									struct ecm_classifier_process_response *pr, bool is_l2_encap,
-									struct nf_conn *ct, struct sk_buff *skb)
+									struct nf_conn *ct, struct sk_buff *skb,
+									ecm_tracker_sender_type_t sender)
 {
 	uint16_t regen_occurrances;
 	int32_t from_ifaces_first;
@@ -250,6 +240,7 @@ static void ecm_ppe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 
 	pd4rc->valid_flags = 0;
 	pd4rc->rule_flags = 0;
+	pd4rc->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Initialize VLAN tag information
@@ -595,6 +586,10 @@ static void ecm_ppe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 			 * If we have not yet got an ethernet mac then take this one (very unlikely as mac should have been propagated to the slave (outer) device
 			 */
 			memcpy(from_ppe_iface_address, vlan_info.address, ETH_ALEN);
+			if (is_valid_ether_addr(from_ppe_iface_address)) {
+				ether_addr_copy((uint8_t *)pd4rc->src_mac_rule.flow_src_mac, from_ppe_iface_address);
+				pd4rc->src_mac_rule.mac_valid_flags |= PPE_DRV_VALID_TUN_SRC_MAC_FLOW;
+			}
 			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
@@ -613,6 +608,13 @@ static void ecm_ppe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 			 */
 			if (IPCB(skb)->flags & IPSKB_XFRM_TRANSFORMED) {
 				pd4rc->conn_rule.flow_mtu = ECM_DB_IFACE_MTU_MAX;
+			}
+
+			/*
+			 * If the IPsec flow is a decapsulation (outer) flow, set rule_flags to IPSEC_DECAP.
+			 */
+			if (ecm_db_connection_flag_check(feci->ci, ECM_DB_CONNECTION_FLAGS_TUNNEL_OUTER)) {
+				pd4rc->rule_flags |= PPE_DRV_V4_RULE_FLAG_IPSEC_DECAP_FLOW;
 			}
 #else
 			rule_invalid = true;
@@ -851,7 +853,10 @@ static void ecm_ppe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 			pd4rc->valid_flags |= PPE_DRV_V4_VALID_FLAG_VLAN;
 
 			memcpy(to_ppe_iface_address, vlan_info.address, ETH_ALEN);
-
+			if (is_valid_ether_addr(to_ppe_iface_address)) {
+				ether_addr_copy((uint8_t *)pd4rc->src_mac_rule.return_src_mac, to_ppe_iface_address);
+				pd4rc->src_mac_rule.mac_valid_flags |= PPE_DRV_VALID_TUN_SRC_MAC_RETURN;
+			}
 			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
@@ -888,9 +893,10 @@ static void ecm_ppe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 
 	/*
 	 * Check if the PPE offload is enabled for the rule's Tx/Rx interfaces or not
+	 * WiFi flows are allowed to bypass the offload enabled check.
 	 */
-	if (!ppe_drv_iface_check_flow_offload_enabled(pd4rc->conn_rule.rx_if,
-						pd4rc->conn_rule.tx_if)) {
+	if (!(ppe_drv_iface_check_wifi_flow(pd4rc->conn_rule.rx_if, pd4rc->conn_rule.tx_if)) &&
+			(!ppe_drv_iface_check_flow_offload_enabled(pd4rc->conn_rule.rx_if,pd4rc->conn_rule.tx_if))) {
 		ecm_ppe_stats_v4_inc(feci, ECM_PPE_STATS_V4_EXCEPTION_NON_PORTED, ECM_PPE_STATS_V4_EXCEPTION_NON_PORTED_PPE_OFFLOAD_DISABLED);
 		DEBUG_TRACE("%px: PPE offload is disabled for rx if: %d, tx: %d\n",
 				feci, pd4rc->conn_rule.rx_if, pd4rc->conn_rule.tx_if);
@@ -983,6 +989,17 @@ static void ecm_ppe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 			pd4rc->wifi_rule.return_ds_node_mdata = pr->return_wifi_ds_node_id;
 			pd4rc->valid_flags |= PPE_DRV_V4_VALID_FLAG_RETURN_WIFI_DS;
 		}
+	}
+#endif
+
+#if defined(ECM_FRONT_END_ESP_SPI_PASSTHROUGH)
+	/*
+	 * Set the SPI rule for ESP passthrough connection.
+	 */
+	if (feci->ci->flags & ECM_DB_CONNECTION_FLAGS_ESP_SPI_PASSTH) {
+		pd4rc->spi_rule.l_spi = ecm_db_connection_spi_get(feci->ci, ECM_DB_OBJ_DIR_FROM);
+		pd4rc->spi_rule.r_spi = ecm_db_connection_spi_get(feci->ci, ECM_DB_OBJ_DIR_TO);
+		pd4rc->rule_flags |= PPE_DRV_V4_RULE_FLAG_ESP_PASS_THROUGH_SPI;
 	}
 #endif
 
@@ -1429,6 +1446,7 @@ static bool ecm_ppe_non_ported_ipv4_connection_decelerate_send(struct ecm_front_
 	spin_unlock_bh(&ecm_ppe_ipv4_lock);
 
 	pd4rd.tuple.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
+	pd4rd.tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Get addressing information
@@ -1747,15 +1765,10 @@ struct ecm_front_end_connection_instance *ecm_ppe_non_ported_ipv4_connection_ins
 }
 
 /*
- * ecm_ppe_non_ported_ipv4_debugfs_init()
+ * ecm_ppe_non_ported_ipv4_init()
  */
-bool ecm_ppe_non_ported_ipv4_debugfs_init(struct dentry *dentry)
+void ecm_ppe_non_ported_ipv4_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("non_ported_accelerated_count", S_IRUGO, dentry,
-					(u32 *)&ecm_ppe_non_ported_ipv4_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm ppe ipv4 non_ported_accelerated_count file in debugfs\n");
-		return false;
-	}
-
-	return true;
+	ecm_debugfs_create_u32("non_ported_accelerated_count", S_IRUGO, dentry,
+				(u32 *)&ecm_ppe_non_ported_ipv4_accelerated_count);
 }

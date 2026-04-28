@@ -126,6 +126,16 @@ unsigned int ecm_front_end_conn_limit = 0;
 unsigned int ecm_front_end_ppe_fse_enable = 1;
 #endif
 
+/*
+ * Operations for per-direction acceleration
+ */
+int ecm_front_end_unidir_accel_en = 1;
+int ecm_front_end_unidir_accel_delay = 0;
+int ecm_front_end_udp_ipsec_port = 4500;	/* UDP IPsec port */
+#ifdef ECM_FRONT_END_ESP_SPI_PASSTHROUGH
+unsigned int ecm_front_end_esp_spi_passthrough_enable = 0;
+#endif
+
 #define ECM_FRONT_END_DENIED_PORTS_HASH_BITS 6
 #define ECM_FRONT_END_DENIED_PORTS_HTABLE_SIZE (1 << ECM_FRONT_END_DENIED_PORTS_HASH_BITS)
 
@@ -527,6 +537,26 @@ int ecm_front_end_common_connection_state_get(struct ecm_front_end_connection_in
 	if ((result = ecm_state_write(sfi, "accel_mode", "%d", accel_mode))) {
 		return result;
 	}
+	if (feci->ci->unidir_accel_en) {
+		if ((result = ecm_state_write(sfi, "udp_flow_dir_accel", "%s", (feci->udp_flow_dir_accel ? "yes" : "no")))) {
+			return result;
+		}
+		if ((result = ecm_state_write(sfi, "udp_return_dir_accel", "%s", (feci->udp_return_dir_accel ? "yes" : "no")))) {
+			return result;
+		}
+
+		uint16_t unidir_fail_reason = (0x7FFF & atomic64_read(&feci->unidir_accel_fail_reason));
+		bool unidir_ae_failure = atomic64_read(&feci->unidir_accel_fail_reason) >> ECM_FRONT_END_FAIL_REASON_SHIFT;
+		if (unidir_ae_failure) {
+			if ((result = ecm_state_write(sfi, "unidir_fail_reason", "%s %u", " AE", unidir_fail_reason))) {
+				return result;
+			}
+		} else if (unidir_fail_reason) {
+			if ((result = ecm_state_write(sfi, "unidir_fail_reason", "%s %u", " ECM", unidir_fail_reason))) {
+				return result;
+			}
+		}
+	}
 	if ((result = ecm_state_write(sfi, "decelerate_pending", "%d", stats.decelerate_pending))) {
 		return result;
 	}
@@ -621,6 +651,54 @@ bool ecm_front_end_l2tp_proto_is_accel_allowed(struct net_device *indev, struct 
 #endif
 	return false;
 }
+
+#if defined(ECM_FRONT_END_ESP_SPI_PASSTHROUGH)
+/*
+ * ecm_front_end_esp_passthrough_is_accel_allowed()
+ *	Check if ESP pass through is allowed.
+ */
+bool ecm_front_end_esp_passthrough_is_accel_allowed(struct nf_conn *ct,
+								enum ip_conntrack_info ctinfo,
+								struct sk_buff *skb,
+								struct nf_conntrack_tuple *orig_tuple)
+{
+	/*
+	 * Check for conntrack.
+	 */
+	if (!ct) {
+		DEBUG_TRACE("%px: ESP passthrough denied - No conntrack for this packet\n", skb);
+		return false;
+	}
+
+	/*
+	 * If the ESP ID is not assigned in the conntrack,
+	 * So no need to process it for SPI match.
+	 */
+	if (orig_tuple->dst.u.esp.id == 0) {
+		DEBUG_TRACE("%px: ESP passthrough denied - Not a pass through flow (ESP ID is 0)\n", skb);
+		return false;
+	}
+
+	/*
+	 * We need to extract Bi-Di SPIs from the packets. Hence do not accelerate
+	 * till we see packets from each direction.
+	 */
+	if (ctinfo != IP_CT_ESTABLISHED && ctinfo != IP_CT_ESTABLISHED_REPLY) {
+		DEBUG_TRACE("%px: ESP passthrough denied - Bi-Di packets not yet seen (ctinfo=%d)\n", skb, ctinfo);
+		return false;
+	}
+
+	/*
+	 * Check if conntrack has information about Bi-Di SPI.
+	 */
+	if (!ct->proto.esp.l_spi || !ct->proto.esp.r_spi) {
+		DEBUG_TRACE("%px: ESP passthrough denied - Both side SPIs not present\n", skb);
+		return false;
+	}
+
+	return true;
+}
+#endif
 
 /*
  * ecm_front_end_gre_proto_is_accel_allowed()
@@ -952,6 +1030,43 @@ uint64_t ecm_front_end_get_slow_packet_count(struct ecm_front_end_connection_ins
 	return slow_pkts;
 }
 
+#ifdef ECM_FRONT_END_ESP_SPI_PASSTHROUGH
+/*
+ * ecm_front_end_esp_spi_passthrough_enable_handler()
+ *	Sysctl to enable/disable ESP SPI based passthrough feature.
+ */
+int ecm_front_end_esp_spi_passthrough_enable_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_value;
+
+	/*
+	 * Take the current value
+	 */
+	current_value = ecm_front_end_esp_spi_passthrough_enable;
+
+	/*
+	 * Write the variable with user input
+	 */
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		/*
+		 * Return failure.
+		 */
+		return ret;
+	}
+
+	if ((ecm_front_end_esp_spi_passthrough_enable != 0) &&
+			(ecm_front_end_esp_spi_passthrough_enable != 1)) {
+		DEBUG_WARN("Invalid input. Valid values 0/1\n");
+		ecm_front_end_esp_spi_passthrough_enable = current_value;
+		return -EINVAL;
+	}
+
+	return ret;
+}
+#endif
+
 #ifdef ECM_FRONT_END_PPE_ENABLE
 /*
  * ecm_front_end_ppe_fse_enable_limit_handler()
@@ -1247,6 +1362,28 @@ static int ecm_front_end_tcp_denied_ports_handler(ECM_CTL_TABLE_CONST struct ctl
 	return ecm_front_end_denied_ports_handler(write, buffer, lenp, ppos, ecm_front_end_tcp_denied_ports, false);
 }
 
+/*
+ * ecm_front_end_unidir_accel_proc_handler()
+ *	Per-direction acceleration sysctl handler.
+ */
+int ecm_front_end_unidir_accel_proc_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	/*
+	 * Write the variable with user input
+	 */
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		/*
+		 * Return failure.
+		 */
+		return ret;
+	}
+
+	return ret;
+}
+
 static struct ctl_table ecm_front_end_sysctl_tbl[] = {
 	{
 		.procname	= "front_end_conn_limit",
@@ -1278,6 +1415,37 @@ static struct ctl_table ecm_front_end_sysctl_tbl[] = {
 		.mode		= 0644,
 		.proc_handler	= &ecm_front_end_tcp_denied_ports_handler,
 	},
+	{
+		.procname	= "unidir_accel_en",
+		.data		= &ecm_front_end_unidir_accel_en,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_front_end_unidir_accel_proc_handler,
+	},
+	{
+		.procname	= "unidir_accel_delay",
+		.data		= &ecm_front_end_unidir_accel_delay,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_front_end_unidir_accel_proc_handler,
+	},
+	{
+		.procname	= "udp_ipsec_port",
+		.data		= &ecm_front_end_udp_ipsec_port,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_front_end_unidir_accel_proc_handler,
+	},
+#ifdef ECM_FRONT_END_ESP_SPI_PASSTHROUGH
+	{
+		.procname	= "esp_spi_passthrough_enable",
+		.data		= &ecm_front_end_esp_spi_passthrough_enable,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_front_end_esp_spi_passthrough_enable_handler,
+	},
+#endif
+	{}
 };
 
 /*

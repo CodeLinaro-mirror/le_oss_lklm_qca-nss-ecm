@@ -333,38 +333,44 @@ void ecm_classifier_pcc_permit_accel_v4(uint8_t *src_mac, __be32 src_ip, int src
 			ECM_IP_ADDR_TO_DOT(ecm_src_ip), src_port,
 			ECM_IP_ADDR_TO_DOT(ecm_dest_ip), dest_port);
 
-	ci = ecm_db_connection_find_and_ref(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
+	ci = ecm_db_connection_find_and_ref_hash_first(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
 	if (!ci) {
 		DEBUG_TRACE("Not found\n");
 		return;
 	}
 
-	/*
-	 * Get the PCC classifier
-	 */
-	classi = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_PCC);
-	if (!classi) {
-		DEBUG_TRACE("No PCC classi\n");
+	do {
+		struct ecm_db_connection_instance *nci;
+
+		/*
+		 * Get the PCC classifier
+		 */
+		classi = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_PCC);
+		if (!classi) {
+			DEBUG_TRACE("No PCC classi\n");
+			goto next_available;
+		}
+		pcci = (struct ecm_classifier_pcc_instance *)classi;
+		DEBUG_CHECK_MAGIC(pcci, ECM_CLASSIFIER_PCC_INSTANCE_MAGIC, "%px: magic failed", pcci);
+
+		/*
+		 * Set the permitted accel state to PERMITTED
+		 * NOTE: When we next see activity on this connection it shall be accelerated (save depending on other classifiers decisions too).
+		 */
+		spin_lock_bh(&ecm_classifier_pcc_lock);
+		pcci->accel_permit_state = ECM_CLASSIFIER_PCC_RESULT_PERMITTED;
+		pcci->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
+		pcci->process_response.process_actions = ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
+		pcci->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
+		pcci->reg_calls_from++;
+		spin_unlock_bh(&ecm_classifier_pcc_lock);
+
+		classi->deref(classi);
+next_available:
+		nci = ecm_db_connection_find_and_ref_hash_next(ci);
 		ecm_db_connection_deref(ci);
-		return;
-	}
-	pcci = (struct ecm_classifier_pcc_instance *)classi;
-	DEBUG_CHECK_MAGIC(pcci, ECM_CLASSIFIER_PCC_INSTANCE_MAGIC, "%px: magic failed", pcci);
-
-	/*
-	 * Set the permitted accel state to PERMITTED
-	 * NOTE: When we next see activity on this connection it shall be accelerated (save depending on other classifiers decisions too).
-	 */
-	spin_lock_bh(&ecm_classifier_pcc_lock);
-	pcci->accel_permit_state = ECM_CLASSIFIER_PCC_RESULT_PERMITTED;
-	pcci->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
-	pcci->process_response.process_actions = ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
-	pcci->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
-	pcci->reg_calls_from++;
-	spin_unlock_bh(&ecm_classifier_pcc_lock);
-
-	classi->deref(classi);
-	ecm_db_connection_deref(ci);
+		ci = nci;
+	} while (ci);
 }
 EXPORT_SYMBOL(ecm_classifier_pcc_permit_accel_v4);
 
@@ -404,38 +410,45 @@ void ecm_classifier_pcc_permit_accel_v6(uint8_t *src_mac, struct in6_addr *src_i
 			ECM_IP_ADDR_TO_OCTAL(ecm_src_ip), src_port,
 			ECM_IP_ADDR_TO_OCTAL(ecm_dest_ip), dest_port);
 
-	ci = ecm_db_connection_find_and_ref(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
+	ci = ecm_db_connection_find_and_ref_hash_first(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
 	if (!ci) {
 		DEBUG_TRACE("Not found\n");
 		return;
 	}
 
-	/*
-	 * Get the PCC classifier
-	 */
-	classi = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_PCC);
-	if (!classi) {
-		DEBUG_TRACE("No PCC classi\n");
+	do {
+		struct ecm_db_connection_instance *nci;
+
+		/*
+		 * Get the PCC classifier
+		 */
+		classi = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_PCC);
+		if (!classi) {
+			DEBUG_TRACE("No PCC classi\n");
+			ecm_db_connection_deref(ci);
+			return;
+		}
+		pcci = (struct ecm_classifier_pcc_instance *)classi;
+		DEBUG_CHECK_MAGIC(pcci, ECM_CLASSIFIER_PCC_INSTANCE_MAGIC, "%px: magic failed", pcci);
+
+		/*
+		 * Set the permitted accel state to PERMITTED
+		 * NOTE: When we next see activity on this connection it shall be accelerated (save depending on other classifiers decisions too).
+		 */
+		spin_lock_bh(&ecm_classifier_pcc_lock);
+		pcci->accel_permit_state = ECM_CLASSIFIER_PCC_RESULT_PERMITTED;
+		pcci->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
+		pcci->process_response.process_actions = ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
+		pcci->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
+		pcci->reg_calls_from++;
+		spin_unlock_bh(&ecm_classifier_pcc_lock);
+
+		classi->deref(classi);
+
+		nci = ecm_db_connection_find_and_ref_hash_next(ci);
 		ecm_db_connection_deref(ci);
-		return;
-	}
-	pcci = (struct ecm_classifier_pcc_instance *)classi;
-	DEBUG_CHECK_MAGIC(pcci, ECM_CLASSIFIER_PCC_INSTANCE_MAGIC, "%px: magic failed", pcci);
-
-	/*
-	 * Set the permitted accel state to PERMITTED
-	 * NOTE: When we next see activity on this connection it shall be accelerated (save depending on other classifiers decisions too).
-	 */
-	spin_lock_bh(&ecm_classifier_pcc_lock);
-	pcci->accel_permit_state = ECM_CLASSIFIER_PCC_RESULT_PERMITTED;
-	pcci->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
-	pcci->process_response.process_actions = ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
-	pcci->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
-	pcci->reg_calls_from++;
-	spin_unlock_bh(&ecm_classifier_pcc_lock);
-
-	classi->deref(classi);
-	ecm_db_connection_deref(ci);
+		ci = nci;
+	} while (ci);
 #endif
 }
 EXPORT_SYMBOL(ecm_classifier_pcc_permit_accel_v6);
@@ -469,46 +482,51 @@ void ecm_classifier_pcc_deny_accel_v4(uint8_t *src_mac, __be32 src_ip, int src_p
 			ECM_IP_ADDR_TO_DOT(ecm_src_ip), src_port,
 			ECM_IP_ADDR_TO_DOT(ecm_dest_ip), dest_port);
 
-	ci = ecm_db_connection_find_and_ref(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
+	ci = ecm_db_connection_find_and_ref_hash_first(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
 	if (!ci) {
 		DEBUG_TRACE("Not found\n");
 		return;
 	}
 
-	/*
-	 * Get the PCC classifier
-	 */
-	classi = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_PCC);
-	if (!classi) {
-		DEBUG_TRACE("No PCC classi\n");
+	do {
+		struct ecm_db_connection_instance *nci;
+		/*
+		 * Get the PCC classifier
+		 */
+		classi = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_PCC);
+		if (!classi) {
+			DEBUG_TRACE("No PCC classi\n");
+			ecm_db_connection_deref(ci);
+			return;
+		}
+		pcci = (struct ecm_classifier_pcc_instance *)classi;
+		DEBUG_CHECK_MAGIC(pcci, ECM_CLASSIFIER_PCC_INSTANCE_MAGIC, "%px: magic failed", pcci);
+
+		/*
+		 * Set the permitted accel state to DENIED
+		 * NOTE: When we next see activity on this connection it shall be accelerated (save depending on other classifiers decisions too).
+		 */
+		spin_lock_bh(&ecm_classifier_pcc_lock);
+		pcci->accel_permit_state = ECM_CLASSIFIER_PCC_RESULT_DENIED;
+		pcci->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
+		pcci->process_response.process_actions = ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
+		pcci->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
+		pcci->reg_calls_from++;
+		spin_unlock_bh(&ecm_classifier_pcc_lock);
+
+		/*
+		 * Get the front end and issue a deceleration
+		 * If the connection is not accelerated anyway this will have no effect
+		 */
+		feci = ecm_db_connection_front_end_get_and_ref(ci);
+		feci->decelerate(feci);
+		ecm_front_end_connection_deref(feci);
+
+		classi->deref(classi);
+		nci = ecm_db_connection_find_and_ref_hash_next(ci);
 		ecm_db_connection_deref(ci);
-		return;
-	}
-	pcci = (struct ecm_classifier_pcc_instance *)classi;
-	DEBUG_CHECK_MAGIC(pcci, ECM_CLASSIFIER_PCC_INSTANCE_MAGIC, "%px: magic failed", pcci);
-
-	/*
-	 * Set the permitted accel state to DENIED
-	 * NOTE: When we next see activity on this connection it shall be accelerated (save depending on other classifiers decisions too).
-	 */
-	spin_lock_bh(&ecm_classifier_pcc_lock);
-	pcci->accel_permit_state = ECM_CLASSIFIER_PCC_RESULT_DENIED;
-	pcci->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
-	pcci->process_response.process_actions = ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
-	pcci->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
-	pcci->reg_calls_from++;
-	spin_unlock_bh(&ecm_classifier_pcc_lock);
-
-	/*
-	 * Get the front end and issue a deceleration
-	 * If the connection is not accelerated anyway this will have no effect
-	 */
-	feci = ecm_db_connection_front_end_get_and_ref(ci);
-	feci->decelerate(feci);
-	ecm_front_end_connection_deref(feci);
-
-	classi->deref(classi);
-	ecm_db_connection_deref(ci);
+		ci = nci;
+	} while (ci);
 }
 EXPORT_SYMBOL(ecm_classifier_pcc_deny_accel_v4);
 
@@ -547,46 +565,53 @@ void ecm_classifier_pcc_deny_accel_v6(uint8_t *src_mac, struct in6_addr *src_ip,
 			ECM_IP_ADDR_TO_OCTAL(ecm_src_ip), src_port,
 			ECM_IP_ADDR_TO_OCTAL(ecm_dest_ip), dest_port);
 
-	ci = ecm_db_connection_find_and_ref(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
+	ci = ecm_db_connection_find_and_ref_hash_first(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
 	if (!ci) {
 		DEBUG_TRACE("Not found\n");
 		return;
 	}
 
-	/*
-	 * Get the PCC classifier
-	 */
-	classi = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_PCC);
-	if (!classi) {
-		DEBUG_TRACE("No PCC classi\n");
+	do {
+		struct ecm_db_connection_instance *nci;
+
+		/*
+		 * Get the PCC classifier
+		 */
+		classi = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_PCC);
+		if (!classi) {
+			DEBUG_TRACE("No PCC classi\n");
+			ecm_db_connection_deref(ci);
+			return;
+		}
+		pcci = (struct ecm_classifier_pcc_instance *)classi;
+		DEBUG_CHECK_MAGIC(pcci, ECM_CLASSIFIER_PCC_INSTANCE_MAGIC, "%px: magic failed", pcci);
+
+		/*
+		 * Set the permitted accel state to DENIED
+		 * NOTE: When we next see activity on this connection it shall be accelerated (save depending on other classifiers decisions too).
+		 */
+		spin_lock_bh(&ecm_classifier_pcc_lock);
+		pcci->accel_permit_state = ECM_CLASSIFIER_PCC_RESULT_DENIED;
+		pcci->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
+		pcci->process_response.process_actions = ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
+		pcci->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
+		pcci->reg_calls_from++;
+		spin_unlock_bh(&ecm_classifier_pcc_lock);
+
+		/*
+		 * Get the front end and issue a deceleration
+		 * If the connection is not accelerated anyway this will have no effect
+		 */
+		feci = ecm_db_connection_front_end_get_and_ref(ci);
+		feci->decelerate(feci);
+		ecm_front_end_connection_deref(feci);
+
+		classi->deref(classi);
+
+		nci = ecm_db_connection_find_and_ref_hash_next(ci);
 		ecm_db_connection_deref(ci);
-		return;
-	}
-	pcci = (struct ecm_classifier_pcc_instance *)classi;
-	DEBUG_CHECK_MAGIC(pcci, ECM_CLASSIFIER_PCC_INSTANCE_MAGIC, "%px: magic failed", pcci);
-
-	/*
-	 * Set the permitted accel state to DENIED
-	 * NOTE: When we next see activity on this connection it shall be accelerated (save depending on other classifiers decisions too).
-	 */
-	spin_lock_bh(&ecm_classifier_pcc_lock);
-	pcci->accel_permit_state = ECM_CLASSIFIER_PCC_RESULT_DENIED;
-	pcci->process_response.relevance = ECM_CLASSIFIER_RELEVANCE_YES;
-	pcci->process_response.process_actions = ECM_CLASSIFIER_PROCESS_ACTION_ACCEL_MODE;
-	pcci->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
-	pcci->reg_calls_from++;
-	spin_unlock_bh(&ecm_classifier_pcc_lock);
-
-	/*
-	 * Get the front end and issue a deceleration
-	 * If the connection is not accelerated anyway this will have no effect
-	 */
-	feci = ecm_db_connection_front_end_get_and_ref(ci);
-	feci->decelerate(feci);
-	ecm_front_end_connection_deref(feci);
-
-	classi->deref(classi);
-	ecm_db_connection_deref(ci);
+		ci = nci;
+	} while (ci);
 #endif
 }
 EXPORT_SYMBOL(ecm_classifier_pcc_deny_accel_v6);
@@ -1453,20 +1478,13 @@ int ecm_classifier_pcc_init(struct dentry *dentry)
 		return -1;
 	}
 
-	ecm_classifier_pcc_dentry = debugfs_create_dir("ecm_classifier_pcc", dentry);
-	if (!ecm_classifier_pcc_dentry) {
+	if (!ecm_debugfs_create_dir("ecm_classifier_pcc", dentry, &ecm_classifier_pcc_dentry)) {
 		DEBUG_ERROR("Failed to create ecm pcc directory in debugfs\n");
 		unregister_sysctl_table(ecm_classifier_pcc_ctl_table_header);
 		return -1;
 	}
 
-	if (!ecm_debugfs_create_u32("enabled", S_IRUGO, ecm_classifier_pcc_dentry,
-					(u32 *)&ecm_classifier_pcc_enabled)) {
-		DEBUG_ERROR("Failed to create pcc enabled file in debugfs\n");
-		debugfs_remove_recursive(ecm_classifier_pcc_dentry);
-		unregister_sysctl_table(ecm_classifier_pcc_ctl_table_header);
-		return -1;
-	}
+	ecm_debugfs_create_u32("enabled", S_IRUGO, ecm_classifier_pcc_dentry, (u32 *)&ecm_classifier_pcc_enabled);
 
 	return 0;
 }
@@ -1483,7 +1501,7 @@ void ecm_classifier_pcc_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_classifier_pcc_dentry) {
-		debugfs_remove_recursive(ecm_classifier_pcc_dentry);
+		ecm_debugfs_remove_recursive(ecm_classifier_pcc_dentry);
 	}
 
 	/*

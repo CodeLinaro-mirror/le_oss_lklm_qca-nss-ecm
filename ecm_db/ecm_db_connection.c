@@ -263,6 +263,21 @@ void ecm_db_connection_mark_set(struct ecm_db_connection_instance *ci, uint32_t 
 	spin_unlock_bh(&ecm_db_lock);
 
 }
+/*
+ * ecm_db_connection_flag_check
+ *	Checkss the flag in connection instance.
+ */
+bool ecm_db_connection_flag_check(struct ecm_db_connection_instance *ci, uint32_t flag)
+{
+	bool ret;
+
+	DEBUG_CHECK_MAGIC(ci, ECM_DB_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", ci);
+	spin_lock_bh(&ecm_db_lock);
+	ret = ci->flags & flag;
+	spin_unlock_bh(&ecm_db_lock);
+
+	return ret;
+}
 
 /*
  * ecm_db_connection_flag_set()
@@ -820,6 +835,38 @@ ecm_db_iface_type_t ecm_db_connection_iface_type_get(struct ecm_db_connection_in
 }
 EXPORT_SYMBOL(ecm_db_connection_iface_type_get);
 
+#if defined(ECM_FRONT_END_ESP_SPI_PASSTHROUGH)
+/*
+ * ecm_db_connection_spi_set()
+ *	Set the SPI values in ECM connection.
+ */
+void ecm_db_connection_spi_set(struct ecm_db_connection_instance *ci, ecm_db_obj_dir_t dir, uint32_t spi)
+{
+	DEBUG_CHECK_MAGIC(ci, ECM_DB_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", ci);
+
+	spin_lock_bh(&ecm_db_lock);
+	ci->spi[dir] = spi;
+	spin_unlock_bh(&ecm_db_lock);
+}
+EXPORT_SYMBOL(ecm_db_connection_spi_set);
+
+/*
+ * ecm_db_connection_spi_get()
+ *	Return the SPI value from ECM connection DB.
+ */
+uint32_t ecm_db_connection_spi_get(struct ecm_db_connection_instance *ci, ecm_db_obj_dir_t dir)
+{
+	uint32_t spi;
+	DEBUG_CHECK_MAGIC(ci, ECM_DB_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", ci);
+
+	spin_lock_bh(&ecm_db_lock);
+	spi = ci->spi[dir];
+	spin_unlock_bh(&ecm_db_lock);
+	return spi;
+}
+EXPORT_SYMBOL(ecm_db_connection_spi_get);
+#endif
+
 /*
  * ecm_db_connection_regeneration_occurrances_get()
  *	Get the number of regeneration occurrances that have occurred since the connection was created.
@@ -1236,15 +1283,13 @@ static void _ecm_db_classifier_type_assignment_remove(struct ecm_db_connection_i
  * _ecm_db_connection_classifier_unassign()
  *	Unassign a classifier and remove the classifier type
  *
- * The default classifier cannot be unassigned.
+ * The default classifier cannot be unassigned from the type_assignment list.
  */
 static inline void _ecm_db_connection_classifier_unassign(struct ecm_db_connection_instance *ci, struct ecm_classifier_instance *cci, ecm_classifier_type_t ca_type)
 {
-#ifdef ECM_DB_CTA_TRACK_ENABLE
-	struct ecm_db_connection_classifier_type_assignment *ta;
-#endif
 	DEBUG_ASSERT(spin_is_locked(&ecm_db_lock), "%px: lock is not held\n", ci);
 
+	DEBUG_INFO("%px: Unassign classifier type : %d\n", ci, ca_type);
 	/*
 	 * Clear the assignment.
 	 */
@@ -1266,26 +1311,29 @@ static inline void _ecm_db_connection_classifier_unassign(struct ecm_db_connecti
 	cci->ca_prev = NULL;
 
 #ifdef ECM_DB_CTA_TRACK_ENABLE
-	/*
-	 * Remove from the classifier type assignment list
-	 */
-	ta = &ci->type_assignment[ca_type];
-	DEBUG_CHECK_MAGIC(ta, ECM_DB_CLASSIFIER_TYPE_ASSIGNMENT_MAGIC, "%px: magic failed, ci: %px", ta, ci);
-	if (ta->iteration_count > 0) {
-		/*
-		 * The list entry is being iterated outside of db lock being held.
-		 * We cannot remove this entry since it would mess up iteration.
-		 * Set the pending flag to be actioned another time
-		 */
-		ta->pending_unassign = true;
-		return;
-	}
+	if (ca_type != ECM_CLASSIFIER_TYPE_DEFAULT) {
+		struct ecm_db_connection_classifier_type_assignment *ta;
 
-	/*
-	 * Remove the list entry
-	 */
-	DEBUG_INFO("%px: Remove type assignment: %d\n", ci, ca_type);
-	_ecm_db_classifier_type_assignment_remove(ci, ca_type);
+		/*
+		 * Remove from the classifier type assignment list
+		 */
+		ta = &ci->type_assignment[ca_type];
+		DEBUG_CHECK_MAGIC(ta, ECM_DB_CLASSIFIER_TYPE_ASSIGNMENT_MAGIC, "%px: magic failed, ci: %px", ta, ci);
+		if (ta->iteration_count > 0) {
+			/*
+			 * The list entry is being iterated outside of db lock being held.
+			 * We cannot remove this entry since it would mess up iteration.
+			 * Set the pending flag to be actioned another time
+			 */
+			ta->pending_unassign = true;
+			return;
+		}
+
+		/*
+		 * Remove the list entry
+		 */
+		_ecm_db_classifier_type_assignment_remove(ci, ca_type);
+	}
 #endif
 	cci->deref(cci);
 }
@@ -1296,9 +1344,7 @@ static inline void _ecm_db_connection_classifier_unassign(struct ecm_db_connecti
  */
 int ecm_db_connection_deref(struct ecm_db_connection_instance *ci)
 {
-#ifdef ECM_DB_CTA_TRACK_ENABLE
 	ecm_classifier_type_t ca_type;
-#endif
 	int32_t i;
 	int32_t dir;
 
@@ -1315,20 +1361,10 @@ int ecm_db_connection_deref(struct ecm_db_connection_instance *ci)
 		return refs;
 	}
 
-#ifdef ECM_MULTICAST_ENABLE
-	/*
-	 * For multicast connections, we need to deref the
-	 * associated tuple instance as well
-	 */
-	if (ci->ti) {
-		_ecm_db_multicast_tuple_instance_deref(ci->ti);
-	}
-#endif
-
 	/*
 	 * Remove from database if inserted
 	 */
-	if ((!ci->flags) & ECM_DB_CONNECTION_FLAGS_INSERTED) {
+	if (!(ci->flags & ECM_DB_CONNECTION_FLAGS_INSERTED)) {
 		spin_unlock_bh(&ecm_db_lock);
 	} else {
 		struct ecm_db_listener_instance *li;
@@ -1463,6 +1499,15 @@ int ecm_db_connection_deref(struct ecm_db_connection_instance *ci)
 			ci->mapping[dir]->conn_count[dir]--;
 		}
 
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
+		/*
+		 * For multicast connections, we need to deref the
+		 * associated tuple instance as well
+		 */
+		if (ci->ti) {
+			_ecm_db_multicast_tuple_instance_deref(ci->ti);
+		}
+#endif
 		/*
 		 * Assert that the defunt timer has been detached
 		 */
@@ -1474,6 +1519,7 @@ int ecm_db_connection_deref(struct ecm_db_connection_instance *ci)
 		ecm_db_connection_count_by_protocol[ci->protocol]--;
 		DEBUG_ASSERT(ecm_db_connection_count_by_protocol[ci->protocol] >= 0, "%px: Invalid protocol count %d\n", ci, ecm_db_connection_count_by_protocol[ci->protocol]);
 
+		ci->flags &= ~ECM_DB_CONNECTION_FLAGS_INSERTED;
 		spin_unlock_bh(&ecm_db_lock);
 
 		/*
@@ -1503,7 +1549,6 @@ int ecm_db_connection_deref(struct ecm_db_connection_instance *ci)
 	ecm_db_connection_del_vlan_filter(ci);
 #endif
 
-#ifdef ECM_DB_CTA_TRACK_ENABLE
 	/*
 	 * Unlink from the "assignments by classifier type" lists.
 	 *
@@ -1514,11 +1559,11 @@ int ecm_db_connection_deref(struct ecm_db_connection_instance *ci)
 	 * ci would be being held as part of iteration and so we would not be here!
 	 * Equally we know that if the assignments_by_type[] element is non-null then it must also be in the relevant list too.
 	 *
-	 * Default classifier is not in the classifier type assignement list, so we should start the loop index
-	 * with the first assigned classifier type.
+	 * Default classifier is not in the classifier type assignement list and _ecm_db_connection_classifier_unassign() function takes
+	 * care of it.
 	 */
 	spin_lock_bh(&ecm_db_lock);
-	for (ca_type = ECM_CLASSIFIER_TYPE_DEFAULT + 1; ca_type < ECM_CLASSIFIER_TYPES; ++ca_type) {
+	for (ca_type = ECM_CLASSIFIER_TYPE_DEFAULT; ca_type < ECM_CLASSIFIER_TYPES; ++ca_type) {
 		struct ecm_classifier_instance *cci = ci->assignments_by_type[ca_type];
 		if (!cci) {
 			/*
@@ -1529,22 +1574,12 @@ int ecm_db_connection_deref(struct ecm_db_connection_instance *ci)
 		_ecm_db_connection_classifier_unassign(ci, cci, ca_type);
 	}
 	spin_unlock_bh(&ecm_db_lock);
-#endif
 
 	/*
 	 * Throw final event
 	 */
 	if (ci->final) {
 		ci->final(ci->arg);
-	}
-
-	/*
-	 * Release instances to the objects referenced by the connection
-	 */
-	while (ci->assignments) {
-		struct ecm_classifier_instance *classi = ci->assignments;
-		ci->assignments = classi->ca_next;
-		classi->deref(classi);
 	}
 
 	for (dir = 0; dir < ECM_DB_OBJ_DIR_MAX; dir++) {
@@ -1573,7 +1608,7 @@ int ecm_db_connection_deref(struct ecm_db_connection_instance *ci)
 		}
 	}
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	/*
 	 * Remove references to the multicast interfaces of this connection.
 	 */
@@ -1932,10 +1967,10 @@ static inline ecm_db_connection_serial_hash_t ecm_db_connection_generate_serial_
 }
 
 /*
- * ecm_db_connection_find_and_ref_chain()
- *	Given a hash chain index locate the connection
+ * ecm_db_connection_find_and_ref_hash_first_chain()
+ *	Given a hash chain index locate the first connection in the chain matching with the 5-tuple.
  */
-static struct ecm_db_connection_instance *ecm_db_connection_find_and_ref_chain(ecm_db_connection_hash_t hash_index,
+static struct ecm_db_connection_instance *ecm_db_connection_find_and_ref_hash_first_chain(ecm_db_connection_hash_t hash_index,
 											ip_addr_t host1_addr, ip_addr_t host2_addr,
 											int protocol, int host1_port, int host2_port)
 {
@@ -2006,12 +2041,12 @@ connection_found:
 }
 
 /*
- * ecm_db_connection_find_and_ref()
+ * ecm_db_connection_find_and_ref_hash_first()
  *	Locate a connection instance based on addressing, protocol and optional port information.
  *
  * NOTE: For non-port based protocols then ports are expected to be -(protocol).
  */
-struct ecm_db_connection_instance *ecm_db_connection_find_and_ref(ip_addr_t host1_addr, ip_addr_t host2_addr, int protocol, int host1_port, int host2_port)
+struct ecm_db_connection_instance *ecm_db_connection_find_and_ref_hash_first(ip_addr_t host1_addr, ip_addr_t host2_addr, int protocol, int host1_port, int host2_port)
 {
 	ecm_db_connection_hash_t hash_index;
 
@@ -2021,9 +2056,191 @@ struct ecm_db_connection_instance *ecm_db_connection_find_and_ref(ip_addr_t host
 	 * Compute the hash chain index and prepare to walk the chain
 	 */
 	hash_index = ecm_db_connection_generate_hash_index(host1_addr, host1_port, host2_addr, host2_port, protocol);
-	return ecm_db_connection_find_and_ref_chain(hash_index, host1_addr, host2_addr, protocol, host1_port, host2_port);
+	return ecm_db_connection_find_and_ref_hash_first_chain(hash_index, host1_addr, host2_addr, protocol, host1_port, host2_port);
 }
-EXPORT_SYMBOL(ecm_db_connection_find_and_ref);
+
+/*
+ * ecm_db_connection_find_and_ref_hash_next()
+ *	Locate a connection instance based on addressing, protocol and optional port information.
+ *
+ * NOTE: For non-port based protocols then ports are expected to be -(protocol).
+ */
+struct ecm_db_connection_instance *ecm_db_connection_find_and_ref_hash_next(struct ecm_db_connection_instance *ci)
+{
+	struct ecm_db_connection_instance *next;
+	spin_lock_bh(&ecm_db_lock);
+	next = ci->hash_next;
+	while (next) {
+		/*
+		 * The use of unlikely() is liberally used because under fast-hit scenarios the connection would always be at the start of a chain
+		 */
+		if (unlikely(next->protocol != ci->protocol)) {
+			goto try_next;
+		}
+
+		if (unlikely(!ECM_IP_ADDR_MATCH(next->mapping[ECM_DB_OBJ_DIR_FROM]->host->address,
+						ci->mapping[ECM_DB_OBJ_DIR_FROM]->host->address))) {
+			goto try_reverse;
+		}
+
+		if (unlikely(next->mapping[ECM_DB_OBJ_DIR_FROM]->port !=
+					ci->mapping[ECM_DB_OBJ_DIR_FROM]->port)) {
+			goto try_reverse;
+		}
+
+		if (unlikely(!ECM_IP_ADDR_MATCH(next->mapping[ECM_DB_OBJ_DIR_TO]->host->address,
+						ci->mapping[ECM_DB_OBJ_DIR_TO]->host->address))) {
+			goto try_reverse;
+		}
+
+		if (unlikely(next->mapping[ECM_DB_OBJ_DIR_TO]->port !=
+					ci->mapping[ECM_DB_OBJ_DIR_TO]->port)) {
+			goto try_reverse;
+		}
+
+		goto connection_found;
+
+try_reverse:
+		if (unlikely(!ECM_IP_ADDR_MATCH(next->mapping[ECM_DB_OBJ_DIR_TO]->host->address,
+						ci->mapping[ECM_DB_OBJ_DIR_FROM]->host->address))) {
+			goto try_next;
+		}
+
+		if (unlikely(next->mapping[ECM_DB_OBJ_DIR_TO]->port !=
+					ci->mapping[ECM_DB_OBJ_DIR_FROM]->port)) {
+			goto try_next;
+		}
+
+		if (unlikely(!ECM_IP_ADDR_MATCH(next->mapping[ECM_DB_OBJ_DIR_FROM]->host->address,
+						ci->mapping[ECM_DB_OBJ_DIR_TO]->host->address))) {
+			goto try_next;
+		}
+
+		if (unlikely(next->mapping[ECM_DB_OBJ_DIR_FROM]->port !=
+					ci->mapping[ECM_DB_OBJ_DIR_TO]->port)) {
+			goto try_next;
+		}
+
+		goto connection_found;
+try_next:
+		next = next->hash_next;
+	}
+	spin_unlock_bh(&ecm_db_lock);
+	DEBUG_TRACE("Connection not found in hash chain\n");
+	return NULL;
+
+connection_found:
+	_ecm_db_connection_ref(next);
+	spin_unlock_bh(&ecm_db_lock);
+	DEBUG_ASSERT((next != ci), "%px: Loop detected in the hash slot\n", ci);
+	DEBUG_TRACE("Connection found %px\n", ci);
+	return next;
+}
+
+/*
+ * ecm_db_connection_find_and_ref_hash_first_chain()
+ *	Given a hash chain index locate the connection
+ */
+static struct ecm_db_connection_instance *
+ecm_db_connection_source_find_and_ref_chain(ecm_db_connection_hash_t hash_index,
+		ip_addr_t host1_addr, ip_addr_t host2_addr,
+		int protocol, int host1_port, int host2_port,
+		struct net_device *in, struct net_device *out)
+{
+	struct ecm_db_connection_instance *ci;
+
+	/*
+	 * Iterate the chain looking for a connection with matching details
+	 */
+	spin_lock_bh(&ecm_db_lock);
+	ci = ecm_db_connection_table[hash_index];
+	while (ci) {
+		/*
+		 * The use of unlikely() is liberally used because under fast-hit scenarios the connection would always be at the start of a chain
+		 */
+		if (unlikely(ci->protocol != protocol)) {
+			goto try_next;
+		}
+
+		if (unlikely(!ECM_IP_ADDR_MATCH(host1_addr, ci->mapping[ECM_DB_OBJ_DIR_FROM]->host->address))) {
+			goto try_reverse;
+		}
+
+		if (unlikely(host1_port != ci->mapping[ECM_DB_OBJ_DIR_FROM]->port)) {
+			goto try_reverse;
+		}
+
+		if (unlikely(!ECM_IP_ADDR_MATCH(host2_addr, ci->mapping[ECM_DB_OBJ_DIR_TO]->host->address))) {
+			goto try_reverse;
+		}
+
+		if (unlikely(host2_port != ci->mapping[ECM_DB_OBJ_DIR_TO]->port)) {
+			goto try_reverse;
+		}
+
+		if (unlikely(!ci->interfaces[ECM_DB_OBJ_DIR_FROM][ECM_DB_IFACE_HEIRARCHY_MAX - 1])) {
+			goto try_reverse;
+		}
+
+		if (unlikely(in->ifindex != ci->interfaces[ECM_DB_OBJ_DIR_FROM][ECM_DB_IFACE_HEIRARCHY_MAX - 1]->interface_identifier)) {
+			goto try_reverse;
+		}
+		goto connection_found;
+
+try_reverse:
+		if (unlikely(!ECM_IP_ADDR_MATCH(host1_addr, ci->mapping[ECM_DB_OBJ_DIR_TO]->host->address))) {
+			goto try_next;
+		}
+
+		if (unlikely(host1_port != ci->mapping[ECM_DB_OBJ_DIR_TO]->port)) {
+			goto try_next;
+		}
+
+		if (unlikely(!ECM_IP_ADDR_MATCH(host2_addr, ci->mapping[ECM_DB_OBJ_DIR_FROM]->host->address))) {
+			goto try_next;
+		}
+
+		if (unlikely(host2_port != ci->mapping[ECM_DB_OBJ_DIR_FROM]->port)) {
+			goto try_next;
+		}
+
+		if (unlikely(!ci->interfaces[ECM_DB_OBJ_DIR_FROM][ECM_DB_IFACE_HEIRARCHY_MAX - 1])) {
+			goto try_next;
+		}
+
+		if (unlikely(out->ifindex != ci->interfaces[ECM_DB_OBJ_DIR_FROM][ECM_DB_IFACE_HEIRARCHY_MAX - 1]->interface_identifier)) {
+			goto try_next;
+		}
+
+		goto connection_found;
+
+try_next:
+		ci = ci->hash_next;
+	}
+	spin_unlock_bh(&ecm_db_lock);
+	DEBUG_TRACE("Connection not found in hash chain\n");
+	return NULL;
+
+connection_found:
+	_ecm_db_connection_ref(ci);
+	spin_unlock_bh(&ecm_db_lock);
+	DEBUG_TRACE("Connection found %px\n", ci);
+	return ci;
+}
+
+struct ecm_db_connection_instance *ecm_db_connection_source_find_and_ref(ip_addr_t host1_addr, ip_addr_t host2_addr, int protocol, int host1_port, int host2_port, struct net_device *in, struct net_device *out)
+{
+	ecm_db_connection_hash_t hash_index;
+
+	DEBUG_TRACE("Lookup connection " ECM_IP_ADDR_OCTAL_FMT ":%d <> " ECM_IP_ADDR_OCTAL_FMT ":%d protocol %d\n", ECM_IP_ADDR_TO_OCTAL(host1_addr), host1_port, ECM_IP_ADDR_TO_OCTAL(host2_addr), host2_port, protocol);
+
+	/*
+	 * Compute the hash chain index and prepare to walk the chain
+	 */
+	hash_index = ecm_db_connection_generate_hash_index(host1_addr, host1_port, host2_addr, host2_port, protocol);
+	return ecm_db_connection_source_find_and_ref_chain(hash_index, host1_addr, host2_addr,
+			protocol, host1_port, host2_port, in, out);
+}
 
 /*
  * ecm_db_connection_serial_find_and_ref()
@@ -2063,7 +2280,6 @@ struct ecm_db_connection_instance *ecm_db_connection_serial_find_and_ref(uint32_
 	DEBUG_TRACE("Connection not found\n");
 	return NULL;
 }
-EXPORT_SYMBOL(ecm_db_connection_serial_find_and_ref);
 
 /*
  * ecm_db_connection_node_get_and_ref()
@@ -2409,8 +2625,8 @@ struct ecm_db_connection_instance *ecm_db_connection_by_classifier_type_assignme
 
 	DEBUG_TRACE("Get and ref first connection assigned with classifier type: %d\n", ca_type);
 
-	tal = &ecm_db_connection_classifier_type_assignments[ca_type];
 	spin_lock_bh(&ecm_db_lock);
+	tal = &ecm_db_connection_classifier_type_assignments[ca_type];
 	ci = tal->type_assignments_list;
 	while (ci) {
 		struct ecm_db_connection_classifier_type_assignment *ta;
@@ -2419,6 +2635,12 @@ struct ecm_db_connection_instance *ecm_db_connection_by_classifier_type_assignme
 
 		if (ta->pending_unassign) {
 			DEBUG_TRACE("Skip %px, pending unassign for type: %d\n", ci, ca_type);
+			ci = ta->next;
+			continue;
+		}
+
+		if (!(ci->flags & ECM_DB_CONNECTION_FLAGS_INSERTED)) {
+			DEBUG_TRACE("connection %px flag is in uninserted state for type: %d\n", ci, ca_type);
 			ci = ta->next;
 			continue;
 		}
@@ -2471,6 +2693,12 @@ struct ecm_db_connection_instance *ecm_db_connection_by_classifier_type_assignme
 			continue;
 		}
 
+		if (!(cin->flags & ECM_DB_CONNECTION_FLAGS_INSERTED)) {
+			DEBUG_TRACE("connection %px flag is in uninserted state for type: %d\n", cin, ca_type);
+			cin = tan->next;
+			continue;
+		}
+
 		/*
 		 * Take reference to this connection.
 		 * NOTE: Hold both the connection and the assignment entry so that when we unlock both the connection
@@ -2493,13 +2721,10 @@ EXPORT_SYMBOL(ecm_db_connection_by_classifier_type_assignment_get_and_ref_next);
  */
 void ecm_db_connection_by_classifier_type_assignment_deref(struct ecm_db_connection_instance *ci, ecm_classifier_type_t ca_type)
 {
-	struct ecm_db_connection_classifier_type_assignment_list *tal;
 	struct ecm_db_connection_classifier_type_assignment *ta;
 
 	DEBUG_ASSERT(ca_type < ECM_CLASSIFIER_TYPES, "Bad type: %d\n", ca_type);
 	DEBUG_CHECK_MAGIC(ci, ECM_DB_CONNECTION_INSTANCE_MAGIC, "%px: magic failed\n", ci);
-
-	tal = &ecm_db_connection_classifier_type_assignments[ca_type];
 
 	/*
 	 * Drop the iteration count
@@ -2521,30 +2746,7 @@ void ecm_db_connection_by_classifier_type_assignment_deref(struct ecm_db_connect
 	ecm_db_connection_deref(ci);
 }
 EXPORT_SYMBOL(ecm_db_connection_by_classifier_type_assignment_deref);
-
-/*
- * ecm_db_connection_make_defunct_by_assignment_type()
- *	Make defunct all connections that are currently assigned to a classifier of the given type
- */
-void ecm_db_connection_make_defunct_by_assignment_type(ecm_classifier_type_t ca_type)
-{
-	struct ecm_db_connection_instance *ci;
-
-	DEBUG_INFO("Make defunct all assigned to type: %d\n", ca_type);
-
-	ci = ecm_db_connection_by_classifier_type_assignment_get_and_ref_first(ca_type);
-	while (ci) {
-		struct ecm_db_connection_instance *cin;
-
-		DEBUG_TRACE("%px: Make defunct: %d\n", ci, ca_type);
-		ecm_db_connection_make_defunct(ci);
-
-		cin = ecm_db_connection_by_classifier_type_assignment_get_and_ref_next(ci, ca_type);
-		ecm_db_connection_by_classifier_type_assignment_deref(ci, ca_type);
-		ci = cin;
-	}
-}
-EXPORT_SYMBOL(ecm_db_connection_make_defunct_by_assignment_type);
+#endif
 
 /*
  * ecm_db_connection_regenerate_by_assignment_type()
@@ -2556,20 +2758,59 @@ void ecm_db_connection_regenerate_by_assignment_type(ecm_classifier_type_t ca_ty
 
 	DEBUG_INFO("Regenerate all assigned to type: %d\n", ca_type);
 
-	ci = ecm_db_connection_by_classifier_type_assignment_get_and_ref_first(ca_type);
+	ci = ecm_db_connections_get_and_ref_first();
 	while (ci) {
 		struct ecm_db_connection_instance *cin;
+		struct ecm_classifier_instance *eci;
+
+		eci = ecm_db_connection_assigned_classifier_find_and_ref(ci, ca_type);
+		if (!eci) {
+			goto next_ci;
+		}
 
 		DEBUG_TRACE("%px: Re-generate: %d\n", ci, ca_type);
 		ecm_db_connection_regenerate(ci);
+		eci->deref(eci);
 
-		cin = ecm_db_connection_by_classifier_type_assignment_get_and_ref_next(ci, ca_type);
-		ecm_db_connection_by_classifier_type_assignment_deref(ci, ca_type);
+next_ci:
+		cin = ecm_db_connection_get_and_ref_next(ci);
+		ecm_db_connection_deref(ci);
 		ci = cin;
 	}
 }
 EXPORT_SYMBOL(ecm_db_connection_regenerate_by_assignment_type);
-#endif
+
+/*
+ * ecm_db_connection_make_defunct_by_assignment_type()
+ *	Make defunct all connections that are currently assigned to a classifier of the given type
+ */
+void ecm_db_connection_make_defunct_by_assignment_type(ecm_classifier_type_t ca_type)
+{
+	struct ecm_db_connection_instance *ci;
+
+	DEBUG_INFO("Make defunct all assigned to type: %d\n", ca_type);
+
+	ci = ecm_db_connections_get_and_ref_first();
+	while (ci) {
+		struct ecm_db_connection_instance *cin;
+		struct ecm_classifier_instance *eci;
+
+		eci = ecm_db_connection_assigned_classifier_find_and_ref(ci, ca_type);
+		if (!eci) {
+			goto next_ci;
+		}
+
+		DEBUG_TRACE("%px: Make defunct: %d\n", ci, ca_type);
+		ecm_db_connection_make_defunct(ci);
+		eci->deref(eci);
+
+next_ci:
+		cin = ecm_db_connection_get_and_ref_next(ci);
+		ecm_db_connection_deref(ci);
+		ci = cin;
+	}
+}
+EXPORT_SYMBOL(ecm_db_connection_make_defunct_by_assignment_type);
 
 /*
  * ecm_db_connection_interfaces_get_and_ref()
@@ -2638,7 +2879,7 @@ struct net_device *ecm_db_connection_first_iface_dev_get_and_ref(struct ecm_db_c
 	spin_unlock_bh(&ecm_db_lock);
 
 	/*
-	 * Dev pointer may get removed from inet array when wifi interface is unregistered 
+	 * Dev pointer may get removed from inet array when wifi interface is unregistered
 	 * And dev_get_by_index() will return null then.
 	 * To avoid this store dev pointer in ii during interface establishment
 	 * And get it from ii if iface_type is ECM_DB_IFACE_TYPE_ETHERNET.
@@ -3427,7 +3668,7 @@ void ecm_db_connection_add(struct ecm_db_connection_instance *ci,
 	ci->final = final;
 	ci->arg = arg;
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	ci->ti = NULL;
 #endif
 
@@ -3840,7 +4081,7 @@ int ecm_db_connection_state_get(struct ecm_state_file_instance *sfi, struct ecm_
 	ni = ci->node[ECM_DB_OBJ_DIR_TO_NAT];
 	snprintf(dnode_address_nat, sizeof(dnode_address_nat), "%pM", ni->address);
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	if (!is_zero_ether_addr(ci->mcuc_addr)) {
 		snprintf(dnode_address_nat, sizeof(dnode_address_nat), "%pM", ci->mcuc_addr);
 	}
@@ -4002,7 +4243,7 @@ int ecm_db_connection_state_get(struct ecm_state_file_instance *sfi, struct ecm_
 		return result;
 	}
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_TO, group_ip);
 	if (ecm_ip_addr_is_multicast(group_ip)) {
 		if ((result = ecm_state_prefix_add(sfi, "to_mc_interfaces"))) {
@@ -4249,7 +4490,7 @@ struct ecm_db_connection_instance *ecm_db_connection_alloc(void)
 	ci->interface_first[ECM_DB_OBJ_DIR_FROM_NAT] = ECM_DB_IFACE_HEIRARCHY_MAX;
 	ci->interface_first[ECM_DB_OBJ_DIR_TO_NAT] = ECM_DB_IFACE_HEIRARCHY_MAX;
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	for (i = 0; i < ECM_DB_MULTICAST_IF_MAX; ++i) {
 		ci->to_mcast_interface_first[i] = ECM_DB_IFACE_HEIRARCHY_MAX;
 	}
@@ -4266,8 +4507,11 @@ struct ecm_db_connection_instance *ecm_db_connection_alloc(void)
 	}
 
 	/*
-	 * Assign runtime unique serial
+	 * Assign runtime unique serial, 0 is reserved.
 	 */
+	if (ecm_db_connection_serial == 0) {
+		ecm_db_connection_serial++;
+	}
 	ci->serial = ecm_db_connection_serial++;
 
 	ecm_db_connection_count++;
@@ -4332,7 +4576,7 @@ struct ecm_db_connection_instance *ecm_db_connection_ipv6_from_ct_get_and_ref(st
 		    host2_port,
 		    protocol);
 
-	return ecm_db_connection_find_and_ref(host1_addr,
+	return ecm_db_connection_find_and_ref_hash_first(host1_addr,
 					      host2_addr,
 					      protocol,
 					      host1_port,
@@ -4372,6 +4616,22 @@ struct ecm_db_connection_instance *ecm_db_connection_ipv4_from_ct_get_and_ref(st
 		break;
 	case IPPROTO_IPV6:
 	case IPPROTO_ESP:
+		/*
+		 * In case of ESP SPI pass through, the port numbers are unique
+		 * ESP IDs indirectly representing the SPI values aligned with conntrack
+		 * entry - making it 5 tuple instead of 3. In case if this feature is
+		 * disabled, then ESP is treated as a regular 5 tuple.
+		 */
+#if defined(ECM_FRONT_END_ESP_SPI_PASSTHROUGH)
+		if (ecm_front_end_esp_spi_passthrough_enable) {
+			host1_port = ntohs(orig_tuple.src.u.udp.port);
+			host2_port = ntohs(reply_tuple.src.u.udp.port);
+		} else {
+			host1_port = 0;
+			host2_port = 0;
+		}
+		break;
+#endif
 	case IPPROTO_GRE:
 	case IPPROTO_L2TP:
 		host1_port = 0;
@@ -4392,7 +4652,7 @@ struct ecm_db_connection_instance *ecm_db_connection_ipv4_from_ct_get_and_ref(st
 		    host2_port,
 		    protocol);
 
-	return ecm_db_connection_find_and_ref(host1_addr,
+	return ecm_db_connection_find_and_ref_hash_first(host1_addr,
 					      host2_addr,
 					      protocol,
 					      host1_port,
@@ -4448,7 +4708,7 @@ struct ecm_db_connection_instance *ecm_db_connection_from_ovs_flow_get_and_ref(s
 		return NULL;
 	}
 
-	return ecm_db_connection_find_and_ref(src_addr,
+	return ecm_db_connection_find_and_ref_hash_first(src_addr,
 					      dst_addr,
 					      protocol,
 					      src_port,
@@ -4477,7 +4737,7 @@ bool ecm_db_connection_decel_v4(__be32 src_ip, int src_port,
 	ECM_NIN4_ADDR_TO_IP_ADDR(ecm_src_ip, src_ip);
 	ECM_NIN4_ADDR_TO_IP_ADDR(ecm_dest_ip, dest_ip);
 
-	ci = ecm_db_connection_find_and_ref(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
+	ci = ecm_db_connection_find_and_ref_hash_first(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
 	if (!ci) {
 		DEBUG_WARN("Decel v4 Connection lookup failed."
 				" Received connection tuple information: \n"
@@ -4490,19 +4750,25 @@ bool ecm_db_connection_decel_v4(__be32 src_ip, int src_port,
 		return false;
 	}
 
-	DEBUG_TRACE("Decel v4, connection tuple information: \n"
-			"Protocol: %d\n"
-			"src: " ECM_IP_ADDR_DOT_FMT ":%d\n"
-			"dest: " ECM_IP_ADDR_DOT_FMT ":%d\n",
-			protocol,
-			ECM_IP_ADDR_TO_DOT(ecm_src_ip), src_port,
-			ECM_IP_ADDR_TO_DOT(ecm_dest_ip), dest_port);
+	do {
+		struct ecm_db_connection_instance *nci;
+		DEBUG_TRACE("Decel v4, connection tuple information: \n"
+				"Protocol: %d\n"
+				"src: " ECM_IP_ADDR_DOT_FMT ":%d\n"
+				"dest: " ECM_IP_ADDR_DOT_FMT ":%d\n",
+				protocol,
+				ECM_IP_ADDR_TO_DOT(ecm_src_ip), src_port,
+				ECM_IP_ADDR_TO_DOT(ecm_dest_ip), dest_port);
 
-	/*
-	 * Defunct the connection.
-	 */
-	ecm_db_connection_make_defunct(ci);
-	ecm_db_connection_deref(ci);
+		/*
+		 * Defunct the connection.
+		 */
+		ecm_db_connection_make_defunct(ci);
+		nci = ecm_db_connection_find_and_ref_hash_next(ci);
+		ecm_db_connection_deref(ci);
+		ci = nci;
+	} while (ci);
+
 	return true;
 }
 
@@ -4533,7 +4799,7 @@ bool ecm_db_connection_decel_v6(struct in6_addr *src_ip, int src_port,
 	in6 = *dest_ip;
 	ECM_NIN6_ADDR_TO_IP_ADDR(ecm_dest_ip, in6);
 
-	ci = ecm_db_connection_find_and_ref(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
+	ci = ecm_db_connection_find_and_ref_hash_first(ecm_src_ip, ecm_dest_ip, protocol, src_port, dest_port);
 	if (!ci) {
 		DEBUG_WARN("Decel v6, Connection lookup failed."
 				" Received connection tuple information: \n"
@@ -4546,20 +4812,26 @@ bool ecm_db_connection_decel_v6(struct in6_addr *src_ip, int src_port,
 		return false;
 	}
 
+	do {
+		struct ecm_db_connection_instance *nci;
 
-	DEBUG_TRACE("Decel v6, connection tuple information: \n"
-			"Protocol: %d\n"
-			"src: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
-			"dest: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
-			protocol,
-			ECM_IP_ADDR_TO_OCTAL(ecm_src_ip), src_port,
-			ECM_IP_ADDR_TO_OCTAL(ecm_dest_ip), dest_port);
+		DEBUG_TRACE("Decel v6, connection tuple information: \n"
+				"Protocol: %d\n"
+				"src: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
+				"dest: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				protocol,
+				ECM_IP_ADDR_TO_OCTAL(ecm_src_ip), src_port,
+				ECM_IP_ADDR_TO_OCTAL(ecm_dest_ip), dest_port);
 
-	/*
-	 * Defunct the connection.
-	 */
-	ecm_db_connection_make_defunct(ci);
-	ecm_db_connection_deref(ci);
+		/*
+		 * Defunct the connection.
+		 */
+		ecm_db_connection_make_defunct(ci);
+		nci = ecm_db_connection_find_and_ref_hash_next(ci);
+		ecm_db_connection_deref(ci);
+		ci = nci;
+	} while (ci);
+
 	return true;
 #endif
 	return false;
@@ -5273,6 +5545,55 @@ static struct ctl_table ecm_db_connection_ctl_table[] = {
 };
 
 /*
+ * ecm_db_connection_unidir_ready_for_accel()
+ *	Check if flow/return connection is ready for acceleration
+ */
+bool ecm_db_connection_unidir_ready_for_accel(struct ecm_db_connection_instance *ci, ecm_tracker_sender_type_t sender)
+{
+	/*
+	 * Get the packet count we have seen in the slow path so far.
+	 */
+	spin_lock_bh(&ecm_db_lock);
+	ci->slow_unidir_pkts[sender]++;
+	spin_unlock_bh(&ecm_db_lock);
+
+	/*
+	 * Check if we have seen slow path packets as the predefined count.
+	 */
+	if (ci->slow_unidir_pkts[sender] < ecm_front_end_unidir_accel_delay) {
+		DEBUG_TRACE("%px: delay the acceleration: slow packets: %llu default delay packet count: %d\n",
+				ci, ci->slow_unidir_pkts[sender], ecm_front_end_unidir_accel_delay);
+
+		/*
+		 * We haven't reached the slow path packet limit.
+		 * We can wait more to accelerate the connection.
+		 */
+		return false;
+	}
+
+	/*
+	 * We waited enough time for the acceleration, we can allow it now.
+	 */
+	DEBUG_INFO("%px: Let the flow accel, waited enough packet\n", ci);
+	return true;
+}
+
+/*
+ * ecm_db_connection_accel_sender_get()
+ *	Return the accel sender for unidirection acceleration
+ */
+ecm_tracker_sender_type_t ecm_db_connection_accel_sender_get(struct ecm_db_connection_instance *ci)
+{
+	ecm_tracker_sender_type_t accel_sender;
+
+	spin_lock_bh(&ecm_db_lock);
+	accel_sender = ci->accel_sender;
+	spin_unlock_bh(&ecm_db_lock);
+	return accel_sender;
+}
+EXPORT_SYMBOL(ecm_db_connection_accel_sender_get);
+
+/*
  * File operations for simple connection counts.
  */
 static struct file_operations ecm_db_connection_count_simple_fops = {
@@ -5284,13 +5605,9 @@ static struct file_operations ecm_db_connection_count_simple_fops = {
  */
 bool ecm_db_connection_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("connection_count", S_IRUGO, dentry,
-					(u32 *)&ecm_db_connection_count)) {
-		DEBUG_ERROR("Failed to create ecm db connection count file in debugfs\n");
-		return false;
-	}
+	ecm_debugfs_create_u32("connection_count", S_IRUGO, dentry, (u32 *)&ecm_db_connection_count);
 
-	if (!debugfs_create_file("connection_count_simple", S_IRUGO, dentry,
+	if (!ecm_debugfs_create_file("connection_count_simple", S_IRUGO, dentry,
 					NULL, &ecm_db_connection_count_simple_fops)) {
 		DEBUG_ERROR("Failed to create ecm db connection count simple file in debugfs\n");
 		return false;

@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -316,7 +305,8 @@ static void ecm_nss_non_ported_ipv6_connection_callback(void *app_data, struct n
  */
 static void ecm_nss_non_ported_ipv6_connection_accelerate(struct ecm_front_end_connection_instance *feci,
                                                                         struct ecm_classifier_process_response *pr, bool is_l2_encap,
-                                                                        struct nf_conn *ct, struct sk_buff *skb)
+                                                                        struct nf_conn *ct, struct sk_buff *skb,
+									ecm_tracker_sender_type_t sender)
 {
 	uint16_t regen_occurrances;
 	int32_t from_ifaces_first;
@@ -1729,15 +1719,10 @@ struct ecm_front_end_connection_instance *ecm_nss_non_ported_ipv6_connection_ins
 }
 
 /*
- * ecm_nss_non_ported_ipv6_debugfs_init()
+ * ecm_nss_non_ported_ipv6_init()
  */
-bool ecm_nss_non_ported_ipv6_debugfs_init(struct dentry *dentry)
+void ecm_nss_non_ported_ipv6_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("non_ported_accelerated_count", S_IRUGO, dentry,
-					(u32 *)&ecm_nss_non_ported_ipv6_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv6 non_ported_accelerated_count file in debugfs\n");
-		return false;
-	}
-
-	return true;
+	ecm_debugfs_create_u32("non_ported_accelerated_count", S_IRUGO, dentry,
+				(u32 *)&ecm_nss_non_ported_ipv6_accelerated_count);
 }

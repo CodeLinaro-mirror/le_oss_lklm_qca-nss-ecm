@@ -70,7 +70,7 @@ struct ecm_db_iface_instance *ecm_interface_establish_and_ref(struct ecm_front_e
 #ifdef ECM_INTERFACE_OVS_BRIDGE_ENABLE
 bool ecm_interface_is_ovs_bridge_port(const struct net_device *dev);
 #endif
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 int32_t ecm_interface_multicast_heirarchy_construct_routed(struct ecm_front_end_connection_instance *feci, struct ecm_db_iface_instance *interfaces, struct net_device *in_dev, ip_addr_t packet_src_addr, ip_addr_t packet_dest_addr, uint8_t maxvif, uint32_t *dst_dev, uint32_t *to_interface_first, bool mfc_update, __be16 *layer4hdr, struct sk_buff *skb);
 
 int32_t ecm_interface_multicast_heirarchy_construct_bridged(struct ecm_front_end_connection_instance *feci, struct ecm_db_iface_instance *interfaces, struct net_device *br_dev, ip_addr_t src_addr, ip_addr_t dest_addr, uint8_t mc_max_dst, int32_t *mc_dst_dev, uint32_t *to_interface_first, uint8_t *src_node_addr, __be16 *layer4hdr, struct sk_buff *skb);
@@ -92,6 +92,12 @@ int32_t ecm_interface_multicast_from_heirarchy_construct(struct ecm_front_end_co
 					uint8_t *dest_node_addr, uint8_t *src_node_addr,
 					__be16 *layer4hdr, struct sk_buff *skb);
 int32_t ecm_interface_multicast_filter_src_interface(struct ecm_db_connection_instance *ci, uint32_t *mc_dst_if_index);
+
+#if defined(ECM_ATH_MCAST_ENABLE)
+int ecm_ipv6_ath_mc_bridge_get_if(struct net_device *brdev, struct in6_addr origin, struct in6_addr group, uint32_t max_dst, uint32_t *dst_dev);
+int ecm_ipv4_ath_mc_bridge_get_if(struct net_device *brdev, __be32 origin, __be32 group, uint32_t max_dst, uint32_t *dst_dev);
+#endif
+
 #ifdef ECM_INTERFACE_OVS_BRIDGE_ENABLE
 bool ecm_interface_multicast_check_for_ovs_br_dev(uint32_t dest_if[], uint8_t max_if);
 int ecm_interface_multicast_ovs_to_interface_get_and_ref(struct ecm_db_connection_instance *ci,
@@ -134,6 +140,17 @@ uint32_t ecm_interface_vxlan_type_get(struct sk_buff *skb, struct vxlan_dev *vxl
 __be32 ecm_interface_vxlan_gpe_get_vni_remote_ip_from_inner(struct net_device *dev, const struct sk_buff *skb, union vxlan_addr *remote_ip);
 #endif
 
+bool ecm_interface_ported_hiearachy_is_tun_outer(struct sk_buff *skb, struct net_device *in_dev, struct net_device *out_dev, int protocol);
+
+#ifdef ECM_INTERFACE_BRIDGE_ISOLATION_ENABLE
+extern int ecm_interface_br_isolation_enable;
+bool ecm_interface_validate_bridge_sub_ids(struct net_device *in, struct net_device *out, struct sk_buff *skb);
+#endif
+
+bool ecm_interface_is_arp_allowed(struct net_device *dev, struct sk_buff *skb);
+bool ecm_interface_is_ns_allowed(struct net_device *dev, struct sk_buff *skb);
+
+bool ecm_interface_hierarchy_is_tunnel_flow(struct net_device *in_dev, struct net_device *out_dev);
 void ecm_interface_node_connections_defunct_by_type_sta_join(uint8_t *mac);
 void ecm_interface_defunct_qm_connections(uint8_t *mac, uint8_t wifi_qm_type, uint8_t wifi_qm_id);
 void ecm_interface_node_connections_defunct_by_mac_addr(uint8_t *mac);

@@ -66,8 +66,9 @@
  * 4 = 3 + TRACE
  */
 #define DEBUG_LEVEL ECM_SFE_MULTICAST_IPV4_DEBUG_LEVEL
+#if defined(ECM_MULTICAST_ENABLE)
 #include <mc_ecm.h>
-
+#endif
 #include "ecm_types.h"
 #include "ecm_db_types.h"
 #include "ecm_state.h"
@@ -98,7 +99,6 @@ static struct ctl_table_header *ecm_sfe_multicast_ipv4_ctl_table_header;	/* Sysc
 static void ecm_sfe_multicast_ipv4_connection_update_callback(void *app_data, struct sfe_ipv4_msg *nim)
 {
 	struct sfe_ipv4_mc_rule_create_msg *mccm = &nim->msg.mc_rule_create;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 
@@ -108,24 +108,28 @@ static void ecm_sfe_multicast_ipv4_connection_update_callback(void *app_data, st
 	 * Is this a response to a create message?
 	 */
 	if (nim->cm.type != SFE_TX_CREATE_MULTICAST_RULE_MSG) {
-		DEBUG_ERROR("%px: multicast update callback with improper type:	%d, serial: %u\n", nim, nim->cm.type, serial);
+		DEBUG_ERROR("%px: multicast update callback with improper type:	%d, serial: %u\n",
+				nim, nim->cm.type, mccm->tuple.flow_rule_id);
 		return;
+
 	}
 
 	/*
 	 * Is this a response to a update rule message?
 	 */
-	if ( !(mccm->rule_flags & SFE_MC_RULE_CREATE_FLAG_MC_UPDATE)) {
-		DEBUG_ERROR("%px: multicast update callback with improper type:	%d, serial: %u\n", nim, nim->cm.type, serial);
+	if (!(mccm->rule_flags & SFE_MC_RULE_CREATE_FLAG_MC_UPDATE)) {
+		DEBUG_ERROR("%px: multicast update callback without update flag, serial: %u\n",
+				nim, mccm->tuple.flow_rule_id);
 		return;
 	}
 
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(mccm->tuple.flow_rule_id);
 	if (!ci) {
-		DEBUG_TRACE("%px: multicast update callback, connection not found, serial: %u\n", mccm, serial);
+		DEBUG_TRACE("%px: multicast update callback, connection not found, serial: %u\n",
+				mccm, mccm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -145,7 +149,8 @@ static void ecm_sfe_multicast_ipv4_connection_update_callback(void *app_data, st
 	/*
 	 * Dump some useful trace information.
 	 */
-	DEBUG_TRACE("%px: Update accelerate response for connection: %px, serial: %u\n", feci, feci->ci, serial);
+	DEBUG_TRACE("%px: Update accelerate response for connection: %px, serial: %u\n",
+			feci, feci->ci, mccm->tuple.flow_rule_id);
 	DEBUG_TRACE("%px: valid_flags: %x\n", feci, mccm->valid_flags);
 	DEBUG_TRACE("%px: flow_ip: %pI4h:%d\n", feci, &mccm->tuple.flow_ip, mccm->tuple.flow_ident);
 	DEBUG_TRACE("%px: return_ip: %pI4h:%d\n", feci, &mccm->tuple.return_ip, mccm->tuple.return_ident);
@@ -166,7 +171,6 @@ static void ecm_sfe_multicast_ipv4_connection_update_callback(void *app_data, st
 static void ecm_sfe_multicast_ipv4_connection_create_callback(void *app_data, struct sfe_ipv4_msg *nim)
 {
 	struct sfe_ipv4_mc_rule_create_msg *__attribute__((unused))mccm = &nim->msg.mc_rule_create;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 	ecm_front_end_acceleration_mode_t result_mode;
@@ -176,16 +180,18 @@ static void ecm_sfe_multicast_ipv4_connection_create_callback(void *app_data, st
 	 * Is this a response to a create message?
 	 */
 	if (nim->cm.type != SFE_TX_CREATE_MULTICAST_RULE_MSG) {
-		DEBUG_ERROR("%px: udp create callback with improper type: %d, serial: %u\n", nim, nim->cm.type, serial);
+		DEBUG_ERROR("%px: udp create callback with improper type: %d, serial: %u\n",
+				nim, nim->cm.type, mccm->tuple.flow_rule_id);
 		return;
 	}
 
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(mccm->tuple.flow_rule_id);
 	if (!ci) {
-		DEBUG_TRACE("%px: create callback, connection not found, serial:%u\n", nim, serial);
+		DEBUG_TRACE("%px: create callback, connection not found, serial:%u\n",
+				nim, mccm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -205,7 +211,8 @@ static void ecm_sfe_multicast_ipv4_connection_create_callback(void *app_data, st
 	/*
 	 * Dump some useful trace information.
 	 */
-	DEBUG_TRACE("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, serial);
+	DEBUG_TRACE("%px: accelerate response for connection: %px, serial: %u\n",
+			feci, feci->ci, mccm->tuple.flow_rule_id);
 	DEBUG_TRACE("%px: valid_flags: %x\n", feci, mccm->valid_flags);
 	DEBUG_TRACE("%px: flow_ip: %pI4h:%d\n", feci, &mccm->tuple.flow_ip, mccm->tuple.flow_ident);
 	DEBUG_TRACE("%px: return_ip: %pI4h:%d\n", feci, &mccm->tuple.return_ip, mccm->tuple.return_ident);
@@ -439,6 +446,7 @@ static int ecm_sfe_multicast_ipv4_connection_update_accelerate(struct ecm_front_
 
 	create->valid_flags = 0;
 	create->rule_flags = 0;
+	create->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Initialize VLAN tag information
@@ -743,7 +751,15 @@ static int ecm_sfe_multicast_ipv4_connection_update_accelerate(struct ecm_front_
 
 				ecm_db_iface_dsa_address_get(ii, to_sfe_iface_address);
 				to_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
-				DEBUG_TRACE("%px: DSA - mac: %pM, mtu %d\n", feci, to_sfe_iface_address, to_mtu);
+				to_sfe_iface_id = ecm_db_iface_ae_interface_identifier_get(ii);
+				if (to_sfe_iface_id < 0) {
+					ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST_TO_IFACE_INVALID_IFACE_ID);
+					DEBUG_TRACE("%px: to_sfe_iface_id: %d\n", feci, to_sfe_iface_id);
+					rule_invalid = true;
+					break;
+			        }
+
+				DEBUG_TRACE("%px: DSA - mac: %pM, mtu %d to_sfe_iface_id: %d\n", feci, to_sfe_iface_address, to_mtu, to_sfe_iface_id);
 #else
 				rule_invalid = true;
 				DEBUG_TRACE("%px: DSA interface is not supported\n", feci);
@@ -983,7 +999,8 @@ static int ecm_sfe_multicast_ipv4_connection_update_accelerate(struct ecm_front_
  */
 static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_connection_instance *feci,
                                                                         struct ecm_classifier_process_response *pr, bool is_l2_encap,
-                                                                        struct nf_conn *ct, struct sk_buff *skb)
+                                                                        struct nf_conn *ct, struct sk_buff *skb,
+									ecm_tracker_sender_type_t sender)
 {
 	uint16_t regen_occurrances;
 	struct ecm_db_iface_instance *to_ifaces;
@@ -1060,6 +1077,7 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 	create = &nim->msg.mc_rule_create;
 	create->valid_flags = 0;
 	create->rule_flags = 0;
+	create->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Initialize VLAN tag information
@@ -1074,6 +1092,7 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 	 */
 	from_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, from_ifaces, ECM_DB_OBJ_DIR_FROM);
 	if (from_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
+		ecm_sfe_ipv4_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST_NO_FROM_INTERFACES);
 		DEBUG_WARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
 		kfree(nim);
@@ -1083,6 +1102,7 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 	from_sfe_iface = from_ifaces[from_ifaces_first];
 	from_sfe_iface_id = ecm_db_iface_ae_interface_identifier_get(from_sfe_iface);
 	if (from_sfe_iface_id < 0) {
+		ecm_sfe_ipv4_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST_FROM_IFACE_INVALID_BOTTOM_IFACE);
                 DEBUG_TRACE("%px: from_sfe_iface_id: %d\n", feci, from_sfe_iface_id);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
@@ -1320,6 +1340,7 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 
 	ret = ecm_db_multicast_connection_to_interfaces_get_and_ref_all(feci->ci, &to_ifaces, &to_ifaces_first);
 	if (!ret) {
+		ecm_sfe_ipv4_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST_NO_TO_INTERFACES);
 		DEBUG_WARN("%px: Accel attempt failed - no multicast interfaces in to_interfaces list!\n", feci);
 		kfree(nim);
@@ -1432,6 +1453,7 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 				to_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
 				to_sfe_iface_id = ecm_db_iface_ae_interface_identifier_get(ii);
 				if (to_sfe_iface_id < 0) {
+					ecm_sfe_ipv4_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 					ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST_TO_IFACE_INVALID_IFACE_ID);
 					DEBUG_TRACE("%px: to_sfe_iface_id: %d\n", feci, to_sfe_iface_id);
 					ecm_db_multicast_connection_to_interfaces_deref_all(to_ifaces, to_ifaces_first);
@@ -1617,7 +1639,15 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 
 				ecm_db_iface_dsa_address_get(ii, to_sfe_iface_address);
 				to_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
-				DEBUG_TRACE("%px: DSA - mac: %pM, mtu %d\n", feci, to_sfe_iface_address, to_mtu);
+				to_sfe_iface_id = ecm_db_iface_ae_interface_identifier_get(ii);
+				if (to_sfe_iface_id < 0) {
+					ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST_TO_IFACE_INVALID_IFACE_ID);
+					DEBUG_TRACE("%px: to_sfe_iface_id: %d\n", feci, to_sfe_iface_id);
+					rule_invalid = true;
+					break;
+			        }
+
+				DEBUG_TRACE("%px: DSA - mac: %pM, mtu %d to_sfe_iface_id: %d\n", feci, to_sfe_iface_address, to_mtu, to_sfe_iface_id);
 #else
 				rule_invalid = true;
 				ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST, ECM_SFE_STATS_V4_EXCEPTION_MULTICAST_TO_IFACE_DSA_UNSUPPORTED);
@@ -1878,6 +1908,7 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 		DEBUG_TRACE("%px: UDP Accelerate connection %px\n"
 			"Vif: %d\n"
 			"Protocol: %d\n"
+			"serial:%u\n"
 			"to_mtu: %u\n"
 			"from_ip: %pI4h:%d\n"
 			"to_ip: %pI4h:%d\n"
@@ -1892,6 +1923,7 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 			feci->ci,
 			vif,
 			create->tuple.protocol,
+			create->tuple.flow_rule_id,
 			create->if_rule[vif].if_mtu,
 			&create->tuple.flow_ip, create->tuple.flow_ident,
 			&create->tuple.return_ip, create->tuple.return_ident,
@@ -1998,7 +2030,6 @@ static void ecm_sfe_multicast_ipv4_connection_accelerate(struct ecm_front_end_co
 static void ecm_sfe_multicast_ipv4_connection_destroy_callback(void *app_data, struct sfe_ipv4_msg *nim)
 {
 	struct sfe_ipv4_mc_rule_destroy_msg * __attribute__((unused))nirdm = &nim->msg.mc_rule_destroy;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 
@@ -2013,9 +2044,10 @@ static void ecm_sfe_multicast_ipv4_connection_destroy_callback(void *app_data, s
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(nirdm->tuple.flow_rule_id);
 	if (!ci) {
-		DEBUG_TRACE("%px: destroy callback, connection not found, serial: %u\n", nim, serial);
+		DEBUG_TRACE("%px: destroy callback, connection not found, serial: %u\n",
+				nim, nirdm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -2143,6 +2175,7 @@ static bool ecm_sfe_multicast_ipv4_connection_decelerate_msg_send(struct ecm_fro
 
 	nirdm = &mccm->msg.mc_rule_destroy;
 	nirdm->tuple.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
+	nirdm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Get addressing information
@@ -2421,8 +2454,15 @@ static void ecm_sfe_multicast_ipv4_bridge_update_connections(ip_addr_t dest_ip, 
 		 * 	if_num > 0   An interface has either left or joined the group. Process the leave/join interface request.
 		 */
 		memset(mc_dst_dev, 0, sizeof(mc_dst_dev));
+
+#if defined(ECM_ATH_MCAST_ENABLE)
+		rcu_read_lock();
+		if_num = ecm_ipv4_ath_mc_bridge_get_if(brdev, htonl(src_ip[0]), htonl(dest_ip[0]), ECM_DB_MULTICAST_IF_MAX, mc_dst_dev);
+		rcu_read_unlock();
+#else
 		if_num = mc_bridge_ipv4_get_if(brdev, htonl(src_ip[0]), htonl(dest_ip[0]), ECM_DB_MULTICAST_IF_MAX,
 				mc_dst_dev, dest_mac_addr);
+#endif
 		if (if_num < 0) {
 			/*
 			 * This may a valid case when all the interfaces have left a multicast group.
@@ -2829,6 +2869,7 @@ ssize_t ecm_sfe_multicast_ipv4_get_accelerated_count(struct device *dev,
 	return count;
 }
 
+#if defined(ECM_MULTICAST_ENABLE)
 /*
  * ecm_sfe_br_multicast_update_event_callback()
  *	Callback received from bridge multicast snooper module in the
@@ -2854,6 +2895,7 @@ static void ecm_sfe_br_multicast_update_event_callback(struct net_device *brdev,
 	ECM_HIN4_ADDR_TO_IP_ADDR(dest_ip, htonl(group));
 	ecm_sfe_multicast_ipv4_bridge_update_connections(dest_ip, brdev);
 }
+#endif
 
 /*
  * ecm_sfe_mfc_update_event_callback()
@@ -3222,22 +3264,31 @@ int ecm_sfe_multicast_ipv4_init(struct dentry *dentry)
 		return -1;
 	}
 
-	if (!ecm_debugfs_create_u32("multicast_accelerated_count", S_IRUGO, dentry,
-					&ecm_sfe_multicast_ipv4_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm sfe ipv4 multicast_accelerated_count file in debugfs\n");
-		unregister_sysctl_table(ecm_sfe_multicast_ipv4_ctl_table_header);
-		return -1;
-	}
+	ecm_debugfs_create_u32("multicast_accelerated_count", S_IRUGO, dentry,
+					(u32 *)&ecm_sfe_multicast_ipv4_accelerated_count);
 
+#if defined(ECM_MULTICAST_ENABLE)
 	/*
 	 * Register multicast update callback to MCS snooper
 	 */
-	mc_bridge_ipv4_update_callback_register(ecm_sfe_br_multicast_update_event_callback);
-
+	if (mc_bridge_ipv4_update_callback_register(ecm_sfe_br_multicast_update_event_callback)) {
+		DEBUG_ERROR("Failed to register MCS callback\n");
+		unregister_sysctl_table(ecm_sfe_multicast_ipv4_ctl_table_header);
+		return -1;
+	}
+#endif
 	/*
 	 * Register multicast update callbacks to MFC
 	 */
-	ipmr_register_mfc_event_offload_callback(ecm_sfe_mfc_update_event_callback);
+	if (!ipmr_register_mfc_event_offload_callback(ecm_sfe_mfc_update_event_callback)) {
+		DEBUG_ERROR("Failed to register MFC callback\n");
+		unregister_sysctl_table(ecm_sfe_multicast_ipv4_ctl_table_header);
+#if defined(ECM_MULTICAST_ENABLE)
+		mc_bridge_ipv4_update_callback_deregister();
+#endif
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -3252,8 +3303,9 @@ void ecm_sfe_multicast_ipv4_exit(void)
 	 * MFC and MCS snooper
 	 */
 	ipmr_unregister_mfc_event_offload_callback();
+#if defined(ECM_MULTICAST_ENABLE)
 	mc_bridge_ipv4_update_callback_deregister();
-
+#endif
 	/*
 	 * Unregister sysctl table header
 	 */

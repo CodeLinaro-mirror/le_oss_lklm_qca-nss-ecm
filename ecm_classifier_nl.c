@@ -455,7 +455,7 @@ static int ecm_classifier_nl_genl_msg_ACCEL(struct sk_buff *skb,
 		    ECM_IP_ADDR_TO_OCTAL(dst_ip),
 		    dst_port,
 		    tuple->proto);
-	ci = ecm_db_connection_find_and_ref(src_ip,
+	ci = ecm_db_connection_find_and_ref_hash_first(src_ip,
 					    dst_ip,
 					    proto,
 					    src_port,
@@ -464,32 +464,39 @@ static int ecm_classifier_nl_genl_msg_ACCEL(struct sk_buff *skb,
 		DEBUG_WARN("database connection not found\n");
 		return -ENOENT;
 	}
-	DEBUG_TRACE("Connection found: %px\n", ci);
 
-	/*
-	 * Get the NL classifier for this connection
-	 */
-	cnli = (struct ecm_classifier_nl_instance *)
-		ecm_db_connection_assigned_classifier_find_and_ref(ci,
-			ECM_CLASSIFIER_TYPE_NL);
-	if (!cnli) {
+	do {
+		struct ecm_db_connection_instance *nci;
+
+		DEBUG_TRACE("Connection found: %px\n", ci);
+
+		/*
+		 * Get the NL classifier for this connection
+		 */
+		cnli = (struct ecm_classifier_nl_instance *)
+			ecm_db_connection_assigned_classifier_find_and_ref(ci,
+				ECM_CLASSIFIER_TYPE_NL);
+		if (!cnli) {
+			ecm_db_connection_deref(ci);
+			return -EUNATCH;
+		}
+
+		/*
+		 * Allow acceleration of the connection.  This will be done as
+		 * packets are processed in the usual way.
+		 */
+		DEBUG_TRACE("Permit accel: %px\n", ci);
+		spin_lock_bh(&ecm_classifier_nl_lock);
+		cnli->process_response.accel_mode =
+			ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
+		cnli->flags |= ECM_CLASSIFIER_NL_F_ACCEL;
+		spin_unlock_bh(&ecm_classifier_nl_lock);
+
+		cnli->base.deref((struct ecm_classifier_instance *)cnli);
+		nci = ecm_db_connection_find_and_ref_hash_next(ci);
 		ecm_db_connection_deref(ci);
-		return -EUNATCH;
-	}
-
-	/*
-	 * Allow acceleration of the connection.  This will be done as
-	 * packets are processed in the usual way.
-	 */
-	DEBUG_TRACE("Permit accel: %px\n", ci);
-	spin_lock_bh(&ecm_classifier_nl_lock);
-	cnli->process_response.accel_mode =
-		ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
-	cnli->flags |= ECM_CLASSIFIER_NL_F_ACCEL;
-	spin_unlock_bh(&ecm_classifier_nl_lock);
-
-	cnli->base.deref((struct ecm_classifier_instance *)cnli);
-	ecm_db_connection_deref(ci);
+		ci = nci;
+	} while (ci);
 
 	return 0;
 }
@@ -1227,7 +1234,7 @@ static ssize_t ecm_classifier_nl_set_command(struct file *file,
 	case 'f':
 		DEBUG_TRACE("Lookup connection " ECM_IP_ADDR_OCTAL_FMT ":%d <> " ECM_IP_ADDR_OCTAL_FMT ":%d protocol %d\n",
 				ECM_IP_ADDR_TO_OCTAL(src_ip), src_port, ECM_IP_ADDR_TO_OCTAL(dest_ip), dest_port, proto);
-		ci = ecm_db_connection_find_and_ref(src_ip, dest_ip, proto, src_port, dest_port);
+		ci = ecm_db_connection_find_and_ref_hash_first(src_ip, dest_ip, proto, src_port, dest_port);
 		break;
 	case 'S':
 	case 's':
@@ -1244,49 +1251,52 @@ static ssize_t ecm_classifier_nl_set_command(struct file *file,
 		return -ENOMEM;
 	}
 	DEBUG_TRACE("Connection found: %px\n", ci);
+	do {
+		struct ecm_db_connection_instance *nci;
+		/*
+		 * Get the NL classifier
+		 */
+		cnli = (struct ecm_classifier_nl_instance *)ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_NL);
+		if (!cnli) {
+			ecm_db_connection_deref(ci);
+			return -ENOMEM;
+		}
 
-	/*
-	 * Get the NL classifier
-	 */
-	cnli = (struct ecm_classifier_nl_instance *)ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_NL);
-	if (!cnli) {
+		/*
+		 * Now action the command
+		 */
+		switch (cmd) {
+		case 's':
+		case 'f':
+			/*
+			 * Decelerate the connection, NL is denying further accel until it says so.
+			 */
+			DEBUG_TRACE("Force decel: %px\n", ci);
+			spin_lock_bh(&ecm_classifier_nl_lock);
+			cnli->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
+			spin_unlock_bh(&ecm_classifier_nl_lock);
+			feci = ecm_db_connection_front_end_get_and_ref(ci);
+			feci->decelerate(feci);
+			ecm_front_end_connection_deref(feci);
+			break;
+		case 'S':
+		case 'F':
+			/*
+			 * Allow acceleration of the connection.  This will be done as packets are processed in the usual way.
+			 */
+			DEBUG_TRACE("Permit accel: %px\n", ci);
+			spin_lock_bh(&ecm_classifier_nl_lock);
+			cnli->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
+			cnli->flags |= ECM_CLASSIFIER_NL_F_ACCEL;
+			spin_unlock_bh(&ecm_classifier_nl_lock);
+			break;
+		}
+
+		cnli->base.deref((struct ecm_classifier_instance *)cnli);
+		nci = ecm_db_connection_find_and_ref_hash_next(ci);
 		ecm_db_connection_deref(ci);
-		return -ENOMEM;
-	}
-
-	/*
-	 * Now action the command
-	 */
-	switch (cmd) {
-	case 's':
-	case 'f':
-		/*
-		 * Decelerate the connection, NL is denying further accel until it says so.
-		 */
-		DEBUG_TRACE("Force decel: %px\n", ci);
-		spin_lock_bh(&ecm_classifier_nl_lock);
-		cnli->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_NO;
-		spin_unlock_bh(&ecm_classifier_nl_lock);
-		feci = ecm_db_connection_front_end_get_and_ref(ci);
-		feci->decelerate(feci);
-		ecm_front_end_connection_deref(feci);
-		break;
-	case 'S':
-	case 'F':
-		/*
-		 * Allow acceleration of the connection.  This will be done as packets are processed in the usual way.
-		 */
-		DEBUG_TRACE("Permit accel: %px\n", ci);
-		spin_lock_bh(&ecm_classifier_nl_lock);
-		cnli->process_response.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
-		cnli->flags |= ECM_CLASSIFIER_NL_F_ACCEL;
-		spin_unlock_bh(&ecm_classifier_nl_lock);
-		break;
-	}
-
-	cnli->base.deref((struct ecm_classifier_instance *)cnli);
-	ecm_db_connection_deref(ci);
-
+		ci = nci;
+	} while (ci && (cmd == 'F' || cmd == 'f'));
 	return sz;
 }
 
@@ -1333,11 +1343,7 @@ static int ecm_classifier_nl_rule_set_enabled(void *data, u64 val)
 		/*
 		 * Change in state to become disabled.
 		 */
-#ifdef ECM_DB_CTA_TRACK_ENABLE
 		ecm_db_connection_regenerate_by_assignment_type(ECM_CLASSIFIER_TYPE_NL);
-#else
-		ecm_db_regeneration_needed();
-#endif
 	}
 	return 0;
 }
@@ -1409,33 +1415,30 @@ static void ecm_classifier_nl_unregister_genl(void)
  */
 int ecm_classifier_nl_rules_init(struct dentry *dentry)
 {
-	int result;
+	int result = -EINVAL;
 	DEBUG_INFO("Netlink classifier Module init\n");
 
-	ecm_classifier_nl_dentry = debugfs_create_dir("ecm_classifier_nl", dentry);
-	if (!ecm_classifier_nl_dentry) {
+	if (!ecm_debugfs_create_dir("ecm_classifier_nl", dentry, &ecm_classifier_nl_dentry)) {
 		DEBUG_ERROR("Failed to create ecm nl classifier directory in debugfs\n");
 		return -1;
 	}
 
-	if (!debugfs_create_file("enabled", S_IRUGO | S_IWUSR, ecm_classifier_nl_dentry,
-					NULL, &ecm_classifier_nl_enabled_fops)) {
+	if (!ecm_debugfs_create_file("enabled", S_IRUGO | S_IWUSR, ecm_classifier_nl_dentry,
+				NULL, &ecm_classifier_nl_enabled_fops)) {
 		DEBUG_ERROR("Failed to create ecm nl classifier enabled file in debugfs\n");
-		debugfs_remove_recursive(ecm_classifier_nl_dentry);
-		return -1;
+		goto fail;
 	}
 
-	if (!debugfs_create_file("cmd", S_IRUGO | S_IWUSR, ecm_classifier_nl_dentry,
-					NULL, &ecm_classifier_nl_cmd_fops)) {
+	if (!ecm_debugfs_create_file("cmd", S_IRUGO | S_IWUSR, ecm_classifier_nl_dentry,
+				NULL, &ecm_classifier_nl_cmd_fops)) {
 		DEBUG_ERROR("Failed to create ecm nl classifier cmd file in debugfs\n");
-		debugfs_remove_recursive(ecm_classifier_nl_dentry);
-		return -1;
+		goto fail;
 	}
 
 	result = ecm_classifier_nl_register_genl();
 	if (result) {
 		DEBUG_ERROR("Failed to register genl sockets\n");
-		return result;
+		goto fail;
 	}
 
 	/*
@@ -1444,7 +1447,7 @@ int ecm_classifier_nl_rules_init(struct dentry *dentry)
 	ecm_classifier_nl_li = ecm_db_listener_alloc();
 	if (!ecm_classifier_nl_li) {
 		DEBUG_ERROR("Failed to allocate listener\n");
-		return -1;
+		goto fail;
 	}
 
 	/*
@@ -1466,6 +1469,10 @@ int ecm_classifier_nl_rules_init(struct dentry *dentry)
 			ecm_classifier_nl_li);
 
 	return 0;
+
+fail:
+	ecm_debugfs_remove_recursive(ecm_classifier_nl_dentry);
+	return result;
 }
 EXPORT_SYMBOL(ecm_classifier_nl_rules_init);
 
@@ -1496,7 +1503,7 @@ void ecm_classifier_nl_rules_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_classifier_nl_dentry) {
-		debugfs_remove_recursive(ecm_classifier_nl_dentry);
+		ecm_debugfs_remove_recursive(ecm_classifier_nl_dentry);
 	}
 }
 EXPORT_SYMBOL(ecm_classifier_nl_rules_exit);

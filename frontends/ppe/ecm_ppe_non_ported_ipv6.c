@@ -1,18 +1,7 @@
 /*
  **************************************************************************
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -159,7 +148,8 @@ static bool ecm_ppe_non_ported_ipv6_accelerate_done(struct ecm_front_end_connect
  */
 static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_connection_instance *feci,
 								struct ecm_classifier_process_response *pr, bool is_l2_encap,
-								struct nf_conn *ct, struct sk_buff *skb)
+								struct nf_conn *ct, struct sk_buff *skb,
+								ecm_tracker_sender_type_t sender)
 {
 	uint16_t regen_occurrances;
 	int32_t from_ifaces_first;
@@ -229,6 +219,7 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 
 	pd6rc->valid_flags = 0;
 	pd6rc->rule_flags = 0;
+	pd6rc->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Initialize VLAN tag information
@@ -349,7 +340,10 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 		ii_name = ecm_db_interface_type_to_string(ii_type);
 		iface_id = ecm_db_iface_interface_identifier_get(ii);
 		ae_iface_id = ecm_ppe_common_get_ae_iface_id_by_netdev_id(iface_id);
-
+#if defined(ECM_INTERFACE_GRE_TAP_ENABLE) || defined(ECM_INTERFACE_GRE_TUN_ENABLE) || defined (ECM_INTERFACE_TUNIPIP6_ENABLE)
+		struct ipv6hdr *ip6h = ipv6_hdr(skb);
+		__be32 flowlabel = ip6_flowlabel(ip6h);
+#endif
 		DEBUG_TRACE("%px: list_index: %d, ii: %px, type: %d (%s) ae_iface_id(%d)\n", feci, list_index, ii, ii_type, ii_name, ae_iface_id);
 
 		if (ae_iface_id < 0) {
@@ -479,6 +473,14 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 				}
 				dev_put(dev);
 			}
+
+			/*
+			 * Copy flow label present in the IPv6 header of pkt.
+			 * PPE will be programmed to add the same flow label to all
+			 * packets accelerated for this tunnel.
+			 */
+			pd6rc->conn_rule.flow_label = flowlabel;
+			pd6rc->valid_flags |= PPE_DRV_V6_VALID_FLAG_FLOW_LABEL;
 #endif
 			/*
 			 * Can only handle one MAC, the first outermost mac.
@@ -497,6 +499,14 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 				ecm_ppe_stats_v6_inc(feci, ECM_PPE_STATS_V6_EXCEPTION_NON_PORTED, ECM_PPE_STATS_V6_EXCEPTION_NON_PORTED_FROM_IFACE_GRETUN_IFACE_MTU_UNKNOWN);
 				DEBUG_WARN("%px: Unable to get mtu value for the GRE TUN interface\n", feci);
 			}
+
+			/*
+			 * Copy flow label present in the IPv6 header of pkt.
+			 * PPE will be programmed to add the same flow label to all
+			 * packets accelerated for this tunnel.
+			 */
+			pd6rc->conn_rule.flow_label = flowlabel;
+			pd6rc->valid_flags|= PPE_DRV_V6_VALID_FLAG_FLOW_LABEL;
 			break;
 #endif
 		case ECM_DB_IFACE_TYPE_PPPOE:
@@ -582,6 +592,10 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 			 * If we have not yet got an ethernet mac then take this one (very unlikely as mac should have been propagated to the slave (outer) device
 			 */
 			memcpy(from_ppe_iface_address, vlan_info.address, ETH_ALEN);
+			if (is_valid_ether_addr(from_ppe_iface_address)) {
+				ether_addr_copy((uint8_t *)pd6rc->src_mac_rule.flow_src_mac, from_ppe_iface_address);
+				pd6rc->src_mac_rule.mac_valid_flags |= PPE_DRV_VALID_TUN_SRC_MAC_FLOW;
+			}
 			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
@@ -600,6 +614,13 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 			 */
 			if (IP6CB(skb)->flags & IP6SKB_XFRM_TRANSFORMED) {
 				pd6rc->conn_rule.flow_mtu = ECM_DB_IFACE_MTU_MAX;
+			}
+
+			/*
+			 * If the IPsec flow is a decapsulation (outer) flow, set rule_flags to IPSEC_DECAP.
+			 */
+			if (ecm_db_connection_flag_check(feci->ci, ECM_DB_CONNECTION_FLAGS_TUNNEL_OUTER)) {
+				pd6rc->rule_flags |= PPE_DRV_V6_RULE_FLAG_IPSEC_DECAP_FLOW;
 			}
 #else
 			rule_invalid = true;
@@ -624,6 +645,12 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 				ecm_ppe_stats_v6_inc(feci, ECM_PPE_STATS_V6_EXCEPTION_NON_PORTED, ECM_PPE_STATS_V6_EXCEPTION_NON_PORTED_TUNIPIP6_FMR_FLOW_OFFLOAD_UNSUPPORTED);
 				DEBUG_TRACE("%px: TUNIPIP6 FMR - unsupported\n", feci);
 			}
+
+			/*
+			 * Copy flow label present in the IPv6 header.
+			 */
+			pd6rc->conn_rule.flow_label = flowlabel;
+			pd6rc->valid_flags|= PPE_DRV_V6_VALID_FLAG_FLOW_LABEL;
 #endif
 			break;
 
@@ -662,6 +689,10 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 		struct ecm_db_interface_info_vlan vlan_info;
 		uint32_t vlan_value = 0;
 		struct net_device *vlan_out_dev = NULL;
+#endif
+#if defined(ECM_INTERFACE_GRE_TAP_ENABLE) || defined(ECM_INTERFACE_GRE_TUN_ENABLE) || defined (ECM_INTERFACE_TUNIPIP6_ENABLE)
+		struct ipv6hdr *ip6h = ipv6_hdr(skb);
+		__be32 flowlabel = ip6_flowlabel(ip6h);
 #endif
 
 		ii = to_ifaces[list_index];
@@ -867,6 +898,10 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 			 * If we have not yet got an ethernet mac then take this one (very unlikely as mac should have been propagated to the slave (outer) device
 			 */
 			memcpy(to_ppe_iface_address, vlan_info.address, ETH_ALEN);
+			if (is_valid_ether_addr(to_ppe_iface_address)) {
+				ether_addr_copy((uint8_t *)pd6rc->src_mac_rule.return_src_mac, to_ppe_iface_address);
+				pd6rc->src_mac_rule.mac_valid_flags |= PPE_DRV_VALID_TUN_SRC_MAC_RETURN;
+			}
 			DEBUG_TRACE("%px: vlan tag: %x\n", feci, vlan_value);
 #else
 			rule_invalid = true;
@@ -894,6 +929,12 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 				ecm_ppe_stats_v6_inc(feci, ECM_PPE_STATS_V6_EXCEPTION_NON_PORTED, ECM_PPE_STATS_V6_EXCEPTION_NON_PORTED_TUNIPIP6_FMR_FLOW_OFFLOAD_UNSUPPORTED);
 				DEBUG_TRACE("%px: TUNIPIP6 FMR - unsupported\n", feci);
 			}
+
+			/*
+			 * Copy flow label present in the IPv6 header of pkt.
+			 */
+			pd6rc->conn_rule.flow_label = flowlabel;
+			pd6rc->valid_flags |= PPE_DRV_V6_VALID_FLAG_FLOW_LABEL;
 #endif
 			break;
 
@@ -916,9 +957,10 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 
 	/*
 	 * Check if the PPE offload is enabled for the rule's Tx/Rx interfaces or not
+	 * WiFi flows are allowed to bypass the offload enabled check.
 	 */
-	if (!ppe_drv_iface_check_flow_offload_enabled(pd6rc->conn_rule.rx_if,
-						pd6rc->conn_rule.tx_if)) {
+	if (!(ppe_drv_iface_check_wifi_flow(pd6rc->conn_rule.rx_if, pd6rc->conn_rule.tx_if)) &&
+			(!ppe_drv_iface_check_flow_offload_enabled(pd6rc->conn_rule.rx_if,pd6rc->conn_rule.tx_if))) {
 		ecm_ppe_stats_v6_inc(feci, ECM_PPE_STATS_V6_EXCEPTION_NON_PORTED, ECM_PPE_STATS_V6_EXCEPTION_NON_PORTED_PPE_OFFLOAD_DISABLED);
 		DEBUG_TRACE("%px: PPE offload is disabled for rx if: %d, tx: %d\n",
 				feci, pd6rc->conn_rule.rx_if, pd6rc->conn_rule.tx_if);
@@ -1144,7 +1186,8 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 			"flow_dscp: %x\n"
 			"return_dscp: %x\n"
 			"conn_rule.rx_if: %d (from iface first:%s)\n"
-			"conn_rule.tx_if: %d (to iface first:%s)\n",
+			"conn_rule.tx_if: %d (to iface first:%s)\n"
+			"conn_rule.flow_label: %x\n",
 			feci,
 			feci->ci,
 			pd6rc->tuple.protocol,
@@ -1175,7 +1218,8 @@ static void ecm_ppe_non_ported_ipv6_connection_accelerate(struct ecm_front_end_c
 			pd6rc->dscp_rule.flow_dscp,
 			pd6rc->dscp_rule.return_dscp,
 			pd6rc->conn_rule.rx_if, (from_ifaces[from_ifaces_first])->name,
-			pd6rc->conn_rule.tx_if, (to_ifaces[to_ifaces_first])->name);
+			pd6rc->conn_rule.tx_if, (to_ifaces[to_ifaces_first])->name,
+			pd6rc->conn_rule.flow_label);
 
 	/*
 	 * Now that the rule has been constructed we re-compare the generation occurrance counter.
@@ -1435,6 +1479,7 @@ static bool ecm_ppe_non_ported_ipv6_connection_decelerate_send(struct ecm_front_
 	spin_unlock_bh(&ecm_ppe_ipv6_lock);
 
 	pd6rd.tuple.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
+	pd6rd.tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Get addressing information
@@ -1750,15 +1795,10 @@ struct ecm_front_end_connection_instance *ecm_ppe_non_ported_ipv6_connection_ins
 }
 
 /*
- * ecm_ppe_non_ported_ipv6_debugfs_init()
+ * ecm_ppe_non_ported_ipv6_init()
  */
-bool ecm_ppe_non_ported_ipv6_debugfs_init(struct dentry *dentry)
+void ecm_ppe_non_ported_ipv6_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("non_ported_accelerated_count", S_IRUGO, dentry,
-					(u32 *)&ecm_ppe_non_ported_ipv6_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm ppe ipv6 non_ported_accelerated_count file in debugfs\n");
-		return false;
-	}
-
-	return true;
+	ecm_debugfs_create_u32("non_ported_accelerated_count", S_IRUGO, dentry,
+				(u32 *)&ecm_ppe_non_ported_ipv6_accelerated_count);
 }

@@ -26,6 +26,7 @@ struct ecm_tracker_instance;
 enum ecm_tracker_sender_types {
 	ECM_TRACKER_SENDER_TYPE_SRC = 0,		/* Sender of tracked data is the source of the connection (who established the connection) */
 	ECM_TRACKER_SENDER_TYPE_DEST = 1,	/* Sender of tracked data is the destination of the connection (to whom connection was established) */
+	ECM_TRACKER_SENDER_UNKNOWN = 2,	/* Sender of tracked data is unknown. */
 	ECM_TRACKER_SENDER_MAX,			/* MUST BE LAST */
 };
 typedef enum ecm_tracker_sender_types ecm_tracker_sender_type_t;

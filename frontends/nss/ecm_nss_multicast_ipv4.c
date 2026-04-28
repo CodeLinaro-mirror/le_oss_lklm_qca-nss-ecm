@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -73,8 +62,9 @@
 #define DEBUG_LEVEL ECM_NSS_MULTICAST_IPV4_DEBUG_LEVEL
 
 #include <nss_api_if.h>
+#if defined(ECM_MULTICAST_ENABLE)
 #include <mc_ecm.h>
-
+#endif
 #include "ecm_types.h"
 #include "ecm_db_types.h"
 #include "ecm_state.h"
@@ -876,7 +866,8 @@ static int ecm_nss_multicast_ipv4_connection_update_accelerate(struct ecm_front_
  */
 static void ecm_nss_multicast_ipv4_connection_accelerate(struct ecm_front_end_connection_instance *feci,
                                                                         struct ecm_classifier_process_response *pr, bool is_l2_encap,
-                                                                        struct nf_conn *ct, struct sk_buff *skb)
+                                                                        struct nf_conn *ct, struct sk_buff *skb,
+									ecm_tracker_sender_type_t sender)
 {
 	uint16_t regen_occurrances;
 	struct ecm_db_iface_instance *to_ifaces;
@@ -1982,8 +1973,15 @@ static void ecm_nss_multicast_ipv4_bridge_update_connections(ip_addr_t dest_ip, 
 		 * 	if_num > 0   An interface has either left or joined the group. Process the leave/join interface request.
 		 */
 		memset(mc_dst_dev, 0, sizeof(mc_dst_dev));
+
+#if defined(ECM_ATH_MCAST_ENABLE)
+		rcu_read_lock();
+		if_num = ecm_ipv4_ath_mc_bridge_get_if(brdev, htonl(src_ip[0]), htonl(dest_ip[0]), ECM_DB_MULTICAST_IF_MAX, mc_dst_dev);
+		rcu_read_unlock();
+#else
 		if_num = mc_bridge_ipv4_get_if(brdev, htonl(src_ip[0]), htonl(dest_ip[0]), ECM_DB_MULTICAST_IF_MAX,
 				mc_dst_dev, dest_mac_addr);
+#endif
 		if (if_num < 0) {
 			/*
 			 * This may a valid case when all the interfaces have left a multicast group.
@@ -2708,20 +2706,6 @@ find_next_tuple:
 }
 
 /*
- * ecm_nss_multicast_ipv4_debugfs_init()
- */
-bool ecm_nss_multicast_ipv4_debugfs_init(struct dentry *dentry)
-{
-	if (!ecm_debugfs_create_u32("multicast_accelerated_count", S_IRUGO, dentry,
-						&ecm_nss_multicast_ipv4_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv4 multicast_accelerated_count file in debugfs\n");
-		return false;
-	}
-
-	return true;
-}
-
-/*
  * ecm_nss_multicast_ipv4_stop()
  */
 void ecm_nss_multicast_ipv4_stop(int num)
@@ -2735,21 +2719,28 @@ void ecm_nss_multicast_ipv4_stop(int num)
  */
 int ecm_nss_multicast_ipv4_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("ecm_nss_multicast_ipv4_stop", S_IRUGO | S_IWUSR, dentry,
-					(u32 *)&ecm_front_end_ipv4_mc_stopped)) {
-		DEBUG_ERROR("Failed to create ecm front end ipv4 mc stop file in debugfs\n");
-		return -1;
-	}
+	ecm_debugfs_create_u32("multicast_accelerated_count", S_IRUGO, dentry,
+				(u32 *)&ecm_nss_multicast_ipv4_accelerated_count);
+	ecm_debugfs_create_u32("ecm_nss_multicast_ipv4_stop", S_IRUGO | S_IWUSR, dentry,
+				(u32 *)&ecm_front_end_ipv4_mc_stopped);
 
 	/*
 	 * Register multicast update callback to MCS snooper
 	 */
-	mc_bridge_ipv4_update_callback_register(ecm_br_multicast_update_event_callback);
+	if(mc_bridge_ipv4_update_callback_register(ecm_br_multicast_update_event_callback)) {
+		DEBUG_ERROR("Failed to register MCS callback\n");
+		return -1;
+	}
 
 	/*
 	 * Register multicast update callbacks to MFC
 	 */
-	ipmr_register_mfc_event_offload_callback(ecm_mfc_update_event_callback);
+	if (!ipmr_register_mfc_event_offload_callback(ecm_mfc_update_event_callback)) {
+		DEBUG_ERROR("Failed to register MFC callback\n");
+		mc_bridge_ipv4_update_callback_deregister();
+		return -1;
+	}
+
 	return 0;
 }
 

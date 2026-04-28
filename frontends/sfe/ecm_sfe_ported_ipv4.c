@@ -74,6 +74,9 @@
 #include "ecm_db.h"
 #include "ecm_classifier_default.h"
 #include "ecm_interface.h"
+#ifdef ECM_CLASSIFIER_WIFI_ENABLE
+#include "ecm_classifier_wifi.h"
+#endif
 #include "ecm_sfe_ported_ipv4.h"
 #include "ecm_sfe_ipv4.h"
 #include "ecm_sfe_common.h"
@@ -83,6 +86,113 @@
 
 static int ecm_sfe_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_MAX] = {0};
 						/* Array of Number of TCP and UDP connections currently offloaded */
+
+#ifdef ECM_CLASSIFIER_WIFI_ENABLE
+/*
+ * ecm_sfe_ported_ipv4_wifi_flowq_setup()
+ *	Setup WiFi non default TID queues for both flow and return direction
+ */
+static void ecm_sfe_ported_ipv4_wifi_flowq_setup(struct ecm_db_connection_instance *ci,
+						  struct ecm_classifier_process_response *pr,
+						  struct sfe_ipv4_rule_create_msg *nircm,
+						  ecm_tracker_sender_type_t sender)
+{
+	struct net_device *src_dev = NULL;
+	struct net_device *dest_dev = NULL;
+	uint8_t smac[ETH_ALEN] = {0};
+	uint8_t dmac[ETH_ALEN] = {0};
+	struct ecm_classifier_instance *aci;
+	struct ecm_classifier_rule_create ecrc = {0};
+	struct ecm_classifier_wifi_flow_info flow_info = {0};
+
+	aci = ecm_db_connection_assigned_classifier_find_and_ref(ci, ECM_CLASSIFIER_TYPE_WIFI);
+	if (!aci) {
+		return;
+	}
+
+	ecrc.flow_info = &flow_info;
+	ecrc.flow_info_valid = true;
+
+	/*
+	 * Get MAC addresses based on sender direction
+	 */
+	if (sender == ECM_TRACKER_SENDER_TYPE_SRC) {
+		ecm_db_connection_node_address_get(ci, ECM_DB_OBJ_DIR_FROM, smac);
+		ecm_db_connection_node_address_get(ci, ECM_DB_OBJ_DIR_TO, dmac);
+	} else {
+		ecm_db_connection_node_address_get(ci, ECM_DB_OBJ_DIR_TO, smac);
+		ecm_db_connection_node_address_get(ci, ECM_DB_OBJ_DIR_FROM, dmac);
+	}
+
+	/*
+	 * Fetch the src and dest net devices to check their interfaces.
+	 */
+	ecm_db_netdevs_get_and_hold(ci, sender, &src_dev, &dest_dev);
+
+	/*
+	 * Setup flow direction queue
+	 */
+	if (dest_dev) {
+		memset(&flow_info, 0, sizeof(flow_info));
+
+#ifdef ECM_CLASSIFIER_EMESH_ENABLE
+		/*
+		 * Check if SAWF rule is valid and extract flow SAWF parameters
+		 */
+		if (pr->process_actions & ECM_CLASSIFIER_PROCESS_ACTION_EMESH_SAWF_TAG) {
+			flow_info.sawf_rule_valid = true;
+			flow_info.sawf_mark = nircm->sawf_rule.flow_mark;
+			flow_info.sawf_service_class = nircm->sawf_rule.flow_svc_id;
+		}
+#endif
+		flow_info.dev = dest_dev;
+		flow_info.peer_mac = dmac;
+		flow_info.dscp = nircm->dscp_rule.flow_dscp;
+		flow_info.qos_tag = nircm->qos_rule.flow_qos_tag;
+		flow_info.protocol = nircm->tuple.protocol;
+
+		aci->sync_from_v4(aci, &ecrc);
+	}
+
+	/*
+	 * Setup return direction queue
+	 */
+	if (src_dev) {
+		memset(&flow_info, 0, sizeof(flow_info));
+
+#ifdef ECM_CLASSIFIER_EMESH_ENABLE
+		/*
+		 * Check if SAWF rule is valid and extract return SAWF parameters
+		 */
+		if (pr->process_actions & ECM_CLASSIFIER_PROCESS_ACTION_EMESH_SAWF_TAG) {
+			flow_info.sawf_rule_valid = true;
+			flow_info.sawf_mark = nircm->sawf_rule.return_mark;
+			flow_info.sawf_service_class = nircm->sawf_rule.return_svc_id;
+		}
+#endif
+		flow_info.dev = src_dev;
+		flow_info.peer_mac = smac;
+		flow_info.dscp = nircm->dscp_rule.return_dscp;
+		flow_info.qos_tag = nircm->qos_rule.return_qos_tag;
+		flow_info.protocol = nircm->tuple.protocol;
+
+		aci->sync_from_v4(aci, &ecrc);
+	}
+
+	aci->deref(aci);
+
+	/*
+	 * Release the source and destination dev count
+	 */
+	if (src_dev) {
+		dev_put(src_dev);
+	}
+
+	if (dest_dev) {
+		dev_put(dest_dev);
+	}
+}
+#endif
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 13, 0))
 /*
@@ -101,7 +211,6 @@ extern int nf_ct_tcp_be_liberal;
 static void ecm_sfe_ported_ipv4_connection_callback(void *app_data, struct sfe_ipv4_msg *nim)
 {
 	struct sfe_ipv4_rule_create_msg * __attribute__((unused)) nircm = &nim->msg.rule_create;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 	ecm_front_end_acceleration_mode_t result_mode;
@@ -111,16 +220,17 @@ static void ecm_sfe_ported_ipv4_connection_callback(void *app_data, struct sfe_i
 	 * Is this a response to a create message?
 	 */
 	if (nim->cm.type != SFE_TX_CREATE_RULE_MSG) {
-		DEBUG_ERROR("%px: ported create callback with improper type: %d, serial: %u\n", nim, nim->cm.type, serial);
+		DEBUG_ERROR("%px: ported create callback with improper type: %d, serial: %u\n",
+				nim, nim->cm.type, nircm->tuple.flow_rule_id);
 		return;
 	}
 
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(nircm->tuple.flow_rule_id);
 	if (!ci) {
-		DEBUG_TRACE("%px: create callback, connection not found, serial: %u\n", nim, serial);
+		DEBUG_TRACE("%px: create callback, connection not found, serial: %u\n", nim, nircm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -145,7 +255,7 @@ static void ecm_sfe_ported_ipv4_connection_callback(void *app_data, struct sfe_i
 	/*
 	 * Dump some useful trace information.
 	 */
-	DEBUG_TRACE("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, serial);
+	DEBUG_TRACE("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, nircm->tuple.flow_rule_id);
 	DEBUG_TRACE("%px: rule_flags: %x, valid_flags: %x\n", feci, nircm->rule_flags, nircm->valid_flags);
 	DEBUG_TRACE("%px: flow_ip: %pI4n:%d\n", feci, &nircm->tuple.flow_ip, nircm->tuple.flow_ident);
 	DEBUG_TRACE("%px: return_ip: %pI4n:%d\n", feci, &nircm->tuple.return_ip, nircm->tuple.return_ident);
@@ -393,12 +503,101 @@ release:
 }
 
 /*
+ * ecm_sfe_ported_ipv4_unidir_rule_update()
+ *	Updates the frontend specifc data.
+ */
+bool ecm_sfe_ported_ipv4_unidir_rule_update(struct ecm_db_connection_instance *ci,
+		struct ecm_classifier_process_response *pr, ecm_tracker_sender_type_t sender, struct sfe_ipv4_msg *msg)
+{
+	struct sfe_rule_update_msg *update_msg = &msg->msg.rule_update;
+	struct ecm_front_end_connection_instance *feci;
+	sfe_tx_status_t sfe_tx_status;
+	uint32_t src_addr, dest_addr;
+	ip_addr_t addr;
+
+	if (sender == ecm_db_connection_accel_sender_get(ci)) {
+		DEBUG_WARN("%px: This direction packet is already accelerated.\n", ci);
+		return true;
+	}
+
+	feci = ecm_db_connection_front_end_get_and_ref(ci);
+
+	if (feci->udp_flow_dir_accel && feci->udp_return_dir_accel) {
+		DEBUG_WARN("%px: Both the directions are accelerated.\n", ci);
+		ecm_front_end_connection_deref(feci);
+		return true;
+	}
+
+	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_FROM, addr);
+	ECM_IP_ADDR_TO_NIN4_ADDR(src_addr, addr);
+	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_TO_NAT, addr);
+	ECM_IP_ADDR_TO_NIN4_ADDR(dest_addr, addr);
+
+	update_msg->type = SFE_CONNECTION_MARK_TYPE_UNIDIR_MARK;
+	update_msg->flow_rule_id = ecm_db_connection_serial_get(ci);
+	update_msg->src_port = htons(ecm_db_connection_port_get(ci, ECM_DB_OBJ_DIR_FROM));
+	update_msg->dest_port = htons(ecm_db_connection_port_get(ci, ECM_DB_OBJ_DIR_TO_NAT));
+	update_msg->protocol = (int32_t) ecm_db_connection_protocol_get(ci);
+	update_msg->src_ip[0] = src_addr;
+	update_msg->dest_ip[0] = dest_addr;
+
+	if (sender == ECM_TRACKER_SENDER_TYPE_SRC) {
+		update_msg->info.unidir.update_dir = SFE_FLOW_RULE_DIRECTION_FLOW;
+	} else {
+		update_msg->info.unidir.update_dir = SFE_FLOW_RULE_DIRECTION_RETURN;
+	}
+
+	/*
+	 * Set up the flow and return qos tags
+	 */
+	if (pr->process_actions & ECM_CLASSIFIER_PROCESS_ACTION_QOS_TAG) {
+		update_msg->info.unidir.qos.flow_qos_tag = (uint32_t)pr->flow_qos_tag;
+		update_msg->info.unidir.qos.return_qos_tag = (uint32_t)pr->return_qos_tag;
+		update_msg->flags |= SFE_UPDATE_RULE_QOS_VALID;
+	}
+
+	/*
+	 * DSCP information?
+	 */
+	if (pr->process_actions & ECM_CLASSIFIER_PROCESS_ACTION_DSCP) {
+		update_msg->info.unidir.dscp.flow_dscp = pr->flow_dscp;
+		update_msg->info.unidir.dscp.return_dscp =  pr->return_dscp;
+		update_msg->flags |= SFE_UPDATE_RULE_DSCP_VALID;
+	}
+
+	sfe_tx_status = sfe_ipv4_tx(NULL, msg);
+
+	atomic64_set(&feci->unidir_accel_fail_reason, ecm_front_end_set_ae_failure_reason(sfe_tx_status));
+	if (sfe_tx_status != SFE_TX_SUCCESS) {
+		DEBUG_WARN("%p: Failed to update rule in SFE.\n", ci);
+		ecm_front_end_connection_deref(feci);
+		return false;
+	}
+
+	if (sender == ECM_TRACKER_SENDER_TYPE_SRC) {
+		feci->udp_flow_dir_accel = true;
+	} else {
+		feci->udp_return_dir_accel = true;
+	}
+
+	DEBUG_TRACE("%px: flow/return qos_tag=0x%08x/0x%08x, dscp=0x%08x/0x%08x, %pI4:%u -> %pI4:%u protocol=%u\n",
+			ci, update_msg->info.unidir.qos.flow_qos_tag, update_msg->info.unidir.qos.return_qos_tag,
+			update_msg->info.unidir.dscp.flow_dscp, update_msg->info.unidir.dscp.return_dscp,
+			update_msg->src_ip, ntohs(update_msg->src_port),
+			update_msg->dest_ip, ntohs(update_msg->dest_port),
+			update_msg->protocol);
+	ecm_front_end_connection_deref(feci);
+	return true;
+}
+
+/*
  * ecm_sfe_ported_ipv4_connection_accelerate()
  *	Accelerate a connection
  */
 static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_connection_instance *feci,
 									struct ecm_classifier_process_response *pr, bool is_l2_encap,
-									struct nf_conn *ct, struct sk_buff *skb)
+									struct nf_conn *ct, struct sk_buff *skb,
+									ecm_tracker_sender_type_t sender)
 {
 	uint16_t regen_occurrances;
 	int protocol;
@@ -408,6 +607,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	struct ecm_db_iface_instance *to_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX];
 	struct ecm_db_iface_instance *from_sfe_iface;
 	struct ecm_db_iface_instance *to_sfe_iface;
+	struct ecm_db_connection_instance *ci = feci->ci;
 	int32_t from_sfe_iface_id;
 	int32_t to_sfe_iface_id;
 	uint8_t from_sfe_iface_address[ETH_ALEN];
@@ -454,6 +654,13 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		return;
 	}
 
+	/*
+	 * Setting the acceleration sender for uni-direction flows
+	 */
+	spin_lock_bh(&feci->lock);
+	ci->accel_sender = sender;
+	spin_unlock_bh(&feci->lock);
+
 	nim = (struct sfe_ipv4_msg *)kzalloc(sizeof(struct sfe_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
 	if (!nim) {
 		ecm_sfe_stats_v4_inc(feci, ECM_SFE_STATS_V4_EXCEPTION_PORTED, ECM_SFE_STATS_V4_EXCEPTION_PORTED_NO_MEM);
@@ -476,6 +683,21 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	nircm = &nim->msg.rule_create;
 	nircm->valid_flags = 0;
 	nircm->rule_flags = 0;
+	nircm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
+
+	/*
+	 * If connection is for Tunnel Outer packet, then mark same in sfe create valid flag.
+	 */
+	if (feci->ci->flags & ECM_DB_CONNECTION_FLAGS_TUNNEL_OUTER) {
+		nircm->valid_flags |= SFE_RULE_CREATE_TUNNEL_OUTER_FLOW_VALID;
+	}
+
+	/*
+	 * If connection is for Tunnel packet, either outer or inner, then mark same in sfe create valid flag.
+	 */
+	if (feci->ci->flags & ECM_DB_CONNECTION_FLAGS_TUNNEL_FLOW) {
+		nircm->valid_flags |= SFE_RULE_CREATE_TUNNEL_FLOW_VALID;
+	}
 
 	/*
 	 * Initialize VLAN tag information
@@ -1734,6 +1956,21 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		ecm_sfe_common_fast_xmit_set(&nircm->rule_flags, &nircm->valid_flags, &nircm->qdisc_rule, from_ifaces, to_ifaces, from_ifaces_first, to_ifaces_first);
 	}
 
+	if  (ci->unidir_accel_en) {
+		nircm->valid_flags |= SFE_RULE_CREATE_DIRECTION_VALID;
+		if (ecm_db_connection_accel_sender_get(ci) == ECM_TRACKER_SENDER_TYPE_SRC) {
+			nircm->direction_rule.flow_accel = true;
+			feci->udp_flow_dir_accel = true;
+			nircm->direction_rule.return_accel = false;
+			feci->udp_return_dir_accel = false;
+		} else {
+			nircm->direction_rule.flow_accel = false;
+			feci->udp_flow_dir_accel = false;
+			nircm->direction_rule.return_accel = true;
+			feci->udp_return_dir_accel = true;
+		}
+	}
+
 	/*
 	 * Release the interface lists
 	 */
@@ -1742,6 +1979,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 
 	DEBUG_INFO("%px: Ported Accelerate connection %px\n"
 			"Protocol: %d\n"
+			"serial:%u\n"
 			"from_mtu: %u\n"
 			"to_mtu: %u\n"
 			"from_ip: %pI4n:%d\n"
@@ -1784,6 +2022,7 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			feci,
 			feci->ci,
 			nircm->tuple.protocol,
+			nircm->tuple.flow_rule_id,
 			nircm->conn_rule.flow_mtu,
 			nircm->conn_rule.return_mtu,
 			&nircm->tuple.flow_ip, ntohs(nircm->tuple.flow_ident),
@@ -1894,6 +2133,15 @@ static void ecm_sfe_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	feci->fe_info.valid_flags = nircm->valid_flags;
 	feci->fe_info.rule_flags = nircm->rule_flags;
 
+#ifdef ECM_CLASSIFIER_WIFI_ENABLE
+	if (pr->process_actions & ECM_CLASSIFIER_PROCESS_ACTION_WIFI_TAG) {
+		/*
+		* Setup WiFi non default TID queues for both flow and return directions
+		*/
+		ecm_sfe_ported_ipv4_wifi_flowq_setup(ci, pr, nircm, sender);
+	}
+#endif
+
 	/*
 	 * Call the rule create function
 	 */
@@ -1977,7 +2225,6 @@ ported_accel_bad_rule:
 static void ecm_sfe_ported_ipv4_connection_destroy_callback(void *app_data, struct sfe_ipv4_msg *nim)
 {
 	struct sfe_ipv4_rule_destroy_msg * __attribute__((unused))nirdm = &nim->msg.rule_destroy;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 
@@ -1992,9 +2239,9 @@ static void ecm_sfe_ported_ipv4_connection_destroy_callback(void *app_data, stru
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(nirdm->tuple.flow_rule_id);
 	if (!ci) {
-		DEBUG_TRACE("%px: destroy callback, connection not found, serial: %u\n", nim, serial);
+		DEBUG_TRACE("%px: destroy callback, connection not found, serial: %u\n", nim, nirdm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -2159,6 +2406,7 @@ static bool ecm_sfe_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 			(void *)(ecm_ptr_t)ecm_db_connection_serial_get(feci->ci));
 
 	nirdm = &nim->msg.rule_destroy;
+	nirdm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 	nirdm->tuple.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
 
 	/*
@@ -2543,21 +2791,12 @@ struct ecm_front_end_connection_instance *ecm_sfe_ported_ipv4_connection_instanc
 }
 
 /*
- * ecm_sfe_ported_ipv4_debugfs_init()
+ * ecm_sfe_ported_ipv4_init()
  */
-bool ecm_sfe_ported_ipv4_debugfs_init(struct dentry *dentry)
+void ecm_sfe_ported_ipv4_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("udp_accelerated_count", S_IRUGO, dentry,
-				    &ecm_sfe_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_UDP])) {
-		DEBUG_ERROR("Failed to create ecm sfe ipv4 udp_accelerated_count file in debugfs\n");
-		return false;
-	}
-
-	if (!ecm_debugfs_create_u32("tcp_accelerated_count", S_IRUGO, dentry,
-					&ecm_sfe_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_TCP])) {
-		DEBUG_ERROR("Failed to create ecm sfe ipv4 tcp_accelerated_count file in debugfs\n");
-		return false;
-	}
-
-	return true;
+	ecm_debugfs_create_u32("udp_accelerated_count", S_IRUGO, dentry,
+			&ecm_sfe_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_UDP]);
+	ecm_debugfs_create_u32("tcp_accelerated_count", S_IRUGO, dentry,
+			&ecm_sfe_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_TCP]);
 }

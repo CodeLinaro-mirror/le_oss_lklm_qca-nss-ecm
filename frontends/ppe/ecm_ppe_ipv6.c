@@ -284,16 +284,16 @@ static inline void ecm_ppe_ipv6_process_one_conn_sync_msg(struct ppe_drv_v6_conn
 	 */
 	DEBUG_INFO("%px: PPE Sync, lookup connection using\n" \
 			"Protocol: %d\n" \
-			"src_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n" \
-			"dest_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n" \
-			"dest_addr_xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			"src_addr: %pI6:%d\n" \
+			"dest_addr: %pI6:%d\n" \
+			"dest_addr_xlate: %pI6:%d\n",
 			sync,
 			(int)sync->protocol,
-			ECM_IP_ADDR_TO_OCTAL(flow_ip), (int)sync->flow_ident,
-			ECM_IP_ADDR_TO_OCTAL(return_ip), (int)sync->return_ident,
-			ECM_IP_ADDR_TO_OCTAL(return_ip_xlate), (int)sync->return_ident_xlate);
+			sync->flow_ip, (int)sync->flow_ident,
+			sync->return_ip, (int)sync->return_ident,
+			sync->return_ip_xlate, (int)sync->return_ident_xlate);
 
-	ci = ecm_db_connection_find_and_ref(flow_ip, return_ip_xlate, sync->protocol, (int)sync->flow_ident, (int)sync->return_ident_xlate);
+	ci = ecm_db_connection_serial_find_and_ref(sync->flow_rule_id);
 	if (!ci) {
 		DEBUG_TRACE("%px: PPE Sync: no connection\n", sync);
 		return;
@@ -1078,63 +1078,44 @@ int ecm_ppe_ipv6_init(struct dentry *dentry)
 		return -1;
 	}
 
-	ecm_ppe_ipv6_dentry = debugfs_create_dir("ecm_ppe_ipv6", dentry);
-	if (!ecm_ppe_ipv6_dentry) {
+	if (!ecm_debugfs_create_dir("ecm_ppe_ipv6", dentry, &ecm_ppe_ipv6_dentry)) {
 		DEBUG_ERROR("Failed to create ecm ppe ipv6 directory in debugfs\n");
 		unregister_sysctl_table(ecm_ppe_ipv6_ctl_table_header);
 		return -1;
 	}
 
-	if (!ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ppe_ipv6_dentry,
-					(u32 *)&ecm_ppe_ipv6_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm ppe ipv6 accelerated_count file in debugfs\n");
-		goto task_cleanup_1;
-	}
+	ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ppe_ipv6_dentry,
+				(u32 *)&ecm_ppe_ipv6_accelerated_count);
+	ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ppe_ipv6_dentry,
+				(u32 *)&ecm_ppe_ipv6_pending_accel_count);
+	ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ppe_ipv6_dentry,
+				(u32 *)&ecm_ppe_ipv6_pending_decel_count);
 
-	if (!ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ppe_ipv6_dentry,
-					(u32 *)&ecm_ppe_ipv6_pending_accel_count)) {
-		DEBUG_ERROR("Failed to create ecm ppe ipv6 pending_accel_count file in debugfs\n");
-		goto task_cleanup_1;
-	}
-
-	if (!ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ppe_ipv6_dentry,
-					(u32 *)&ecm_ppe_ipv6_pending_decel_count)) {
-		DEBUG_ERROR("Failed to create ecm ppe ipv6 pending_decel_count file in debugfs\n");
-		goto task_cleanup_1;
-	}
-
-	if (!debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ppe_ipv6_dentry,
+	if (!ecm_debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ppe_ipv6_dentry,
 					NULL, &ecm_ppe_ipv6_accel_cmd_avg_millis_fops)) {
 		DEBUG_ERROR("Failed to create ecm ppe ipv6 accel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup_1;
 	}
 
-	if (!debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ppe_ipv6_dentry,
+	if (!ecm_debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ppe_ipv6_dentry,
 					NULL, &ecm_ppe_ipv6_decel_cmd_avg_millis_fops)) {
 		DEBUG_ERROR("Failed to create ecm ppe ipv6 decel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup_1;
 	}
 
-	if (!ecm_ppe_ported_ipv6_debugfs_init(ecm_ppe_ipv6_dentry)) {
-		DEBUG_ERROR("Failed to create ecm ported files in debugfs\n");
-		goto task_cleanup_1;
-	}
+	ecm_ppe_ported_ipv6_init(ecm_ppe_ipv6_dentry);
 
-	if (!debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ppe_ipv6_dentry,
+	if (!ecm_debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ppe_ipv6_dentry,
 					NULL, &ecm_ppe_ipv6_stats_request_counter_fops)) {
 		DEBUG_ERROR("Failed to create ecm ppe ipv6 stats_request_counter file in debugfs\n");
 		goto task_cleanup_1;
 	}
 
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE
-	if (!ecm_ppe_non_ported_ipv6_debugfs_init(ecm_ppe_ipv6_dentry)) {
-		DEBUG_ERROR("Failed to create ecm non-ported files in debugfs\n");
-		goto task_cleanup_1;
-	}
+	ecm_ppe_non_ported_ipv6_init(ecm_ppe_ipv6_dentry);
 #endif
 
-	ecm_stats_dentry = debugfs_lookup("stats", dentry);
-	if (!ecm_stats_dentry) {
+	if (!ecm_debugfs_lookup("stats", dentry, &ecm_stats_dentry)) {
 		DEBUG_ERROR("Stats dentry not created\n");
 		goto task_cleanup_1;
 	}
@@ -1166,7 +1147,7 @@ int ecm_ppe_ipv6_init(struct dentry *dentry)
 task_cleanup_2:
 	ppe_drv_v6_stats_callback_unregister();
 task_cleanup_1:
-	debugfs_remove_recursive(ecm_ppe_ipv6_dentry);
+	ecm_debugfs_remove_recursive(ecm_ppe_ipv6_dentry);
 	unregister_sysctl_table(ecm_ppe_ipv6_ctl_table_header);
 	return -1;
 }
@@ -1193,7 +1174,7 @@ void ecm_ppe_ipv6_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_ppe_ipv6_dentry) {
-		debugfs_remove_recursive(ecm_ppe_ipv6_dentry);
+		ecm_debugfs_remove_recursive(ecm_ppe_ipv6_dentry);
 	}
 
 	/*

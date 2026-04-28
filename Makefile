@@ -7,9 +7,6 @@ endif
 obj-m +=examples/ecm_ae_select.o
 
 obj-m += ecm.o
-ifeq ($(BUILD_ECM_WIFI_PLUGIN),y)
-obj-m += ecm_wifi_plugins/
-endif
 
 # #####################################################
 # Example builds.
@@ -65,8 +62,10 @@ endif
 
 #SFE Multicast is enabled in case NSS disabled
 ecm-$(ECM_MULTICAST_ENABLE) += frontends/cmn/ecm_multicast_ipv4.o
+ecm-$(ECM_ATH_MCAST_ENABLE) += frontends/cmn/ecm_multicast_ipv4.o
 ifeq ($(ECM_IPV6_ENABLE), y)
 ecm-$(ECM_MULTICAST_ENABLE) += frontends/cmn/ecm_multicast_ipv6.o
+ecm-$(ECM_ATH_MCAST_ENABLE) += frontends/cmn/ecm_multicast_ipv6.o
 endif
 
 # #############################################################################
@@ -151,8 +150,8 @@ ccflags-$(ECM_INTERFACE_L2TPV3_ENABLE) += -DECM_INTERFACE_L2TPV3_ENABLE
 ccflags-$(ECM_INTERFACE_PPTP_ENABLE) += -DECM_INTERFACE_PPTP_ENABLE
 
 # #############################################################################
-# if pppoe, l2tpv2, pptp acceleration is enabled, ppp should
-# be enabled automatically
+# Define ECM_INTERFACE_PPP_ENABLE=y in order
+# to enable PPP-dependent interfaces such as PPPoE, PPTP, L2TP
 # #############################################################################
 ccflags-$(ECM_INTERFACE_PPP_ENABLE) += -DECM_INTERFACE_PPP_ENABLE
 
@@ -206,23 +205,29 @@ ccflags-$(ECM_INTERFACE_VXLAN_ENABLE) += -DECM_INTERFACE_VXLAN_ENABLE
 ccflags-$(ECM_IPV6_ENABLE) += -DECM_IPV6_ENABLE
 
 # #############################################################################
-# Define ECM_MULTICAST_ENABLE=y in order to enable support for ECM Multicast
-# NSS is enabled, using NSS multicast acceleration, otherwise using SFE
-# multicast acceleration.
+# Define ECM_MULTICAST_ENABLE=y / ECM_ATH_MCAST_ENABLE=y in order to enable
+# support for ECM Multicast NSS is enabled, using NSS multicast acceleration,
+# otherwise using SFE multicast acceleration.
 # #############################################################################
 
 ecm-$(ECM_MULTICAST_ENABLE) += ecm_db/ecm_db_multicast.o
+ecm-$(ECM_ATH_MCAST_ENABLE) += ecm_db/ecm_db_multicast.o
 ccflags-$(ECM_MULTICAST_ENABLE) += -DECM_MULTICAST_ENABLE
+ccflags-$(ECM_ATH_MCAST_ENABLE) += -DECM_ATH_MCAST_ENABLE
 
 ifeq ($(ECM_FRONT_END_NSS_ENABLE), y)
 ecm-$(ECM_MULTICAST_ENABLE) += frontends/nss/ecm_nss_multicast_ipv4.o
+ecm-$(ECM_ATH_MCAST_ENABLE) += frontends/nss/ecm_nss_multicast_ipv4.o
 ifeq ($(ECM_IPV6_ENABLE), y)
 ecm-$(ECM_MULTICAST_ENABLE) += frontends/nss/ecm_nss_multicast_ipv6.o
+ecm-$(ECM_ATH_MCAST_ENABLE) += frontends/nss/ecm_nss_multicast_ipv6.o
 endif
 else
 ecm-$(ECM_MULTICAST_ENABLE) += frontends/sfe/ecm_sfe_multicast_ipv4.o
+ecm-$(ECM_ATH_MCAST_ENABLE) += frontends/sfe/ecm_sfe_multicast_ipv4.o
 ifeq ($(ECM_IPV6_ENABLE), y)
 ecm-$(ECM_MULTICAST_ENABLE) += frontends/sfe/ecm_sfe_multicast_ipv6.o
+ecm-$(ECM_ATH_MCAST_ENABLE) += frontends/sfe/ecm_sfe_multicast_ipv6.o
 endif
 endif
 
@@ -264,7 +269,7 @@ ccflags-$(ECM_INTERFACE_SKIP_ACCEL_ENABLE) += -DECM_INTERFACE_SKIP_ACCEL_ENABLE
 
 ECM_INTERFACE_IPSEC_GLUE_LAYER_SUPPORT_ENABLE=n
 ifeq ($(SoC),$(filter $(SoC), ipq807x ipq807x_64 ipq60xx ipq60xx_64 ipq50xx \
-	     ipq50xx_64 ipq95xx_32 ipq95xx ipq53xx_32 ipq53xx ipq54xx_32 ipq54xx))
+	     ipq50xx_64 ipq95xx_32 ipq95xx ipq53xx_32 ipq53xx ipq54xx_32 ipq54xx ipq52xx ipq96xx))
 ECM_INTERFACE_IPSEC_GLUE_LAYER_SUPPORT_ENABLE=$(ECM_INTERFACE_IPSEC_ENABLE)
 ccflags-$(ECM_INTERFACE_IPSEC_GLUE_LAYER_SUPPORT_ENABLE) += -DECM_INTERFACE_IPSEC_GLUE_LAYER_SUPPORT_ENABLE
 endif
@@ -432,7 +437,7 @@ ccflags-$(ECM_TRACKER_DPI_SUPPORT_ENABLE) += -DECM_TRACKER_DPI_SUPPORT_ENABLE
 # support for the database keeping lists of connections that are assigned
 # on a per TYPE of classifier basis.
 # #############################################################################
-ECM_DB_CLASSIFIER_TYPE_ASSIGNMENTS_TRACK_ENABLE=y
+ECM_DB_CLASSIFIER_TYPE_ASSIGNMENTS_TRACK_ENABLE=n
 ccflags-$(ECM_DB_CLASSIFIER_TYPE_ASSIGNMENTS_TRACK_ENABLE) += -DECM_DB_CTA_TRACK_ENABLE
 
 # #############################################################################
@@ -460,9 +465,19 @@ ccflags-$(ECM_BRIDGE_VLAN_FILTERING_ENABLE) += -DECM_BRIDGE_VLAN_FILTERING_ENABL
 ccflags-$(ECM_FRONT_END_FSE_ENABLE) += -DECM_FRONT_END_FSE_ENABLE
 
 # #############################################################################
+# Define ECM_FRONT_END_ESP_SPI_PASSTHROUGH=y in order to enable ESP SPI based passthrough
+# #############################################################################
+ccflags-$(ECM_FRONT_END_ESP_SPI_PASSTHROUGH) += -DECM_FRONT_END_ESP_SPI_PASSTHROUGH
+
+# #############################################################################
 # Define ECM_256M_PROFILE=y in order to reduce hash slots for LM256 profile.
 # #############################################################################
 ccflags-$(ECM_256M_PROFILE) += -DECM_256M_PROFILE
+
+# #############################################################################
+# Define ECM_INTERFACE_BRIDGE_ISOLATION_ENABLE=y in order to enable Bridge Isolation.
+# #############################################################################
+ccflags-$(ECM_INTERFACE_BRIDGE_ISOLATION_ENABLE) += -DECM_INTERFACE_BRIDGE_ISOLATION_ENABLE
 
 # #############################################################################
 # Debug flags, set these to = 0 if you want to disable all debugging for that
