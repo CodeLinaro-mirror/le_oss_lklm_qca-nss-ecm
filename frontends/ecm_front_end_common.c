@@ -1035,7 +1035,7 @@ uint64_t ecm_front_end_get_slow_packet_count(struct ecm_front_end_connection_ins
  * ecm_front_end_esp_spi_passthrough_enable_handler()
  *	Sysctl to enable/disable ESP SPI based passthrough feature.
  */
-int ecm_front_end_esp_spi_passthrough_enable_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_front_end_esp_spi_passthrough_enable_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret;
 	int current_value;
@@ -1366,7 +1366,7 @@ static int ecm_front_end_tcp_denied_ports_handler(ECM_CTL_TABLE_CONST struct ctl
  * ecm_front_end_unidir_accel_proc_handler()
  *	Per-direction acceleration sysctl handler.
  */
-int ecm_front_end_unidir_accel_proc_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_front_end_unidir_accel_proc_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret;
 
@@ -1445,7 +1445,6 @@ static struct ctl_table ecm_front_end_sysctl_tbl[] = {
 		.proc_handler	= &ecm_front_end_esp_spi_passthrough_enable_handler,
 	},
 #endif
-	{}
 };
 
 /*

@@ -548,11 +548,11 @@ int ecm_conntrack_notifier_init(struct dentry *dentry)
 init_cleanup_2:
 #ifdef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
 	nf_conntrack_unregister_notifier(&init_net, &ecm_conntrack_notifier);
+init_cleanup_1:
 #else
 	nf_conntrack_unregister_notifier(&init_net);
 #endif
 
-init_cleanup_1:
 	ecm_debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
 	unregister_sysctl_table(ecm_conntrack_notifier_ctl_table_header);
 	return -1;

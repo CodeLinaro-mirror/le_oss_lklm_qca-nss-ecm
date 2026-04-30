@@ -21,6 +21,9 @@
 #include <linux/string.h>
 #include <linux/kernel.h>
 
+#define DEBUG_LEVEL ECM_AE_SELECT_DEBUG_LEVEL
+
+#include "ecm_types.h"
 #include "ecm_ae_classifier_public.h"
 
 #define MAX_RULE_SIZE 256
@@ -647,7 +650,7 @@ static int ecm_ae_select_test_rule_read_handler(void *buffer, size_t *lenp, loff
  * ecm_ae_select_test_rule_handler()
  * 	Sysctl handler for AE select test rule ops
  */
-static int ecm_ae_select_test_rule_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_ae_select_test_rule_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	char *buf;
 	int count;

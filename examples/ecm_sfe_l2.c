@@ -5,7 +5,6 @@
  **************************************************************************
  */
 #include <linux/module.h>
-
 #include <linux/version.h>
 #include <linux/types.h>
 #include <linux/debugfs.h>
@@ -14,6 +13,9 @@
 #include <linux/etherdevice.h>
 #include <linux/inet.h>
 
+#define DEBUG_LEVEL ECM_SFE_L2_DEBUG_LEVEL
+
+#include "ecm_types.h"
 #include "exports/ecm_sfe_common_public.h"
 
 /*
@@ -916,7 +918,7 @@ struct ecm_sfe_common_callbacks sfe_cbs = {
  * ecm_sfe_l2_defunct_by_port_handler()
  * 	Proc handler to defunct the ecm rules by giving port numnber
  */
-static int ecm_sfe_l2_defunct_by_port_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_sfe_l2_defunct_by_port_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	char *buf;
 	int count;
@@ -954,7 +956,7 @@ static int ecm_sfe_l2_defunct_by_port_handler(struct ctl_table *ctl, int write, 
  * ecm_sfe_l2_defunct_by_5tuple_handler()
  * 	Proc handler to defunct the ecm rules by giving 5 tuple
  */
-static int ecm_sfe_l2_defunct_by_5tuple_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_sfe_l2_defunct_by_5tuple_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	char *buf;
 	int count;
@@ -1000,7 +1002,7 @@ static int ecm_sfe_l2_defunct_by_5tuple_handler(struct ctl_table *ctl, int write
  * ecm_sfe_l2_defunct_by_protocol_handler()
  * 	Proc handler to defunct connections based on protocol
  */
-static int ecm_sfe_l2_defunct_by_protocol_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_sfe_l2_defunct_by_protocol_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	char *buf;
 	int count;
@@ -1100,7 +1102,7 @@ static int ecm_sfe_l2_policy_rule_read_handler(void *buffer, size_t *lenp, loff_
  * Policy rule must include cmd, ip_ver and direction. It can also include src/dest IP and ports, protocol.
  * cmd and ip_ver MUST be the first 2 options in the command.
  */
-static int ecm_sfe_l2_policy_rule_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_sfe_l2_policy_rule_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	char *buf;
 	int count;
@@ -1136,7 +1138,7 @@ static int ecm_sfe_l2_policy_rule_handler(struct ctl_table *ctl, int write, void
  * ecm_sfe_l2_wan_name_handler()
  * 	Writes the WAN interface name to the sysctl node wan_name
  */
-static int ecm_sfe_l2_wan_name_handler(struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+static int ecm_sfe_l2_wan_name_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int count;
 

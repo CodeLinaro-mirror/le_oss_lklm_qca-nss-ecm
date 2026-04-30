@@ -317,34 +317,6 @@ skip_port:
 #endif
 
 /*
- * ecm_ipv6_is_ns_allowed()
- *	Check if Neighbor Solicitation is allowed for a given tunnel interface.
- */
-static bool ecm_ipv6_is_ns_allowed(struct net_device *dev, struct sk_buff *skb)
-{
-	struct ipv6hdr *iph;
-	uint8_t proto;
-
-	iph = ipv6_hdr(skb);
-	proto = iph->nexthdr;
-
-	/*
-	 * For tunnels, sending a Neighbor Solicitation while the
-	 * packet is being transmitted can lead to a deadlock.
-	 * Dont send NS frames on tunnel interface if the IP protocol is of tunnel type
-	 */
-	if ((dev->priv_flags_ext & IFF_EXT_ETH_L2TPV3) && (proto == IPPROTO_L2TP)) {
-		return false;
-	}
-
-	if ((dev->priv_flags_ext & IFF_EXT_GRE_V6_TAP) && (proto == IPPROTO_GRE)) {
-		return false;
-	}
-
-	return true;
-}
-
-/*
  * ecm_ipv6_node_establish_and_ref()
  *	Returns a reference to a node, possibly creating one if necessary.
  *
