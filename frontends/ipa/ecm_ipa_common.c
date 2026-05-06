@@ -41,6 +41,11 @@
 #include "ecm_ipa_ipv6.h"
 #include "ecm_ipa_common.h"
 #include "exports/ecm_ipa_common_public.h"
+#include "ecm_ipa_ported_ipv4.h"
+#include "ecm_ipa_ported_ipv6.h"
+#include "ecm_ipa_stats_v4.h"
+#include "ecm_ipa_stats_v6.h"
+
 
 
 
@@ -259,141 +264,356 @@ no_rule:
 void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, enum ecm_rule_update_type type, void *arg)
 {
 
+	bool status = true;
+
 	switch (type) {
-	case ECM_RULE_UPDATE_TYPE_CONNMARK:
-	{
-		struct nf_conn *ct = (struct nf_conn *)arg;
-		struct ipa_connection_mark mark;
-		ip_addr_t src_addr;
-		ip_addr_t dest_addr;
-		int aci_index;
-		int assignment_count;
-		struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
+		case ECM_RULE_UPDATE_TYPE_UNI_DI_QOS:
+		{
+			if (feci->ip_version == 4) {
+#if 0
+				/* TODO: enable once IPA BE lands ipa_ipv4_msg_init / ecm_ipa_ported_ipv4_unidir_rule_update */
+				struct ipa_ipv4_msg *msg_v4;
+				struct ecm_cmn_unidir_update_info *update_info = (struct ecm_cmn_unidir_update_info *)arg;
 
-		if (ecm_front_end_connection_accel_state_get(feci) != ECM_FRONT_END_ACCELERATION_MODE_ACCEL) {
-			IPAFEWARN("%px: connection is not in accelerated mode\n", feci);
-			return;
-		}
+				msg_v4 = (struct ipa_ipv4_msg *)kzalloc(sizeof(struct ipa_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
+				if (!msg_v4) {
+					DEBUG_WARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
+					ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
+					return;
+				}
 
-		/*
-		 * Get connection information
-		 */
-		mark.type = IPA_CONNECTION_MARK_TYPE_CONNMARK;
-		mark.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
-		mark.src_port = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_FROM));
-		mark.dest_port = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT));
-		ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM, src_addr);
-		ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT, dest_addr);
-		mark.flow_mark = ct->mark;
-		mark.return_mark = ct->mark;
+				ipa_ipv4_msg_init(msg_v4, IPA_SPECIAL_INTERFACE_IPV4, IPA_TX_UPDATE_RULE_MSG,
+					sizeof(struct ipa_rule_update_msg), NULL, NULL);
 
-		IPAFEDBG("%px: Update the mark value for the IPA connection\n", feci);
+				status = ecm_ipa_ported_ipv4_unidir_rule_update(feci->ci, update_info->pr, update_info->sender, msg_v4);
+				kfree(msg_v4);
+#endif
+				if (!status) {
+					DEBUG_WARN("%px: Uni-directional v4 flow update failed in IPA.\n", feci);
+					ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_UNIDIR_UPDATE_FAIL);
+				}
+			} else {
+#if 0
+				/* TODO: enable once IPA BE lands ipa_ipv6_msg_init / ecm_ipa_ported_ipv6_unidir_rule_update */
+				struct ipa_ipv6_msg *msg_v6;
+				struct ecm_cmn_unidir_update_info *update_info = (struct ecm_cmn_unidir_update_info *)arg;
 
-		if (feci->ip_version == 4) {
-			ECM_IP_ADDR_TO_NIN4_ADDR(mark.src_ip[0], src_addr);
-			ECM_IP_ADDR_TO_NIN4_ADDR(mark.dest_ip[0], dest_addr);
-			/* Commented it for now, as it will be implemented in IPA BE at later point of time.*/
-			// ipa_ipv4_mark_rule_update(&mark);
-			DEBUG_INFO("%px: src_ip: %pI4 dest_ip: %pI4 src_port: %d dest_port: %d protocol: %d\n",
-				    feci, &mark.src_ip[0], &mark.dest_ip[0],
-				    ntohs(mark.src_port), ntohs(mark.dest_port), mark.protocol);
-		} else {
-			ECM_IP_ADDR_TO_IPA_IPV6_ADDR(mark.src_ip, src_addr);
-			ECM_IP_ADDR_TO_IPA_IPV6_ADDR(mark.dest_ip, dest_addr);
-			/* Commented it for now, as it will be implemented in IPA BE at later point of time.*/
-			// ipa_ipv6_mark_rule_update(&mark);
-			IPAFEDBG_LOW("%px: src_ip: " ECM_IP_ADDR_OCTAL_FMT "dest_ip: " ECM_IP_ADDR_OCTAL_FMT
-				    " src_port: %d dest_port: %d protocol: %d\n",
-				    feci, ECM_IP_ADDR_TO_OCTAL(src_addr), ECM_IP_ADDR_TO_OCTAL(dest_addr),
-				    ntohs(mark.src_port), ntohs(mark.dest_port), mark.protocol);
-		}
+				msg_v6 = (struct ipa_ipv6_msg *)kzalloc(sizeof(struct ipa_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
+				if (!msg_v6) {
+					DEBUG_WARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
+					ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
+					return;
+				}
 
-		/*
-		 * Get the assigned classifiers and call their update callbacks. If they are interested in this type of
-		 * update, they will handle the event.
-		 */
-		assignment_count = ecm_db_connection_classifier_assignments_get_and_ref(feci->ci, assignments);
-		for (aci_index = 0; aci_index < assignment_count; ++aci_index) {
-			struct ecm_classifier_instance *aci;
-			aci = assignments[aci_index];
-			if (aci->update) {
-				aci->update(aci, type, ct);
+				ipa_ipv6_msg_init(msg_v6, IPA_SPECIAL_INTERFACE_IPV6, IPA_TX_UPDATE_RULE_MSG,
+					sizeof(struct ipa_rule_update_msg), NULL, NULL);
+
+				status = ecm_ipa_ported_ipv6_unidir_rule_update(feci->ci, update_info->pr, update_info->sender, msg_v6);
+				kfree(msg_v6);
+#endif
+				if (!status) {
+					DEBUG_WARN("%px: Uni-directional v6 flow update failed in IPA.\n", feci);
+					ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_UNIDIR_UPDATE_FAIL);
+				}
 			}
+			break;
 		}
-		ecm_db_connection_assignments_release(assignment_count, assignments);
+		case ECM_RULE_UPDATE_TYPE_CONNMARK:
+		{
+			struct nf_conn *ct = (struct nf_conn *)arg;
+			ip_addr_t src_addr;
+			ip_addr_t dest_addr;
+			int aci_index;
+			int assignment_count;
+			struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
+			struct ipa_rule_update_msg *update_msg = NULL;
 
-		break;
-	}
+			if (feci->ip_version == 4) {
+				struct ipa_ipv4_msg *msg_v4;
 
-	case ECM_RULE_UPDATE_TYPE_SAWFMARK:
-	{
-		struct ecm_front_end_flowsawf_msg *msg = (struct ecm_front_end_flowsawf_msg *)arg;
-		struct ipa_connection_mark mark;
-		int aci_index;
-		int assignment_count;
-		struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
+				msg_v4 = (struct ipa_ipv4_msg *)kzalloc(sizeof(struct ipa_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
+				if (!msg_v4) {
+					DEBUG_WARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
+					ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
+					return;
+				}
 
-		IPAFEDBG("control reached to deprio in update rule \n");
-		memset(&mark, 0, sizeof(mark));
-		mark.type = IPA_CONNECTION_MARK_TYPE_SAWFMARK;
-		mark.flow_mark = msg->flow_mark;
-		mark.flow_svc_id = msg->flow_service_class_id;
-		if (IPA_GET_SAWF_TAG(mark.flow_mark) == IPA_SAWF_VALID_TAG || (msg->flags & ECM_FRONT_END_PRIO_UPDATE_FLOW)) {
-			mark.flags |= IPA_SAWF_MARK_FLOW_VALID;
-		}
-		mark.return_mark = msg->return_mark;
-		mark.return_svc_id = msg->return_service_class_id;
-		if (IPA_GET_SAWF_TAG(mark.return_mark) == IPA_SAWF_VALID_TAG || (msg->flags & ECM_FRONT_END_PRIO_UPDATE_RETURN)) {
-			mark.flags |= IPA_SAWF_MARK_RETURN_VALID;
-		}
-		mark.protocol = msg->protocol;
-		mark.src_port = msg->flow_src_port;
-		mark.dest_port = msg->flow_dest_port;
-		if (msg->ip_version == 4) {
-			mark.src_ip[0] = msg->flow_src_ip[0];
-			mark.dest_ip[0] = msg->flow_dest_ip[0];
-			/* Commented it for now, as it will be implemented in IPA BE at later point of time.*/
-			// ipa_ipv4_mark_rule_update(&mark);
+				/*ipa_ipv4_msg_init(msg_v4, IPA_SPECIAL_INTERFACE_IPV4, IPA_TX_UPDATE_RULE_MSG,
+										sizeof(struct ipa_rule_update_msg), NULL, NULL);*/
+				update_msg = &msg_v4->msg.rule_update;
 
-			IPAFEDBG_LOW("%px: sawf flow/return mark=0x%08x/0x%08x %pI4:%u -> %pI4:%u protocol=%u\n",
-					feci, mark.flow_mark, mark.return_mark,
-					mark.src_ip, ntohs(mark.src_port),
-					mark.dest_ip, ntohs(mark.dest_port),
-					mark.protocol);
-		} else {
-			ECM_IP_ADDR_COPY(mark.src_ip, msg->flow_src_ip);
-			ECM_IP_ADDR_COPY(mark.dest_ip, msg->flow_dest_ip);
-			/* Commented it for now, as it will be implemented in IPA BE at later point of time.*/
-			// ipa_ipv6_mark_rule_update(&mark);
+				if (ecm_front_end_connection_accel_state_get(feci) != ECM_FRONT_END_ACCELERATION_MODE_ACCEL) {
+					DEBUG_WARN("%px: connection is not in accelerated mode\n", feci);
+					kfree(msg_v4);
+					return;
+				}
 
-			IPAFEDBG_LOW("%px: sawf flow/return mark=0x%08x/0x%08x %pI6c@%u -> %pI6c@%u protocol=%u\n",
-					feci, mark.flow_mark, mark.return_mark,
-					mark.src_ip, ntohs(mark.src_port),
-					mark.dest_ip, ntohs(mark.dest_port),
-					mark.protocol);
-		}
+				/*
+				 * Get connection information
+				 */
+				update_msg->flow_rule_id = ecm_db_connection_serial_get(feci->ci);
+				update_msg->type = IPA_CONNECTION_MARK_TYPE_CONNMARK;
+				update_msg->protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
+				update_msg->src_port = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_FROM));
+				update_msg->dest_port = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT));
+				ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM, src_addr);
+				ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT, dest_addr);
+				update_msg->info.connmark.flow_mark = ct->mark;
+				update_msg->info.connmark.return_mark = ct->mark;
 
-		/*
-		 * Get the assigned classifiers and call their update callbacks. If they are interested in this type of
-		 * update, they will handle the event.
-		 */
-		assignment_count = ecm_db_connection_classifier_assignments_get_and_ref(feci->ci, assignments);
-		for (aci_index = 0; aci_index < assignment_count; ++aci_index) {
-			struct ecm_classifier_instance *aci;
-			aci = assignments[aci_index];
-			if (aci->update) {
-				aci->update(aci, type, msg);
+				DEBUG_INFO("%px: Update the mark value for the IPA connection\n", feci);
+
+				ECM_IP_ADDR_TO_NIN4_ADDR(update_msg->src_ip[0], src_addr);
+				ECM_IP_ADDR_TO_NIN4_ADDR(update_msg->dest_ip[0], dest_addr);
+
+				/*if (ipa_ipv4_tx(NULL, msg_v4) != IPA_TX_SUCCESS) {
+					DEBUG_WARN("%px: Failed to update mark value in IPA", feci);
+					kfree(msg_v4);
+					return;
+				}*/
+
+				DEBUG_INFO("%px: src_ip: %pI4 dest_ip: %pI4 src_port: %d dest_port: %d protocol: %d\n",
+						feci, &update_msg->src_ip[0], &update_msg->dest_ip[0],
+						ntohs(update_msg->src_port), ntohs(update_msg->dest_port), update_msg->protocol);
+
+				/*
+				 * Get the assigned classifiers and call their update callbacks. If they are interested in this type of
+				 * update, they will handle the event.
+				 */
+				assignment_count = ecm_db_connection_classifier_assignments_get_and_ref(feci->ci, assignments);
+				for (aci_index = 0; aci_index < assignment_count; ++aci_index) {
+					struct ecm_classifier_instance *aci;
+					aci = assignments[aci_index];
+					if (aci->update) {
+						aci->update(aci, type, ct);
+					}
+				}
+				ecm_db_connection_assignments_release(assignment_count, assignments);
+				kfree(msg_v4);
+			} else {
+				struct ipa_ipv6_msg *msg_v6;
+
+				msg_v6 = (struct ipa_ipv6_msg *)kzalloc(sizeof(struct ipa_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
+				if (!msg_v6) {
+					DEBUG_WARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
+					ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
+					return;
+				}
+
+				/*ipa_ipv6_msg_init(msg_v6, IPA_SPECIAL_INTERFACE_IPV6, IPA_TX_UPDATE_RULE_MSG,
+							sizeof(struct ipa_rule_update_msg), NULL, NULL);*/
+				update_msg = &msg_v6->msg.rule_update;
+
+				if (ecm_front_end_connection_accel_state_get(feci) != ECM_FRONT_END_ACCELERATION_MODE_ACCEL) {
+					DEBUG_WARN("%px: connection is not in accelerated mode\n", feci);
+					kfree(msg_v6);
+					return;
+				}
+
+				/*
+				* Get connection information
+				*/
+				update_msg->type = IPA_CONNECTION_MARK_TYPE_CONNMARK;
+				update_msg->flow_rule_id = ecm_db_connection_serial_get(feci->ci);
+				update_msg->protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
+				update_msg->src_port = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_FROM));
+				update_msg->dest_port = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT));
+				ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM, src_addr);
+				ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT, dest_addr);
+				update_msg->info.connmark.flow_mark = ct->mark;
+				update_msg->info.connmark.return_mark = ct->mark;
+
+				DEBUG_INFO("%px: Update the mark value for the IPA connection\n", feci);
+
+				ECM_IP_ADDR_TO_IPA_IPV6_ADDR(update_msg->src_ip, src_addr);
+				ECM_IP_ADDR_TO_IPA_IPV6_ADDR(update_msg->dest_ip, dest_addr);
+
+				/*if (ipa_ipv6_tx(NULL, msg_v6) != IPA_TX_SUCCESS) {
+					DEBUG_WARN("%px: Failed to update mark value in IPA", feci);
+					kfree(msg_v6);
+					return;
+				}*/
+
+				DEBUG_TRACE("%px: src_ip: " ECM_IP_ADDR_OCTAL_FMT "dest_ip: " ECM_IP_ADDR_OCTAL_FMT
+						" src_port: %d dest_port: %d protocol: %d\n",
+						feci, ECM_IP_ADDR_TO_OCTAL(src_addr), ECM_IP_ADDR_TO_OCTAL(dest_addr),
+						ntohs(update_msg->src_port), ntohs(update_msg->dest_port), update_msg->protocol);
+
+				/*
+				 * Get the assigned classifiers and call their update callbacks. If they are interested in this type of
+				 * update, they will handle the event.
+				 */
+				assignment_count = ecm_db_connection_classifier_assignments_get_and_ref(feci->ci, assignments);
+				for (aci_index = 0; aci_index < assignment_count; ++aci_index) {
+					struct ecm_classifier_instance *aci;
+					aci = assignments[aci_index];
+					if (aci->update) {
+						aci->update(aci, type, ct);
+					}
+				}
+				ecm_db_connection_assignments_release(assignment_count, assignments);
+				kfree(msg_v6);
 			}
+			break;
 		}
-		ecm_db_connection_assignments_release(assignment_count, assignments);
+		case ECM_RULE_UPDATE_TYPE_BI_DI_SAWF_QOS:
+		{
+			struct ecm_front_end_flowsawf_msg *msg = (struct ecm_front_end_flowsawf_msg *)arg;
+			int aci_index;
+			int assignment_count;
+			struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
+			struct ipa_rule_update_msg *update_msg = NULL;
+			ipa_tx_status_t ipa_tx_status = IPA_TX_SUCCESS;
 
-		break;
-	}
+			if (feci->ip_version == 4) {
+				struct ipa_ipv4_msg *msg_v4;
 
-	default:
-		IPAFEWARN("%px: unsupported update rule type: %d\n", feci, type);
-		break;
+				msg_v4 = (struct ipa_ipv4_msg *)kzalloc(sizeof(struct ipa_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
+				if (!msg_v4) {
+					DEBUG_WARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
+					ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
+					return;
+				}
+
+				/*ipa_ipv4_msg_init(msg_v4, IPA_SPECIAL_INTERFACE_IPV4, IPA_TX_UPDATE_RULE_MSG,
+										sizeof(struct ipa_rule_update_msg), NULL, NULL);*/
+				update_msg = &msg_v4->msg.rule_update;
+
+				DEBUG_INFO("control reached to deprio in update rule \n");
+
+				update_msg->type = IPA_CONNECTION_MARK_TYPE_BIDIR_SAWF_MARK;
+				update_msg->info.sawf.flow_mark = msg->flow_mark;
+				update_msg->info.sawf.flow_svc_id = msg->flow_service_class_id;
+
+				if (IPA_GET_SAWF_TAG(update_msg->info.sawf.flow_mark) == IPA_SAWF_VALID_TAG ||
+						(msg->flags & ECM_FRONT_END_PRIO_UPDATE_FLOW)) {
+					update_msg->flags |= IPA_UPDATE_RULE_SAWF_FLOW_VALID;
+				}
+
+				update_msg->info.sawf.return_mark = msg->return_mark;
+				update_msg->info.sawf.return_svc_id = msg->return_service_class_id;
+
+				if (IPA_GET_SAWF_TAG(update_msg->info.sawf.return_mark) == IPA_SAWF_VALID_TAG
+						|| (msg->flags & ECM_FRONT_END_PRIO_UPDATE_RETURN)) {
+					update_msg->flags |= IPA_UPDATE_RULE_SAWF_RETURN_VALID;
+				}
+
+				update_msg->flow_rule_id = ecm_db_connection_serial_get(feci->ci);
+				update_msg->protocol = msg->protocol;
+				update_msg->src_port = msg->flow_src_port;
+				update_msg->dest_port = msg->flow_dest_port;
+				update_msg->src_ip[0] = msg->flow_src_ip[0];
+				update_msg->dest_ip[0] = msg->flow_dest_ip[0];
+
+				/*ipa_tx_status = ipa_ipv4_tx(NULL, msg_v4);
+
+				atomic64_set(&feci->unidir_accel_fail_reason, ecm_front_end_set_ae_failure_reason(ipa_tx_status));*/
+				if (ipa_tx_status != IPA_TX_SUCCESS) {
+					DEBUG_WARN("%px: Failed to update mark value in IPA", feci);
+					kfree(msg_v4);
+					return;
+				}
+
+				DEBUG_TRACE("%px: sawf flow/return mark=0x%08x/0x%08x %pI4:%u -> %pI4:%u protocol=%u\n",
+						feci, update_msg->info.sawf.flow_mark, update_msg->info.sawf.return_mark,
+						update_msg->src_ip, ntohs(update_msg->src_port),
+						update_msg->dest_ip, ntohs(update_msg->dest_port),
+						update_msg->protocol);
+
+				/*
+				 * Get the assigned classifiers and call their update callbacks. If they are interested in this type of
+				 * update, they will handle the event.
+				 */
+				assignment_count = ecm_db_connection_classifier_assignments_get_and_ref(feci->ci, assignments);
+				for (aci_index = 0; aci_index < assignment_count; ++aci_index) {
+					struct ecm_classifier_instance *aci;
+					aci = assignments[aci_index];
+					if (aci->update) {
+						aci->update(aci, type, msg);
+					}
+				}
+				ecm_db_connection_assignments_release(assignment_count, assignments);
+				kfree(msg_v4);
+			} else {
+				struct ipa_ipv6_msg *msg_v6;
+
+				msg_v6 = (struct ipa_ipv6_msg *)kzalloc(sizeof(struct ipa_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
+				if (!msg_v6) {
+					DEBUG_WARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
+					ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
+					return;
+				}
+
+				/*ipa_ipv6_msg_init(msg_v6, IPA_SPECIAL_INTERFACE_IPV6, IPA_TX_UPDATE_RULE_MSG,
+							sizeof(struct ipa_rule_update_msg), NULL, NULL);*/
+				update_msg = &msg_v6->msg.rule_update;
+
+				DEBUG_INFO("control reached to deprio in update rule \n");
+
+				update_msg->type = IPA_CONNECTION_MARK_TYPE_BIDIR_SAWF_MARK;
+				update_msg->info.sawf.flow_mark = msg->flow_mark;
+				update_msg->info.sawf.flow_svc_id = msg->flow_service_class_id;
+
+				if (IPA_GET_SAWF_TAG(update_msg->info.sawf.flow_mark) == IPA_SAWF_VALID_TAG
+						|| (msg->flags & ECM_FRONT_END_PRIO_UPDATE_FLOW)) {
+					update_msg->flags |= IPA_UPDATE_RULE_SAWF_FLOW_VALID;
+				}
+
+				update_msg->info.sawf.return_mark = msg->return_mark;
+				update_msg->info.sawf.return_svc_id = msg->return_service_class_id;
+
+				if (IPA_GET_SAWF_TAG(update_msg->info.sawf.return_mark) == IPA_SAWF_VALID_TAG
+						|| (msg->flags & ECM_FRONT_END_PRIO_UPDATE_RETURN)) {
+					update_msg->flags |= IPA_UPDATE_RULE_SAWF_RETURN_VALID;
+				}
+
+				update_msg->flow_rule_id = ecm_db_connection_serial_get(feci->ci);
+				update_msg->protocol = msg->protocol;
+				update_msg->src_port = msg->flow_src_port;
+				update_msg->dest_port = msg->flow_dest_port;
+
+				ECM_IP_ADDR_COPY(update_msg->src_ip, msg->flow_src_ip);
+				ECM_IP_ADDR_COPY(update_msg->dest_ip, msg->flow_dest_ip);
+
+				/*ipa_tx_status = ipa_ipv6_tx(NULL, msg_v6);
+
+				atomic64_set(&feci->unidir_accel_fail_reason, ecm_front_end_set_ae_failure_reason(ipa_tx_status));*/
+				if (ipa_tx_status != IPA_TX_SUCCESS) {
+					DEBUG_WARN("%px: Failed to update mark value in IPA", feci);
+					kfree(msg_v6);
+					return;
+				}
+
+				DEBUG_TRACE("%px: sawf flow/return mark=0x%08x/0x%08x %pI6c@%u -> %pI6c@%u protocol=%u\n",
+						feci, update_msg->info.sawf.flow_mark, update_msg->info.sawf.return_mark,
+						update_msg->src_ip, ntohs(update_msg->src_port),
+						update_msg->dest_ip, ntohs(update_msg->dest_port),
+						update_msg->protocol);
+
+				/*
+				 * Get the assigned classifiers and call their update callbacks. If they are interested in this type of
+				 * update, they will handle the event.
+				 */
+				assignment_count = ecm_db_connection_classifier_assignments_get_and_ref(feci->ci, assignments);
+				for (aci_index = 0; aci_index < assignment_count; ++aci_index) {
+					struct ecm_classifier_instance *aci;
+					aci = assignments[aci_index];
+					if (aci->update) {
+						aci->update(aci, type, msg);
+					}
+				}
+				ecm_db_connection_assignments_release(assignment_count, assignments);
+				kfree(msg_v6);
+			}
+			break;
+		}
+		default:
+		{
+			DEBUG_WARN("%px: unsupported update rule type: %d\n", feci, type);
+			break;
+		}
 	}
+		
 }
 
 /*

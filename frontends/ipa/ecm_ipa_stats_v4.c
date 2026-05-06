@@ -78,7 +78,10 @@ static const char *ecm_ipa_stats_v4_exception_ported_name_str[] = {
 	"v4_exception_ported_to_iface_vxlan_not_enabled",
 	"v4_exception_ported_mht_port_failed",
 	"v4_exception_ported_regen_occurred",
-	"v4_exception_ported_tx_failed"
+	"v4_exception_ported_tx_failed",
+	"v4_exception_ported_unidir_update_fail",
+	"v4_exception_ported_bidir_update_fail",
+	"v4_exception_ported_unidir_update_no_mem"
 };
 
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE
@@ -182,7 +185,7 @@ const struct file_operations ecm_ipa_stats_v4_exception_file_ops = {
 
 int ecm_ipa_stats_v4_debugfs_init(struct dentry *dentry)
 {
-	if (!debugfs_create_file("ecm_ipa_v4_exception_stats", S_IRUGO, dentry,
+	if (!ecm_debugfs_create_file("ecm_ipa_v4_exception_stats", S_IRUGO, dentry,
 				NULL, &ecm_ipa_stats_v4_exception_file_ops)) {
 		return -1;
 	}

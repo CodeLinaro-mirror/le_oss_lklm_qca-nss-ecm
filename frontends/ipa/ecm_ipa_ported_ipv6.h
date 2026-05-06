@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: ISC
  **************************************************************************
  */
-extern bool ecm_ipa_ported_ipv6_debugfs_init(struct dentry *dentry);
+extern void ecm_ipa_ported_ipv6_init(struct dentry *dentry);
 
 extern struct ecm_front_end_connection_instance *ecm_ipa_ported_ipv6_connection_instance_alloc(
 								uint32_t accel_flags,
