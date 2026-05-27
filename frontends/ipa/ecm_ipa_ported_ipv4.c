@@ -1694,6 +1694,8 @@ static bool ecm_ipa_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 	struct ecm_db_iface_instance *to_ipa_iface;
 	int32_t from_ipa_iface_id;
 	int32_t to_ipa_iface_id;
+	uint8_t from_ipa_iface_address[ETH_ALEN];
+	uint8_t to_ipa_iface_address[ETH_ALEN];
 	struct ipa_ipv4_msg *nim;
 	struct ipa_ipv4_rule_destroy_msg *nirdm;
 	ip_addr_t addr;
@@ -1701,6 +1703,11 @@ static bool ecm_ipa_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 	ecm_db_direction_t ecm_dir;
 	ipa_tx_status_t ipa_tx_status;
 	bool ret;
+	int32_t list_index;
+	int32_t interface_type_counts[ECM_DB_IFACE_TYPE_COUNT];
+	bool rule_invalid;
+	uint32_t l2_accel_bits = (ECM_IPA_COMMON_FLOW_L2_ACCEL_ALLOWED | ECM_IPA_COMMON_RETURN_L2_ACCEL_ALLOWED);
+	ecm_ipa_common_l2_accel_check_callback_t l2_accel_check;
 
 	DEBUG_CHECK_MAGIC(feci, ECM_FRONT_END_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", feci);
 
@@ -1726,27 +1733,19 @@ static bool ecm_ipa_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 			(void *)(ecm_ptr_t)ecm_db_connection_serial_get(feci->ci));
 
 	nirdm = &nim->msg.rule_destroy;
-	nirdm->tuple.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
-	nirdm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
+	nirdm->valid_flags = 0;
+	nirdm->rule_flags = 0;
 
 	/*
-	 * Get addressing information
+	 * Initialize VLAN tag information
 	 */
-	ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM, addr);
-	ECM_IP_ADDR_TO_NIN4_ADDR(nirdm->tuple.flow_ip, addr);
-	ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT, addr);
-	ECM_IP_ADDR_TO_NIN4_ADDR(nirdm->tuple.return_ip, addr);
-	nirdm->tuple.flow_ident = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_FROM));
-	nirdm->tuple.return_ident = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT));
+	nirdm->vlan_primary_rule.ingress_vlan_tag = IPA_VLAN_ID_NOT_CONFIGURED;
+	nirdm->vlan_primary_rule.egress_vlan_tag = IPA_VLAN_ID_NOT_CONFIGURED;
+	nirdm->vlan_secondary_rule.ingress_vlan_tag = IPA_VLAN_ID_NOT_CONFIGURED;
+	nirdm->vlan_secondary_rule.egress_vlan_tag = IPA_VLAN_ID_NOT_CONFIGURED;
 
-	IPAFEDBG("%px: Ported Connection %px decelerate\n"
-			"protocol: %d\n"
-			"src_ip: %pI4:%d\n"
-			"dest_ip: %pI4:%d\n",
-			feci, feci->ci, nirdm->tuple.protocol,
-			&nirdm->tuple.flow_ip, nirdm->tuple.flow_ident,
-			&nirdm->tuple.return_ip, nirdm->tuple.return_ident);
-
+	nirdm->tuple.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
+	nirdm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Get the interface lists of the connection, we must have at least one interface in the list to continue
@@ -1754,14 +1753,16 @@ static bool ecm_ipa_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 	from_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, from_ifaces, ECM_DB_OBJ_DIR_FROM);
 	if (from_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_NO_FROM_INTERFACES);
-		IPAFEWARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
+		IPAFEWARN("%px: Decel attempt failed - no interfaces in from_interfaces list!\n", feci);
+		goto ported_decel_bad_rule;
 	}
 
 	to_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, to_ifaces, ECM_DB_OBJ_DIR_TO);
 	if (to_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_NO_TO_INTERFACES);
-		IPAFEWARN("%px: Accel attempt failed - no interfaces in to_interfaces list!\n", feci);
+		IPAFEWARN("%px: Decel attempt failed - no interfaces in to_interfaces list!\n", feci);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
+		goto ported_decel_bad_rule;
 	}
 
 	/*
@@ -1776,41 +1777,454 @@ static bool ecm_ipa_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 		IPAFEDBG_LOW("%px: from_ipa_iface_id: %d, to_ipa_iface_id: %d\n", feci, from_ipa_iface_id, to_ipa_iface_id);
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
+		goto ported_decel_bad_rule;
 	}
 
 	/*
-	 * Set interface numbers involved in accelerating this connection.
-	 * These are the inner facing addresses from the heirarchy interface lists we got above.
+	 * New rule being destroyed
 	 */
-	nirdm->conn_rule.flow_top_interface_num = ecm_db_iface_interface_identifier_get(from_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX-1]);
-	nirdm->conn_rule.return_top_interface_num = ecm_db_iface_interface_identifier_get(to_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX-1]);
+	nirdm->valid_flags |= IPA_RULE_CREATE_CONN_VALID;
 
 	/*
-	 * Set interface numbers involved in accelerating this connection.
-	 * These are the outer facing addresses from the heirarchy interface lists we got above.
-	 * These may be overridden later if we detect special interface types e.g. ipsec.
+	 * Set interface numbers involved in this connection.
+	 * These are the outer facing addresses from the hierarchy interface lists we got above.
 	 */
 	nirdm->conn_rule.flow_interface_num = from_ipa_iface_id;
 	nirdm->conn_rule.return_interface_num = to_ipa_iface_id;
 
 	/*
-	 * When the packet is forwarded to the next interface get the address the source IP of the
-	 * packet should be translated to.  For egress this is the NAT'ed from address.
-	 * This also works for ingress as the NAT'ed version of the WAN host would be the same as non-NAT'ed
+	 * Check which side of the connection can support L2 acceleration.
+	 * The check is done only for the routed flows and if the L2 feature is enabled.
 	 */
-	ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM_NAT, addr);
-	ECM_IP_ADDR_TO_NIN4_ADDR(nirdm->conn_rule.flow_ip_xlate, addr);
+	if (ipa_is_l2_feature_enabled() && ecm_db_connection_is_routed_get(feci->ci)) {
+		rcu_read_lock();
+		l2_accel_check = rcu_dereference(ecm_ipa_cb.l2_accel_check);
+		if (l2_accel_check) {
+			struct ecm_ipa_common_tuple l2_accel_tuple;
+
+			ecm_ipa_common_tuple_set(feci, from_ipa_iface_id, to_ipa_iface_id, &l2_accel_tuple);
+			l2_accel_bits = l2_accel_check(&l2_accel_tuple);
+		}
+		rcu_read_unlock();
+	}
 
 	/*
-	 * The destination address is what the destination IP is translated to as it is forwarded to the next interface.
-	 * For egress this would yield the normal wan host and for ingress this would correctly NAT back to the LAN host
+	 * Set interface numbers involved in this connection.
+	 * These are the inner facing addresses from the hierarchy interface lists we got above.
 	 */
+	nirdm->conn_rule.flow_top_interface_num = ecm_db_iface_interface_identifier_get(from_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX-1]);
+	nirdm->conn_rule.return_top_interface_num = ecm_db_iface_interface_identifier_get(to_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX-1]);
+
+	/*
+	 * Examine the FROM / SRC hierarchy list to populate L2 rule fields.
+	 */
+	IPAFEDBG_LOW("%px: Examine from/src heirarchy list\n", feci);
+	memset(interface_type_counts, 0, sizeof(interface_type_counts));
+	rule_invalid = false;
+	for (list_index = from_ifaces_first; !rule_invalid && (list_index < ECM_DB_IFACE_HEIRARCHY_MAX); list_index++) {
+		struct ecm_db_iface_instance *ii;
+		ecm_db_iface_type_t ii_type;
+		char *ii_name;
+#ifdef ECM_INTERFACE_PPPOE_ENABLE
+		struct ecm_db_interface_info_pppoe pppoe_info;
+#endif
+#ifdef ECM_INTERFACE_VLAN_ENABLE
+		struct ecm_db_interface_info_vlan vlan_info;
+		uint32_t vlan_value = 0;
+#endif
+		ii = from_ifaces[list_index];
+		ii_type = ecm_db_iface_type_get(ii);
+		ii_name = ecm_db_interface_type_to_string(ii_type);
+
+		IPAFEDBG_LOW("%px: list_index: %d, ii: %px (%s %d %d), type: %d (%s)\n",
+				feci, list_index, ii,
+				ii->name, ii->interface_identifier, ii->ae_interface_identifier,
+				ii_type, ii_name);
+
+		switch (ii_type) {
+		case ECM_DB_IFACE_TYPE_BRIDGE:
+			IPAFEDBG_LOW("%px: Bridge\n", feci);
+			if (interface_type_counts[ii_type] != 0) {
+				rule_invalid = true;
+				ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_BRIDGE_CASCADE);
+				IPAFEDBG_LOW("%px: Bridge - ignore additional\n", feci);
+				break;
+			}
+
+			if (ecm_ipa_common_is_l2_iface_supported(ECM_DB_IFACE_TYPE_BRIDGE, list_index, from_ifaces_first) && (l2_accel_bits & ECM_IPA_COMMON_FLOW_L2_ACCEL_ALLOWED)) {
+				nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE;
+				feci->set_stats_bitmap(feci, ECM_DB_OBJ_DIR_FROM, ECM_DB_IFACE_TYPE_BRIDGE);
+			}
+
+			ecm_db_iface_bridge_address_get(ii, from_ipa_iface_address);
+			if (is_valid_ether_addr(from_ipa_iface_address)) {
+				ether_addr_copy((uint8_t *)nirdm->src_mac_rule.flow_src_mac, from_ipa_iface_address);
+				nirdm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_FLOW_VALID;
+				nirdm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
+			}
+			IPAFEDBG_LOW("%px: Bridge - mac: %pM\n", feci, from_ipa_iface_address);
+			break;
+
+		case ECM_DB_IFACE_TYPE_ETHERNET:
+			IPAFEDBG_LOW("%px: Ethernet\n", feci);
+			if (interface_type_counts[ii_type] != 0) {
+				IPAFEDBG_LOW("%px: Ethernet - ignore additional\n", feci);
+				break;
+			}
+
+			ecm_db_iface_ethernet_address_get(ii, from_ipa_iface_address);
+			IPAFEDBG_LOW("%px: Ethernet - mac: %pM\n", feci, from_ipa_iface_address);
+			break;
+
+		case ECM_DB_IFACE_TYPE_PPPOE:
+#ifdef ECM_INTERFACE_PPPOE_ENABLE
+			if (interface_type_counts[ii_type] != 0) {
+				ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
+				IPAFEDBG_LOW("%px: PPPoE - additional unsupported\n", feci);
+				rule_invalid = true;
+				break;
+			}
+
+			if (!ipa_is_l2_feature_enabled()) {
+				IPAFEDBG_LOW("%px: PPPoE - unsupported\n", feci);
+				break;
+			}
+
+			if (!(l2_accel_bits & ECM_IPA_COMMON_FLOW_L2_ACCEL_ALLOWED)) {
+				IPAFEDBG_LOW("%px: L2 acceleration is not allowed for the PPPoE interface\n", feci);
+				break;
+			}
+
+			feci->set_stats_bitmap(feci, ECM_DB_OBJ_DIR_FROM, ECM_DB_IFACE_TYPE_PPPOE);
+
+			ecm_db_iface_pppoe_session_info_get(ii, &pppoe_info);
+			nirdm->pppoe_rule.flow_pppoe_session_id = pppoe_info.pppoe_session_id;
+			memcpy(nirdm->pppoe_rule.flow_pppoe_remote_mac, pppoe_info.remote_mac, ETH_ALEN);
+			nirdm->valid_flags |= IPA_RULE_CREATE_PPPOE_DECAP_VALID;
+			nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE;
+
+			IPAFEDBG_LOW("%px: PPPoE - session: %x, mac: %pM\n", feci,
+					nirdm->pppoe_rule.flow_pppoe_session_id,
+					nirdm->pppoe_rule.flow_pppoe_remote_mac);
+#else
+			rule_invalid = true;
+			ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_PPPOE_FLOW_INVALID);
+#endif
+			break;
+
+		case ECM_DB_IFACE_TYPE_VLAN:
+#ifdef ECM_INTERFACE_VLAN_ENABLE
+			IPAFEDBG_LOW("%px: VLAN\n", feci);
+			if (interface_type_counts[ii_type] > 1) {
+				rule_invalid = true;
+				ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_ONLY_TWO_VLANS_SUPPORTED);
+				IPAFEDBG_LOW("%px: VLAN - additional unsupported\n", feci);
+				break;
+			}
+			ecm_db_iface_vlan_info_get(ii, &vlan_info);
+			vlan_value = ((vlan_info.vlan_tpid << 16) | vlan_info.vlan_tag);
+
+			if (interface_type_counts[ii_type] == 0) {
+				nirdm->vlan_primary_rule.ingress_vlan_tag = vlan_value;
+			} else {
+				nirdm->vlan_secondary_rule.ingress_vlan_tag = vlan_value;
+			}
+			nirdm->valid_flags |= IPA_RULE_CREATE_VLAN_VALID;
+
+			if (ipa_is_l2_feature_enabled() && (l2_accel_bits & ECM_IPA_COMMON_FLOW_L2_ACCEL_ALLOWED)) {
+				nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE;
+				feci->set_stats_bitmap(feci, ECM_DB_OBJ_DIR_FROM, ECM_DB_IFACE_TYPE_VLAN);
+
+				if (is_valid_ether_addr(vlan_info.address)) {
+					ether_addr_copy((uint8_t *)nirdm->src_mac_rule.flow_src_mac, vlan_info.address);
+					nirdm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_FLOW_VALID;
+					nirdm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
+				}
+			}
+
+			if (interface_type_counts[ECM_DB_IFACE_TYPE_ETHERNET] == 0) {
+				interface_type_counts[ECM_DB_IFACE_TYPE_ETHERNET]++;
+				IPAFEDBG_LOW("%px: VLAN use mac: %pM\n", feci, vlan_info.address);
+			}
+			IPAFEDBG_LOW("%px: vlan tag: %x\n", feci, vlan_value);
+#else
+			rule_invalid = true;
+			ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_VLAN_NOT_ENABLED);
+			IPAFEDBG_LOW("%px: VLAN - unsupported\n", feci);
+#endif
+			break;
+
+		case ECM_DB_IFACE_TYPE_MACVLAN:
+#ifdef ECM_INTERFACE_MACVLAN_ENABLE
+			if (ecm_ipa_common_is_l2_iface_supported(ECM_DB_IFACE_TYPE_MACVLAN, list_index, from_ifaces_first) && (l2_accel_bits & ECM_IPA_COMMON_FLOW_L2_ACCEL_ALLOWED)) {
+				nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE;
+				feci->set_stats_bitmap(feci, ECM_DB_OBJ_DIR_FROM, ECM_DB_IFACE_TYPE_MACVLAN);
+			}
+
+			ecm_db_iface_macvlan_address_get(ii, from_ipa_iface_address);
+			ether_addr_copy((uint8_t *)nirdm->src_mac_rule.flow_src_mac, from_ipa_iface_address);
+			nirdm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_FLOW_VALID;
+			nirdm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
+
+			IPAFEDBG_LOW("%px: Macvlan - mac: %pM\n", feci, from_ipa_iface_address);
+#else
+			rule_invalid = true;
+			ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_MACVLAN_NOT_ENABLED);
+			IPAFEDBG_LOW("%px: MACVLAN - unsupported\n", feci);
+#endif
+			break;
+
+		case ECM_DB_IFACE_TYPE_IPSEC_TUNNEL:
+#ifdef ECM_INTERFACE_IPSEC_ENABLE
+			IPAFEDBG_LOW("%px: IPSEC\n", feci);
+			if (interface_type_counts[ii_type] != 0) {
+				rule_invalid = true;
+				ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_ONLY_ONE_IPSEC_SUPPORTED);
+				IPAFEDBG_LOW("%px: IPSEC - additional unsupported\n", feci);
+				break;
+			}
+#else
+			rule_invalid = true;
+			ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_FROM_IFACE_IPSEC_NOT_ENABLED);
+			IPAFEDBG_LOW("%px: IPSEC - unsupported\n", feci);
+#endif
+			break;
+
+		default:
+			IPAFEDBG_LOW("%px: Ignoring: %d (%s)\n", feci, ii_type, ii_name);
+		}
+
+		interface_type_counts[ii_type]++;
+	}
+
+	if (rule_invalid) {
+		IPAFEWARN("%px: from/src Rule invalid\n", feci);
+		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
+		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
+		goto ported_decel_bad_rule;
+	}
+
+	/*
+	 * Now examine the TO / DEST hierarchy list to construct the destination part of the rule
+	 */
+	IPAFEDBG_LOW("%px: Examine to/dest heirarchy list\n", feci);
+	memset(interface_type_counts, 0, sizeof(interface_type_counts));
+	rule_invalid = false;
+	for (list_index = to_ifaces_first; !rule_invalid && (list_index < ECM_DB_IFACE_HEIRARCHY_MAX); list_index++) {
+		struct ecm_db_iface_instance *ii;
+		ecm_db_iface_type_t ii_type;
+		char *ii_name;
+#ifdef ECM_INTERFACE_PPPOE_ENABLE
+		struct ecm_db_interface_info_pppoe pppoe_info;
+#endif
+#ifdef ECM_INTERFACE_VLAN_ENABLE
+		struct ecm_db_interface_info_vlan vlan_info;
+		uint32_t vlan_value = 0;
+#endif
+		ii = to_ifaces[list_index];
+		ii_type = ecm_db_iface_type_get(ii);
+		ii_name = ecm_db_interface_type_to_string(ii_type);
+
+		IPAFEDBG_LOW("%px: list_index: %d, ii: %px (%s %d %d), type: %d (%s)\n",
+				feci, list_index, ii,
+				ii->name, ii->interface_identifier, ii->ae_interface_identifier,
+				ii_type, ii_name);
+
+		switch (ii_type) {
+		case ECM_DB_IFACE_TYPE_BRIDGE:
+			IPAFEDBG_LOW("%px: Bridge\n", feci);
+			if (interface_type_counts[ii_type] != 0) {
+				rule_invalid = true;
+				ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_TO_IFACE_BRIDGE_CASCADE);
+				IPAFEDBG_LOW("%px: Bridge - ignore additional\n", feci);
+				break;
+			}
+
+			if (ecm_ipa_common_is_l2_iface_supported(ECM_DB_IFACE_TYPE_BRIDGE, list_index, to_ifaces_first) && (l2_accel_bits & ECM_IPA_COMMON_RETURN_L2_ACCEL_ALLOWED)) {
+				nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE;
+				feci->set_stats_bitmap(feci, ECM_DB_OBJ_DIR_TO, ECM_DB_IFACE_TYPE_BRIDGE);
+			}
+
+			ecm_db_iface_bridge_address_get(ii, to_ipa_iface_address);
+			if (is_valid_ether_addr(to_ipa_iface_address)) {
+				ether_addr_copy((uint8_t *)nirdm->src_mac_rule.return_src_mac, to_ipa_iface_address);
+				nirdm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_RETURN_VALID;
+				nirdm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
+			}
+			IPAFEDBG_LOW("%px: Bridge - mac: %pM\n", feci, to_ipa_iface_address);
+			break;
+
+		case ECM_DB_IFACE_TYPE_ETHERNET:
+			IPAFEDBG_LOW("%px: Ethernet\n", feci);
+			if (interface_type_counts[ii_type] != 0) {
+				IPAFEDBG_LOW("%px: Ethernet - ignore additional\n", feci);
+				break;
+			}
+
+			ecm_db_iface_ethernet_address_get(ii, to_ipa_iface_address);
+			IPAFEDBG_LOW("%px: Ethernet - mac: %pM\n", feci, to_ipa_iface_address);
+			break;
+
+		case ECM_DB_IFACE_TYPE_PPPOE:
+#ifdef ECM_INTERFACE_PPPOE_ENABLE
+			if (interface_type_counts[ii_type] != 0) {
+				ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_TO_IFACE_MORE_THAN_ONE_PPPOE_UNSUPPORTED);
+				IPAFEDBG_LOW("%px: PPPoE - additional unsupported\n", feci);
+				rule_invalid = true;
+				break;
+			}
+
+			if (!ipa_is_l2_feature_enabled()) {
+				IPAFEDBG_LOW("%px: PPPoE - unsupported\n", feci);
+				break;
+			}
+
+			if (!(l2_accel_bits & ECM_IPA_COMMON_RETURN_L2_ACCEL_ALLOWED)) {
+				IPAFEDBG_LOW("%px: L2 acceleration is not allowed for the PPPoE interface\n", feci);
+				break;
+			}
+
+			feci->set_stats_bitmap(feci, ECM_DB_OBJ_DIR_TO, ECM_DB_IFACE_TYPE_PPPOE);
+
+			ecm_db_iface_pppoe_session_info_get(ii, &pppoe_info);
+			nirdm->pppoe_rule.return_pppoe_session_id = pppoe_info.pppoe_session_id;
+			memcpy(nirdm->pppoe_rule.return_pppoe_remote_mac, pppoe_info.remote_mac, ETH_ALEN);
+			nirdm->valid_flags |= IPA_RULE_CREATE_PPPOE_ENCAP_VALID;
+			nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE;
+
+			IPAFEDBG_LOW("%px: PPPoE - session: %x, mac: %pM\n", feci,
+					nirdm->pppoe_rule.return_pppoe_session_id,
+					nirdm->pppoe_rule.return_pppoe_remote_mac);
+#else
+			rule_invalid = true;
+			ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_TO_IFACE_PPPOE_FLOW_INVALID);
+#endif
+			break;
+
+		case ECM_DB_IFACE_TYPE_VLAN:
+#ifdef ECM_INTERFACE_VLAN_ENABLE
+			IPAFEDBG_LOW("%px: VLAN\n", feci);
+			if (interface_type_counts[ii_type] > 1) {
+				rule_invalid = true;
+				ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_TO_IFACE_ONLY_TWO_VLANS_SUPPORTED);
+				IPAFEDBG_LOW("%px: VLAN - additional unsupported\n", feci);
+				break;
+			}
+			ecm_db_iface_vlan_info_get(ii, &vlan_info);
+			vlan_value = ((vlan_info.vlan_tpid << 16) | vlan_info.vlan_tag);
+
+			if (interface_type_counts[ii_type] == 0) {
+				nirdm->vlan_primary_rule.egress_vlan_tag = vlan_value;
+			} else {
+				nirdm->vlan_secondary_rule.egress_vlan_tag = vlan_value;
+			}
+			nirdm->valid_flags |= IPA_RULE_CREATE_VLAN_VALID;
+
+			if (ipa_is_l2_feature_enabled() && (l2_accel_bits & ECM_IPA_COMMON_RETURN_L2_ACCEL_ALLOWED)) {
+				nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE;
+				feci->set_stats_bitmap(feci, ECM_DB_OBJ_DIR_TO, ECM_DB_IFACE_TYPE_VLAN);
+
+				if (is_valid_ether_addr(vlan_info.address)) {
+					ether_addr_copy((uint8_t *)nirdm->src_mac_rule.return_src_mac, vlan_info.address);
+					nirdm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_RETURN_VALID;
+					nirdm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
+				}
+			}
+
+			if (interface_type_counts[ECM_DB_IFACE_TYPE_ETHERNET] == 0) {
+				interface_type_counts[ECM_DB_IFACE_TYPE_ETHERNET]++;
+				IPAFEDBG_LOW("%px: VLAN use mac: %pM\n", feci, vlan_info.address);
+			}
+			IPAFEDBG_LOW("%px: vlan tag: %x\n", feci, vlan_value);
+#else
+			rule_invalid = true;
+			ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_TO_IFACE_VLAN_NOT_ENABLED);
+			IPAFEDBG_LOW("%px: VLAN - unsupported\n", feci);
+#endif
+			break;
+
+		case ECM_DB_IFACE_TYPE_MACVLAN:
+#ifdef ECM_INTERFACE_MACVLAN_ENABLE
+			if (ecm_ipa_common_is_l2_iface_supported(ECM_DB_IFACE_TYPE_MACVLAN, list_index, to_ifaces_first) && (l2_accel_bits & ECM_IPA_COMMON_RETURN_L2_ACCEL_ALLOWED)) {
+				nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE;
+				feci->set_stats_bitmap(feci, ECM_DB_OBJ_DIR_TO, ECM_DB_IFACE_TYPE_MACVLAN);
+			}
+
+			ecm_db_iface_macvlan_address_get(ii, to_ipa_iface_address);
+			ether_addr_copy((uint8_t *)nirdm->src_mac_rule.return_src_mac, to_ipa_iface_address);
+			nirdm->src_mac_rule.mac_valid_flags |= IPA_SRC_MAC_RETURN_VALID;
+			nirdm->valid_flags |= IPA_RULE_CREATE_SRC_MAC_VALID;
+
+			IPAFEDBG_LOW("%px: Macvlan - mac: %pM\n", feci, to_ipa_iface_address);
+#else
+			rule_invalid = true;
+			ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_TO_IFACE_MACVLAN_NOT_ENABLED);
+			IPAFEDBG_LOW("%px: MACVLAN - unsupported\n", feci);
+#endif
+			break;
+
+		case ECM_DB_IFACE_TYPE_IPSEC_TUNNEL:
+#ifdef ECM_INTERFACE_IPSEC_ENABLE
+			IPAFEDBG_LOW("%px: IPSEC\n", feci);
+			if (interface_type_counts[ii_type] != 0) {
+				rule_invalid = true;
+				ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_TO_IFACE_ONLY_ONE_IPSEC_SUPPORTED);
+				IPAFEDBG_LOW("%px: IPSEC - additional unsupported\n", feci);
+				break;
+			}
+#else
+			rule_invalid = true;
+			ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_TO_IFACE_IPSEC_NOT_ENABLED);
+			IPAFEDBG_LOW("%px: IPSEC - unsupported\n", feci);
+#endif
+			break;
+
+		default:
+			IPAFEDBG_LOW("%px: Ignoring: %d (%s)\n", feci, ii_type, ii_name);
+		}
+
+		interface_type_counts[ii_type]++;
+	}
+
+	if (rule_invalid) {
+		IPAFEWARN("%px: to/dest Rule invalid\n", feci);
+		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
+		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
+		goto ported_decel_bad_rule;
+	}
+
+	/*
+	 * Routed or bridged?
+	 */
+	if (ecm_db_connection_is_routed_get(feci->ci)) {
+		nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_ROUTED;
+	} else {
+		nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_BRIDGE_FLOW;
+	}
+
+	if (!(l2_accel_bits & ECM_IPA_COMMON_FLOW_L2_ACCEL_ALLOWED)) {
+		nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK;
+		nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK_NO_FLUSH;
+	}
+
+	if (!(l2_accel_bits & ECM_IPA_COMMON_RETURN_L2_ACCEL_ALLOWED)) {
+		nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_RETURN_SRC_INTERFACE_CHECK;
+		nirdm->rule_flags |= IPA_RULE_CREATE_FLAG_RETURN_SRC_INTERFACE_CHECK_NO_FLUSH;
+	}
+
+	/*
+	 * Get addressing information
+	 */
+	ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM, addr);
+	ECM_IP_ADDR_TO_NIN4_ADDR(nirdm->tuple.flow_ip, addr);
+	ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT, addr);
+	ECM_IP_ADDR_TO_NIN4_ADDR(nirdm->tuple.return_ip, addr);
+
+	ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM_NAT, addr);
+	ECM_IP_ADDR_TO_NIN4_ADDR(nirdm->conn_rule.flow_ip_xlate, addr);
 	ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_TO, addr);
 	ECM_IP_ADDR_TO_NIN4_ADDR(nirdm->conn_rule.return_ip_xlate, addr);
 
-	/*
-	 * Same approach as above for port information
-	 */
 	nirdm->tuple.flow_ident = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_FROM));
 	nirdm->tuple.return_ident = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_TO_NAT));
 	nirdm->conn_rule.flow_ident_xlate = htons(ecm_db_connection_port_get(feci->ci, ECM_DB_OBJ_DIR_FROM_NAT));
@@ -1861,6 +2275,19 @@ static bool ecm_ipa_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 	nirdm->conn_rule.flow_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_FROM);
 	nirdm->conn_rule.return_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
 
+	/*
+	 * Release the interface lists
+	 */
+	ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
+	ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
+
+	IPAFEDBG("%px: Ported Connection %px decelerate\n"
+			"protocol: %d\n"
+			"src_ip: %pI4:%d\n"
+			"dest_ip: %pI4:%d\n",
+			feci, feci->ci, nirdm->tuple.protocol,
+			&nirdm->tuple.flow_ip, nirdm->tuple.flow_ident,
+			&nirdm->tuple.return_ip, nirdm->tuple.return_ident);
 
 	/*
 	 * Take a ref to the feci->ci so that it will persist until we get a response from the IPA.
@@ -1911,6 +2338,28 @@ static bool ecm_ipa_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 	spin_unlock_bh(&ecm_ipa_ipv4_lock);
 
 	return ret;
+
+ported_decel_bad_rule:
+	/*
+	 * Jump to here when rule data is bad and a deceleration command cannot be constructed
+	 */
+	IPAFEWARN("%px: conn:%px serial:%u Decel failed - bad rule\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
+
+	/*
+	 * Revert accel_mode from DECEL_PENDING back to ACCEL so the connection remains
+	 * eligible for a future decel re-try; otherwise decelerate_accel_mode_check will
+	 * reject subsequent attempts and the connection stays wedged in DECEL_PENDING.
+	 */
+	spin_lock_bh(&feci->lock);
+	feci->accel_mode = ECM_FRONT_END_ACCELERATION_MODE_ACCEL;
+	spin_unlock_bh(&feci->lock);
+
+	spin_lock_bh(&ecm_ipa_ipv4_lock);
+	ecm_ipa_ipv4_pending_decel_count--;
+	DEBUG_ASSERT(ecm_ipa_ipv4_pending_decel_count >= 0, "Bad decel pending counter\n");
+	spin_unlock_bh(&ecm_ipa_ipv4_lock);
+	kfree(nim);
+	return false;
 }
 
 /*
