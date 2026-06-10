@@ -287,9 +287,9 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	feci = ecm_db_connection_front_end_get_and_ref(ci);
 
 	if (sync->flow_tx_packet_count || sync->return_tx_packet_count) {
-		IPAFEDBG_LOW("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %u, return_rx_packet_count: %u, , return_rx_byte_count: %u\n",
+		IPAFEDBG_LOW("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %llu, return_rx_packet_count: %u, return_rx_byte_count: %llu\n",
 				ci, sync->flow_rx_packet_count, sync->flow_rx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
-		IPAFEDBG_LOW("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %u, return_tx_packet_count: %u, return_tx_byte_count: %u\n",
+		IPAFEDBG_LOW("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %llu, return_tx_packet_count: %u, return_tx_byte_count: %llu\n",
 				ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->return_tx_packet_count, sync->return_tx_byte_count);
 
 #ifdef ECM_MULTICAST_ENABLE
@@ -797,7 +797,7 @@ static void ecm_ipa_ipv6_connection_sync_many_callback(void *app_data, struct ip
 		/*
 		 * We get a NACK from FW, which should not happen, restart the request
 		 */
-		IPAFEWARN("IPv4 conn stats request failed, restarting\n");
+		IPAFEWARN("IPv6 conn stats request failed, restarting\n");
 		ecm_ipa_ipv6_stats_request_nack++;
 		ecm_ipa_ipv6_sync_req_msg->msg.conn_stats_many.index = 0;
 	}
