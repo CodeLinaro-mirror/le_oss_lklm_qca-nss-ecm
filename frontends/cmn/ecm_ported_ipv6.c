@@ -399,7 +399,8 @@ unsigned int ecm_ported_ipv6_process(struct net_device *out_dev, struct net_devi
 	/*
 	 * Look up a connection
 	 */
-	ci = ecm_db_connection_find_and_ref(ip_src_addr, ip_dest_addr, protocol, src_port, dest_port);
+	ci = ecm_db_connection_source_find_and_ref(ip_src_addr, ip_dest_addr, protocol,
+			src_port, dest_port, in_dev, out_dev);
 
 	/*
 	 * If there is no existing connection then create a new one.
@@ -826,7 +827,8 @@ feci_alloc_done:
 		 * To guard against this we now perform a mutex'd lookup of the connection + add once more - another cpu may have created it before us.
 		 */
 		spin_lock_bh(&ecm_ipv6_lock);
-		ci = ecm_db_connection_find_and_ref(ip_src_addr, ip_dest_addr, protocol, src_port, dest_port);
+		ci = ecm_db_connection_source_find_and_ref(ip_src_addr, ip_dest_addr, protocol,
+				src_port, dest_port, in_dev, out_dev);
 		if (ci) {
 			/*
 			 * Another cpu created the same connection before us - use the one we just found
@@ -848,6 +850,20 @@ feci_alloc_done:
 			ti->deref(ti);
 
 			/*
+			 * Check if flow belongs to tunnel and it is tunnel outer flow.
+			 */
+			if (ecm_interface_ported_hiearachy_is_tun_outer(skb, in_dev, out_dev, protocol)) {
+				ecm_db_connection_flag_set(nci, ECM_DB_CONNECTION_FLAGS_TUNNEL_OUTER);
+			}
+
+				/*
+			 * If any of the in/out dev is a tunnel dev, then mark CI as a tunnel connection.
+			 */
+			if (ecm_interface_hierarchy_is_tunnel_flow(in_dev, out_dev)) {
+				ecm_db_connection_flag_set(nci, ECM_DB_CONNECTION_FLAGS_TUNNEL_FLOW);
+			}
+
+			/*
 			 * Add the new connection we created into the database
 			 * NOTE: assign to a short timer group for now - it is the assigned classifiers responsibility to do this
 			 */
@@ -855,6 +871,19 @@ feci_alloc_done:
 					6, protocol, ecm_dir,
 					NULL /* final callback */,
 					tg, is_routed, nci);
+
+			/*
+			 * Setting an invalid value for this initially.
+			 */
+			nci->accel_sender = ECM_TRACKER_SENDER_UNKNOWN;
+
+			/*
+			 * If its UDP flow, then we can accerate this connection in a single direction
+			 * if unidirection acceleration is enabled
+			 */
+			if (nci->protocol == IPPROTO_UDP && ecm_front_end_unidir_accel_en &&  !(nci->flags & ECM_DB_CONNECTION_FLAGS_TUNNEL_OUTER)) {
+				nci->unidir_accel_en = true;
+			}
 
 			spin_unlock_bh(&ecm_ipv6_lock);
 
@@ -1040,10 +1069,24 @@ done:
 	DEBUG_TRACE("%px: process begin, skb: %px\n", ci, skb);
 	prevalent_pr.process_actions = 0;
 	prevalent_pr.drop = false;
-	prevalent_pr.flow_qos_tag = skb->priority;
-	prevalent_pr.return_qos_tag = skb->priority;
-	prevalent_pr.flow_int_pri = skb->int_pri;
-	prevalent_pr.return_int_pri = skb->int_pri;
+
+	/*
+	 * In case of uni-direction acceleration, assign priority per direction.
+	 */
+	if (ci->unidir_accel_en) {
+		if (sender == ECM_TRACKER_SENDER_TYPE_SRC) {
+			prevalent_pr.flow_qos_tag = skb->priority;
+			prevalent_pr.flow_int_pri = skb->int_pri;
+		} else {
+			prevalent_pr.return_qos_tag = skb->priority;
+			prevalent_pr.return_int_pri = skb->int_pri;
+		}
+	} else {
+		prevalent_pr.flow_qos_tag = skb->priority;
+		prevalent_pr.return_qos_tag = skb->priority;
+		prevalent_pr.flow_int_pri = skb->int_pri;
+		prevalent_pr.return_int_pri = skb->int_pri;
+	}
 	prevalent_pr.accel_mode = ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL;
 	prevalent_pr.timer_group = ci_orig_timer_group = ecm_db_connection_timer_group_get(ci);
 
@@ -1116,6 +1159,13 @@ done:
 			prevalent_pr.process_actions |= ECM_CLASSIFIER_PROCESS_ACTION_WIFI_TAG;
 			prevalent_pr.flow_wifi_ds_node_id = aci_pr.flow_wifi_ds_node_id;
 			prevalent_pr.return_wifi_ds_node_id = aci_pr.return_wifi_ds_node_id;
+
+			prevalent_pr.flow_ast_info = aci_pr.flow_ast_info;
+			prevalent_pr.flow_stream_id = aci_pr.flow_stream_id;
+			prevalent_pr.flow_peer_id = aci_pr.flow_peer_id;
+			prevalent_pr.return_ast_info = aci_pr.return_ast_info;
+			prevalent_pr.return_stream_id = aci_pr.return_stream_id;
+			prevalent_pr.return_peer_id = aci_pr.return_peer_id;
 		}
 #endif
 		/*
@@ -1354,12 +1404,47 @@ done:
 	}
 
 	/*
-	 * Accelerate?
+	 * Should we delay the acceleration?
+	 */
+	if (ci->unidir_accel_en && ecm_front_end_unidir_accel_delay) {
+		spin_lock_bh(&ecm_ipv6_lock);
+		if (!ecm_db_connection_unidir_ready_for_accel(ci, sender)) {
+			DEBUG_INFO("%px: Unidirection connection is not ready for acceleration\n", ci);
+			spin_unlock_bh(&ecm_ipv6_lock);
+			ecm_db_connection_deref(ci);
+			ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_PORTED, ECM_STATS_V6_EXCEPTION_PORTED_ACCEL_DELAY);
+			return NF_ACCEPT;
+		}
+
+		DEBUG_INFO("%px: connection is ready for acceleration\n", ci);
+		spin_unlock_bh(&ecm_ipv6_lock);
+	}
+
+	/*
+	 * Accelerate or update?
+	 * In case of uni-direction acceleration first one flow is accelerated
+	 * later when the update comes for second flow then that flow is accelerated
+	 * This is done to update the Qos and SAWF fields for the other direction
 	 */
 	if (prevalent_pr.accel_mode == ECM_CLASSIFIER_ACCELERATION_MODE_ACCEL) {
 		DEBUG_TRACE("%px: accel\n", ci);
 		feci = ecm_db_connection_front_end_get_and_ref(ci);
-		feci->accelerate(feci, &prevalent_pr, is_l2_encap, ct, skb);
+
+		if (feci->accel_mode == ECM_FRONT_END_ACCELERATION_MODE_ACCEL && ci->unidir_accel_en && feci->update_rule) {
+			struct ecm_cmn_unidir_update_info *update_info;
+			update_info = kzalloc(sizeof(struct ecm_cmn_unidir_update_info), GFP_ATOMIC);
+			if (update_info) {
+				update_info->sender = sender;
+				update_info->pr = &prevalent_pr;
+				feci->update_rule(feci, ECM_RULE_UPDATE_TYPE_UNI_DI_QOS, (void *) update_info);
+				kfree(update_info);
+			} else {
+				DEBUG_WARN("%px: Failed to allocate memory for update_info %d\n", feci, ci->serial);
+			}
+		} else {
+			feci->accelerate(feci, &prevalent_pr, is_l2_encap, ct, skb, sender);
+		}
+
 		ecm_front_end_connection_deref(feci);
 	}
 	ecm_db_connection_deref(ci);

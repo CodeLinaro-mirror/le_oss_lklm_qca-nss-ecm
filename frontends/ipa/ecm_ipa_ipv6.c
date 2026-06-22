@@ -218,16 +218,18 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 * Note that we use _xlate versions for destination - for egressing connections this would be the wan IP address,
 	 * but for ingressing this would be the LAN side (non-nat'ed) address and is what we need for lookup of our connection.
 	 */
+	
 	IPAFEDBG("%px: IPA Sync, lookup connection using\n" \
 			"Protocol: %d\n" \
-			"src_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n" \
-			"dest_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			"src_addr: %pI6:%d\n" \
+			"dest_addr: %pI6:%d\n",
 			sync,
 			(int)sync->protocol,
-			ECM_IP_ADDR_TO_OCTAL(flow_ip), (int)sync->flow_ident,
-			ECM_IP_ADDR_TO_OCTAL(return_ip_xlate), (int)sync->return_ident_xlate);
+			sync->flow_ip, (int)sync->flow_ident,
+			sync->return_ip_xlate, (int)sync->return_ident_xlate);
 
-	ci = ecm_db_connection_find_and_ref(flow_ip, return_ip_xlate, sync->protocol, (int)ntohs(sync->flow_ident), (int)ntohs(sync->return_ident_xlate));
+	ci = ecm_db_connection_serial_find_and_ref(sync->flow_rule_id);
+	
 	if (!ci) {
 		IPAFEDBG_LOW("%px: IPA Sync: no connection\n", sync);
 		return;
@@ -958,80 +960,55 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 
 	IPAFEDBG("ECM IPA IPv6 init\n");
 
-	ecm_ipa_ipv6_dentry = debugfs_create_dir("ecm_ipa_ipv6", dentry);
-	if (!ecm_ipa_ipv6_dentry) {
+
+	if (!ecm_debugfs_create_dir("ecm_ipa_ipv6", dentry, &ecm_ipa_ipv6_dentry)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 directory in debugfs\n");
 		return result;
 	}
 
 #ifdef CONFIG_XFRM
-	if (!ecm_debugfs_create_u32("reject_acceleration_for_ipsec", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_reject_acceleration_for_ipsec)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 reject_acceleration_for_ipsec file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("reject_acceleration_for_ipsec", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_reject_acceleration_for_ipsec);
 #endif
 
-	if (!ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_no_action_limit_default)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 no_action_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_no_action_limit_default);
+	ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_driver_fail_limit_default);
 
-	if (!ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_driver_fail_limit_default)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 driver_fail_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_nack_limit_default);
 
-	if (!ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_nack_limit_default)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 nack_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_accelerated_count);
 
-	if (!ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_accelerated_count)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 accelerated_count file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_pending_accel_count);
 
-	if (!ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_pending_accel_count)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 pending_accel_count file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_pending_decel_count);
 
-	if (!ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_pending_decel_count)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 pending_decel_count file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+	if (!ecm_debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_accel_limit_mode_fops)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 accel_limit_mode file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
+	if (!ecm_debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_accel_cmd_avg_millis_fops)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 accel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
+	if (!ecm_debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_decel_cmd_avg_millis_fops)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 decel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!ecm_ipa_ported_ipv6_debugfs_init(ecm_ipa_ipv6_dentry)) {
-		IPAFEERR("Failed to create ecm ported files in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_ipa_ported_ipv6_init(ecm_ipa_ipv6_dentry);
 
-	if (!debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ipa_ipv6_dentry,
+	if (!ecm_debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_stats_request_counter_fops)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 stats_request_counter file in debugfs\n");
 		goto task_cleanup;
@@ -1044,8 +1021,7 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 	}
 #endif
 
-	ecm_stats_dentry = debugfs_lookup("stats", dentry);
-	if (!ecm_stats_dentry) {
+	if (!ecm_debugfs_lookup("stats", dentry, &ecm_stats_dentry)) {
 		IPAFEERR("Stats dentry not created\n");
 		goto task_cleanup;
 	}
@@ -1081,7 +1057,7 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 
 task_cleanup:
 
-	debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
+	ecm_debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
 	return result;
 }
 EXPORT_SYMBOL(ecm_ipa_ipv6_init);
@@ -1114,7 +1090,7 @@ void ecm_ipa_ipv6_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_ipa_ipv6_dentry) {
-		debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
+		ecm_debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
 	}
 }
 EXPORT_SYMBOL(ecm_ipa_ipv6_exit);

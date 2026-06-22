@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: ISC
  **************************************************************************
  */
+
 #include <linux/version.h>
 #include <linux/types.h>
 #include <linux/ip.h>
@@ -75,7 +76,7 @@
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE
 #include "ecm_sfe_non_ported_ipv4.h"
 #endif
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 #ifndef ECM_FRONT_END_NSS_ENABLE
 #include "ecm_sfe_multicast_ipv4.h"
 #endif
@@ -204,7 +205,6 @@ static void ecm_sfe_ipv4_process_one_conn_sync_msg(struct sfe_ipv4_conn_sync *sy
 	struct ecm_front_end_connection_instance *feci;
 	struct neighbour *neigh;
 	ip_addr_t flow_ip;
-	ip_addr_t return_ip_xlate;
 	ip_addr_t return_ip;
 	struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
 	int aci_index;
@@ -212,40 +212,26 @@ static void ecm_sfe_ipv4_process_one_conn_sync_msg(struct sfe_ipv4_conn_sync *sy
 	struct ecm_classifier_rule_sync class_sync;
 	int flow_dir;
 	int return_dir;
-	int flow_ident;
-	int return_ident_xlate;
+
+	ECM_NIN4_ADDR_TO_IP_ADDR(flow_ip, sync->flow_ip);
+	ECM_NIN4_ADDR_TO_IP_ADDR(return_ip, sync->return_ip);
 
 	/*
 	 * Look up ecm connection with a view to synchronising the connection, classifier and data tracker.
 	 * Note that we use _xlate versions for destination - for egressing connections this would be the wan IP address,
 	 * but for ingressing this would be the LAN side (non-nat'ed) address and is what we need for lookup of our connection.
 	 */
-	DEBUG_INFO("%px: SFE Sync, lookup connection using\n"
+	DEBUG_TRACE("%px: SFE Sync, lookup connection using serial:%d\n"
 			"Protocol: %d\n" \
 			"src_addr: %pI4n:%d\n" \
 			"dest_addr: %pI4n:%d\n",
 			sync,
+			sync->flow_rule_id,
 			(int)sync->protocol,
 			&sync->flow_ip, (int)sync->flow_ident,
 			&sync->return_ip_xlate, (int)sync->return_ident_xlate);
 
-	ECM_NIN4_ADDR_TO_IP_ADDR(flow_ip, sync->flow_ip);
-	ECM_NIN4_ADDR_TO_IP_ADDR(return_ip_xlate, sync->return_ip_xlate);
-	ECM_NIN4_ADDR_TO_IP_ADDR(return_ip, sync->return_ip);
-	flow_ident = (int)sync->flow_ident;
-	return_ident_xlate = (int)sync->return_ident_xlate;
-
-	/*
-	 * GRE connections such as PPTP-GRE are stored into the db using a 3 tuple based hash.
-	 * L2TPv3 over IP connection also uses a 3 tuple based hash.
-	 * So we ignore the port information here when trying to lookup the connection.
-	 */
-	if (sync->protocol == IPPROTO_GRE || sync->protocol == IPPROTO_L2TP) {
-		flow_ident = 0;
-		return_ident_xlate = 0;
-	}
-
-	ci = ecm_db_connection_find_and_ref(flow_ip, return_ip_xlate, sync->protocol, ntohs(flow_ident), ntohs(return_ident_xlate));
+	ci = ecm_db_connection_serial_find_and_ref(sync->flow_rule_id);
 
 	if (!ci) {
 		DEBUG_TRACE("%px: SFE Sync: no connection\n", sync);
@@ -309,7 +295,7 @@ static void ecm_sfe_ipv4_process_one_conn_sync_msg(struct sfe_ipv4_conn_sync *sy
 		DEBUG_TRACE("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %u, return_tx_packet_count: %u, return_tx_byte_count: %u\n",
 				ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->return_tx_packet_count, sync->return_tx_byte_count);
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 		if (ecm_ip_addr_is_multicast(return_ip)) {
 			/*
 			 * The amount of data *sent* by the ECM multicast connection 'from' side is the amount the SFE has *received* in the 'flow' direction.
@@ -1163,49 +1149,34 @@ int ecm_sfe_ipv4_init(struct dentry *dentry)
 		return -1;
 	}
 
-	ecm_sfe_ipv4_dentry = debugfs_create_dir("ecm_sfe_ipv4", dentry);
-	if (!ecm_sfe_ipv4_dentry) {
+	if (!ecm_debugfs_create_dir("ecm_sfe_ipv4", dentry, &ecm_sfe_ipv4_dentry)) {
 		DEBUG_ERROR("Failed to create ecm sfe ipv4 directory in debugfs\n");
 		unregister_sysctl_table(ecm_sfe_ipv4_ctl_table_header);
 		return -1;
 	}
 
-	if (!ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_sfe_ipv4_dentry,
-					(u32 *)&ecm_sfe_ipv4_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm sfe ipv4 accelerated_count file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_sfe_ipv4_dentry,
+				(u32 *)&ecm_sfe_ipv4_accelerated_count);
+	ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_sfe_ipv4_dentry,
+				(u32 *)&ecm_sfe_ipv4_pending_accel_count);
+	ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_sfe_ipv4_dentry,
+				(u32 *)&ecm_sfe_ipv4_pending_decel_count);
 
-	if (!ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_sfe_ipv4_dentry,
-					(u32 *)&ecm_sfe_ipv4_pending_accel_count)) {
-		DEBUG_ERROR("Failed to create ecm sfe ipv4 pending_accel_count file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_sfe_ipv4_dentry,
-					(u32 *)&ecm_sfe_ipv4_pending_decel_count)) {
-		DEBUG_ERROR("Failed to create ecm sfe ipv4 pending_decel_count file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_sfe_ipv4_dentry,
+	if (!ecm_debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_sfe_ipv4_dentry,
 					NULL, &ecm_sfe_ipv4_accel_cmd_avg_millis_fops)) {
 		DEBUG_ERROR("Failed to create ecm sfe ipv4 accel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_sfe_ipv4_dentry,
+	if (!ecm_debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_sfe_ipv4_dentry,
 					NULL, &ecm_sfe_ipv4_decel_cmd_avg_millis_fops)) {
 		DEBUG_ERROR("Failed to create ecm sfe ipv4 decel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!ecm_sfe_ported_ipv4_debugfs_init(ecm_sfe_ipv4_dentry)) {
-		DEBUG_ERROR("Failed to create ecm ported files in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_sfe_ported_ipv4_init(ecm_sfe_ipv4_dentry);
 
-	if (!debugfs_create_file("stats_request_counter", S_IRUGO, ecm_sfe_ipv4_dentry,
+	if (!ecm_debugfs_create_file("stats_request_counter", S_IRUGO, ecm_sfe_ipv4_dentry,
 					NULL, &ecm_sfe_ipv4_stats_request_counter_fops))
 	{
 		DEBUG_ERROR("Failed to create ecm sfe ipv4 stats request ounter file in debugfs\n");
@@ -1213,14 +1184,10 @@ int ecm_sfe_ipv4_init(struct dentry *dentry)
 	}
 
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE
-	if (!ecm_sfe_non_ported_ipv4_debugfs_init(ecm_sfe_ipv4_dentry)) {
-		DEBUG_ERROR("Failed to create ecm non-ported files in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_sfe_non_ported_ipv4_init(ecm_sfe_ipv4_dentry);
 #endif
 
-	ecm_stats_dentry = debugfs_lookup("stats", dentry);
-	if (!ecm_stats_dentry) {
+	if (!ecm_debugfs_lookup("stats", dentry, &ecm_stats_dentry)) {
 		DEBUG_ERROR("Stats dentry not created\n");
 		goto task_cleanup;
 	}
@@ -1242,7 +1209,7 @@ int ecm_sfe_ipv4_init(struct dentry *dentry)
 	}
 	ecm_sfe_ipv4_mgr = sfe_ipv4_notify_register(ecm_sfe_ipv4_stats_sync_callback, ecm_sfe_ipv4_connection_sync_many_callback, NULL);
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 #ifndef ECM_FRONT_END_NSS_ENABLE
 	if (ecm_sfe_multicast_ipv4_init(ecm_sfe_ipv4_dentry)) {
 		DEBUG_ERROR("Failed to init sfe multicast\n");
@@ -1256,7 +1223,7 @@ int ecm_sfe_ipv4_init(struct dentry *dentry)
 
 task_cleanup:
 
-	debugfs_remove_recursive(ecm_sfe_ipv4_dentry);
+	ecm_debugfs_remove_recursive(ecm_sfe_ipv4_dentry);
 	unregister_sysctl_table(ecm_sfe_ipv4_ctl_table_header);
 	return -1;
 }
@@ -1272,7 +1239,7 @@ void ecm_sfe_ipv4_exit(void)
 		return;
 	}
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 #ifndef ECM_FRONT_END_NSS_ENABLE
 	ecm_sfe_multicast_ipv4_exit();
 #endif
@@ -1285,7 +1252,7 @@ void ecm_sfe_ipv4_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_sfe_ipv4_dentry) {
-		debugfs_remove_recursive(ecm_sfe_ipv4_dentry);
+		ecm_debugfs_remove_recursive(ecm_sfe_ipv4_dentry);
 	}
 
 	/*

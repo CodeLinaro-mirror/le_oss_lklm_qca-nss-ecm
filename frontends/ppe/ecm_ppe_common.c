@@ -1,18 +1,7 @@
 /*
  **************************************************************************
- * Copyright (c) 2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -25,6 +14,7 @@
 #include <linux/inet.h>
 #include <linux/etherdevice.h>
 #include <net/netfilter/nf_conntrack_l4proto.h>
+#include <ecm_interface_ipsec.h>
 
 #define DEBUG_LEVEL ECM_PPE_COMMON_DEBUG_LEVEL
 
@@ -43,6 +33,8 @@
 #include "ecm_front_end_common.h"
 #include "ecm_ppe_ipv6.h"
 #include "ecm_ppe_ipv4.h"
+#include "ecm_ppe_ported_ipv4.h"
+#include "ecm_ppe_ported_ipv6.h"
 #ifdef ECM_INTERFACE_VXLAN_ENABLE
 #include <net/vxlan.h>
 #endif
@@ -54,6 +46,9 @@ extern int nf_ct_tcp_no_window_check;
 #ifdef ECM_INTERFACE_TUNIPIP6_ENABLE
 #include <net/ip6_tunnel.h>
 #endif
+
+#include "ecm_ppe_stats_v4.h"
+#include "ecm_ppe_stats_v6.h"
 
 #ifdef ECM_IPV6_ENABLE
 /*
@@ -225,6 +220,53 @@ vxlan_fail:
 }
 #endif
 
+
+#ifdef ECM_XFRM_ENABLE
+/*
+ * ecm_ppe_ipsec_flow_accel()
+ *	Check if the IPsec flow is allowed for hardware acceleration.
+ *	Returns 0 on success, else error.
+ *	Sets inner and outer flags based on xfrm state.
+ */
+static int ecm_ppe_ipsec_flow_accel(struct sk_buff *skb, bool *inner, bool *outer)
+{
+	struct sec_path *sp;
+	struct xfrm_state *xs = NULL;
+	struct dst_entry *dst;
+
+	*inner = *outer = false;
+
+	/*
+	 * skb's sp is set for decapsulated packet (WAN to LAN)
+	 */
+	if (secpath_exists(skb)) {
+		sp = skb_sec_path(skb);
+		if (!sp || sp->len <= 0)
+			return -EINVAL;
+
+		xs = sp->xvec[sp->len - 1];
+		if (xs) {
+			*inner = !!(xs->xflags & XFRM_STATE_OFFLOAD_HW_INNER);
+			*outer = !!(xs->xflags & XFRM_STATE_OFFLOAD_HW);
+			return 0;
+		}
+	}
+
+	/*
+	 * dst->xfrm is valid for lan to wan plain packet (LAN to WAN)
+	 */
+	dst = skb_dst(skb);
+	if (dst && dst->xfrm) {
+		xs = dst->xfrm;
+		*inner = !!(xs->xflags & XFRM_STATE_OFFLOAD_HW_INNER);
+		*outer = !!(xs->xflags & XFRM_STATE_OFFLOAD_HW);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+#endif /* ECM_XFRM_ENABLE */
+
 /*
  * ecm_ppe_feature_check()
  *	Check some specific features for PPE acceleration
@@ -269,12 +311,18 @@ bool ecm_ppe_feature_check(struct sk_buff *skb, struct ecm_tracker_ip_header *ip
 #ifdef ECM_XFRM_ENABLE
 		struct net_device *ipsec_dev;
 		int32_t interface_type;
+		bool inner_accel = false;
+		bool outer_accel = false;
 
 		/*
-		 * Dont accelerate inner flow.
+		 * Check if inner/outer acceleration is supported
 		 */
-		if (inner) {
-			DEBUG_TRACE("%px xfrm inner flow is not supported for PPE; skip it\n", skb);
+		ecm_ppe_ipsec_flow_accel(skb, &inner_accel, &outer_accel);
+
+		/*
+		 * If flow is inner, check if inner accel is supported by PPE
+		 */
+		if (inner && !inner_accel) {
 			return false;
 		}
 
@@ -287,6 +335,7 @@ bool ecm_ppe_feature_check(struct sk_buff *skb, struct ecm_tracker_ip_header *ip
 			DEBUG_TRACE("%px xfrm flow not managed by NSS; skip it\n", skb);
 			return false;
 		}
+
 		dev_put(ipsec_dev);
 #else
 		DEBUG_TRACE("%px xfrm flow, but accel is disabled; skip it\n", skb);
@@ -456,100 +505,57 @@ bool ecm_ppe_tunipip6_is_flow_offload_enabled(struct ecm_front_end_connection_in
 /*
  * ecm_ppe_common_update_rule()
  *	Updates the frontend specifc data.
- *
- * Currently, only updates the mark values of the connection and updates the PPE AE.
  */
 void ecm_ppe_common_update_rule(struct ecm_front_end_connection_instance *feci, enum ecm_rule_update_type type, void *arg)
 {
+	uint8_t rule_type = 0;
+	bool status;
+
 	switch (type) {
-	case ECM_RULE_UPDATE_TYPE_SAWFMARK:
+	case ECM_RULE_UPDATE_TYPE_UNI_DI_QOS:
+	{
+		struct ecm_cmn_unidir_update_info *update_info = (struct ecm_cmn_unidir_update_info *) arg;
+
+		rule_type |= PPE_DRV_UPDATE_RULE_TYPE_QOS;
+		rule_type |= PPE_DRV_UPDATE_RULE_TYPE_DSCP;
+
+		if (feci->ip_version == 4) {
+			status = ecm_ppe_ported_ipv4_unidir_rule_update(feci->ci, update_info->pr, update_info->sender, rule_type);
+			if (!status) {
+				DEBUG_WARN("%p: Uni-directional v4 flow update failed in PPE.\n", feci);
+				ecm_ppe_stats_v4_inc(feci, ECM_PPE_STATS_V4_EXCEPTION_PORTED, ECM_PPE_STATS_V4_EXCEPTION_PORTED_UNIDIR_UPDATE_FAIL);
+			}
+		} else {
+			status = ecm_ppe_ported_ipv6_unidir_rule_update(feci->ci, update_info->pr, update_info->sender, rule_type);
+			if (!status) {
+				DEBUG_WARN("%p: Uni-directional v6 flow update failed in PPE.\n", feci);
+				ecm_ppe_stats_v6_inc(feci, ECM_PPE_STATS_V6_EXCEPTION_PORTED, ECM_PPE_STATS_V6_EXCEPTION_PORTED_UNIDIR_UPDATE_FAIL);
+			}
+		}
+		break;
+	}
+	case ECM_RULE_UPDATE_TYPE_BI_DI_SAWF_QOS:
 	{
 		struct ecm_front_end_flowsawf_msg *msg = (struct ecm_front_end_flowsawf_msg *)arg;
+		struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
 		int aci_index;
 		int assignment_count;
-		struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
-		bool sawf_flow_mark_update, sawf_return_mark_update = false;
-		ppe_drv_ret_t ppe_status;
 
-		sawf_flow_mark_update = ((PPE_DRV_SAWF_GET_TAG(msg->flow_mark) == PPE_DRV_SAWF_VALID_TAG) && PPE_DRV_SAWF_VALID_BIT(msg->flow_mark));
-		sawf_return_mark_update = ((PPE_DRV_SAWF_GET_TAG(msg->return_mark) == PPE_DRV_SAWF_VALID_TAG) && PPE_DRV_SAWF_VALID_BIT(msg->return_mark));
-
+		rule_type |= PPE_DRV_UPDATE_RULE_TYPE_SAWF;
 		if (msg->ip_version == 4) {
-			struct ppe_drv_v4_sawf_mark_update mark = {0};
-
-			mark.sawf_rule.flow_mark = msg->flow_mark;
-			mark.sawf_rule.flow_service_class = msg->flow_service_class_id;
-
-			if (sawf_flow_mark_update || (msg->flags & ECM_FRONT_END_PRIO_UPDATE_FLOW)) {
-				mark.valid_flags |= PPE_DRV_SAWF_MARK_FLOW_UPDATE;
-			}
-
-			mark.sawf_rule.return_mark = msg->return_mark;
-			mark.sawf_rule.return_service_class = msg->return_service_class_id;
-
-			if (sawf_return_mark_update || (msg->flags & ECM_FRONT_END_PRIO_UPDATE_RETURN)) {
-				mark.valid_flags |= PPE_DRV_SAWF_MARK_RETURN_UPDATE;
-			}
-
-			mark.tuple.protocol = msg->protocol;
-			mark.tuple.flow_ident = ntohs(msg->flow_src_port);
-			mark.tuple.return_ident = ntohs(msg->flow_dest_port);
-
-			ECM_IP_ADDR_TO_NIN4_ADDR(mark.tuple.flow_ip, msg->flow_src_ip);
-			ECM_IP_ADDR_TO_NIN4_ADDR(mark.tuple.return_ip, msg->flow_dest_ip);
-
-			ppe_status = ppe_drv_v4_rule_sawf_mark_update(&mark);
-			if (ppe_status != PPE_DRV_RET_SUCCESS) {
-				DEBUG_WARN("%px: Failed to update mark value in PPE\n", feci);
-				msg->status = false;
+			status = ecm_ppe_ported_ipv4_bidir_sawf_rule_update(feci->ci, msg, rule_type);
+			if (!status) {
+				DEBUG_WARN("%px: Failed to update v4 sawf mark value in PPE\n", feci);
+				ecm_ppe_stats_v4_inc(feci, ECM_PPE_STATS_V4_EXCEPTION_PORTED, ECM_PPE_STATS_V4_EXCEPTION_PORTED_BIDIR_UPDATE_FAIL);
 				return;
 			}
-
-			msg->status = true;
-
-			DEBUG_TRACE("%px: sawf flow/return mark=0x%08x/0x%08x %pI4:%u -> %pI4:%u protocol=%u\n",
-				feci, mark.sawf_rule.flow_mark, mark.sawf_rule.return_mark,
-				&mark.tuple.flow_ip, mark.tuple.flow_ident,
-				&mark.tuple.return_ip, mark.tuple.return_ident,
-				mark.tuple.protocol);
 		} else {
-			struct ppe_drv_v6_sawf_mark_update mark = {0};
-
-			mark.sawf_rule.flow_mark = msg->flow_mark;
-			mark.sawf_rule.flow_service_class = msg->flow_service_class_id;
-
-			if (sawf_flow_mark_update || (msg->flags & ECM_FRONT_END_PRIO_UPDATE_FLOW)) {
-				mark.valid_flags |= PPE_DRV_SAWF_MARK_FLOW_UPDATE;
-			}
-
-			mark.sawf_rule.return_mark = msg->return_mark;
-			mark.sawf_rule.return_service_class = msg->return_service_class_id;
-
-			if (sawf_return_mark_update || (msg->flags & ECM_FRONT_END_PRIO_UPDATE_RETURN)) {
-				mark.valid_flags |= PPE_DRV_SAWF_MARK_RETURN_UPDATE;
-			}
-
-			mark.tuple.protocol = msg->protocol;
-			mark.tuple.flow_ident = ntohs(msg->flow_src_port);
-			mark.tuple.return_ident = ntohs(msg->flow_dest_port);
-
-			ECM_IP_ADDR_TO_NET_IPV6_ADDR(mark.tuple.flow_ip, msg->flow_src_ip);
-			ECM_IP_ADDR_TO_NET_IPV6_ADDR(mark.tuple.return_ip, msg->flow_dest_ip);
-
-			ppe_status = ppe_drv_v6_rule_sawf_mark_update(&mark);
-			if (ppe_status != PPE_DRV_RET_SUCCESS) {
-				DEBUG_WARN("%px: Failed to update mark value in PPE\n", feci);
-				msg->status = false;
+			status = ecm_ppe_ported_ipv6_bidir_sawf_rule_update(feci->ci, msg, rule_type);
+			if (!status) {
+				DEBUG_WARN("%px: Failed to update v6 sawf mark value in PPE\n", feci);
+				ecm_ppe_stats_v6_inc(feci, ECM_PPE_STATS_V6_EXCEPTION_PORTED, ECM_PPE_STATS_V6_EXCEPTION_PORTED_BIDIR_UPDATE_FAIL);
 				return;
 			}
-
-			msg->status = true;
-
-			DEBUG_TRACE("%px: sawf flow/return mark=0x%08x/0x%08x %pI6:%u -> %pI6:%u protocol=%u\n",
-				feci, mark.sawf_rule.flow_mark, mark.sawf_rule.return_mark,
-				mark.tuple.flow_ip, mark.tuple.flow_ident,
-				mark.tuple.return_ip, mark.tuple.return_ident,
-				mark.tuple.protocol);
 		}
 
 		/*
@@ -569,7 +575,6 @@ void ecm_ppe_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 
 		break;
 	}
-
 	default:
 		DEBUG_WARN("%px: unsupported update rule type: %d\n", feci, type);
 		break;

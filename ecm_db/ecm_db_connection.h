@@ -168,7 +168,9 @@ struct ecm_db_connection_instance {
 	uint16_t l2_encap_proto;				/* L2 encap protocol of the flow of this connection */
 	uint32_t mark;						/* The result value of mark classifier on this connection */
 	bool is_rtp;						/* RTP is present in UDP if this flag is set */
-
+#if defined(ECM_FRONT_END_ESP_SPI_PASSTHROUGH)
+	uint32_t spi[ECM_DB_OBJ_DIR_MAX];			/* ESP SPI index in flow and return direction */
+#endif
 	/*
 	 * Connection endpoint mapping
 	 * NOTE: For non-NAT connections mapping[ECM_DB_OBJ_DIR_FROM_NAT] and mapping[ECM_DB_OBJ_DIR_TO_NAT]
@@ -226,7 +228,7 @@ struct ecm_db_connection_instance {
 	int32_t interface_first[ECM_DB_OBJ_DIR_MAX];	/* The index of the first interface in the list */
 	bool interface_set[ECM_DB_OBJ_DIR_MAX];		/* True when a list has been set - even if there is NO list, it's still deliberately set that way. */
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	/*
 	 * Destination Multicast interfaces list
 	 */
@@ -326,6 +328,11 @@ struct ecm_db_connection_instance {
 #if (DEBUG_LEVEL > 0)
 	uint16_t magic;
 #endif
+	bool unidir_accel_en;					/* Tells if this connection needs to be accelerated in one direction initially. */
+	ecm_tracker_sender_type_t accel_sender;			/* Stores the sender who accelerates the connection first  */
+	uint64_t slow_unidir_pkts[ECM_TRACKER_SENDER_MAX];	/* Count of unidirection slow packets for accel delay */
+	bool packet_seen[ECM_CONN_DIR_MAX];			/* Per-direction packet seen flag */
+
 };
 
 /*
@@ -334,6 +341,9 @@ struct ecm_db_connection_instance {
 #define ECM_DB_CONNECTION_FLAGS_INSERTED 0x1			/* Connection is inserted into connection database tables */
 #define ECM_DB_CONNECTION_FLAGS_PPPOE_BRIDGE 0x2		/* Connection is PPPoE bridge entry */
 #define ECM_DB_CONNECTION_FLAGS_DEFUNCT_CT_DESTROYED 0x4	/* Connection is defuncted because of conntarck Destroyed */
+#define ECM_DB_CONNECTION_FLAGS_TUNNEL_OUTER 0x8		/* Connection is for a tunnel connection outer */
+#define ECM_DB_CONNECTION_FLAGS_TUNNEL_FLOW 0x10		/* Connection is for a tunnel connection, either inner or outer tunnel */
+#define ECM_DB_CONNECTION_FLAGS_ESP_SPI_PASSTH 0x20		/* Connection is ESP SPI based pass-through */
 
 int _ecm_db_connection_count_get(void);
 
@@ -365,6 +375,10 @@ void ecm_db_connection_address_get(struct ecm_db_connection_instance *ci, ecm_db
 
 int ecm_db_connection_port_get(struct ecm_db_connection_instance *ci, ecm_db_obj_dir_t dir);
 
+#if defined(ECM_FRONT_END_ESP_SPI_PASSTHROUGH)
+void ecm_db_connection_spi_set(struct ecm_db_connection_instance *ci, ecm_db_obj_dir_t dir, uint32_t spi);
+uint32_t ecm_db_connection_spi_get(struct ecm_db_connection_instance *ci, ecm_db_obj_dir_t dir);
+#endif
 void ecm_db_connection_node_address_get(struct ecm_db_connection_instance *ci, ecm_db_obj_dir_t dir, uint8_t *address_buffer);
 
 void ecm_db_connection_iface_name_get(struct ecm_db_connection_instance *ci, ecm_db_obj_dir_t dir, char *name_buffer);
@@ -402,11 +416,21 @@ void ecm_db_connection_defunct_by_protocol(int protocol);
 void ecm_db_connection_defunct_ip_version(int ip_version);
 
 struct ecm_db_connection_instance *ecm_db_connection_serial_find_and_ref(uint32_t serial);
-struct ecm_db_connection_instance *ecm_db_connection_find_and_ref(ip_addr_t host1_addr,
+struct ecm_db_connection_instance *ecm_db_connection_find_and_ref_hash_first(ip_addr_t host1_addr,
 								  ip_addr_t host2_addr,
 								  int protocol,
 								  int host1_port,
 								  int host2_port);
+
+struct ecm_db_connection_instance *ecm_db_connection_find_and_ref_hash_next(struct ecm_db_connection_instance *ci);
+
+struct ecm_db_connection_instance *ecm_db_connection_source_find_and_ref(ip_addr_t host1_addr,
+								  ip_addr_t host2_addr,
+								  int protocol,
+								  int host1_port,
+								  int host2_port,
+								  struct net_device *in,
+								  struct net_device *out);
 
 struct ecm_db_node_instance *ecm_db_connection_node_get_and_ref(struct ecm_db_connection_instance *ci, ecm_db_obj_dir_t dir);
 
@@ -454,10 +478,10 @@ ecm_db_connection_by_classifier_type_assignment_get_and_ref_next(struct ecm_db_c
 								 ecm_classifier_type_t ca_type);
 void ecm_db_connection_by_classifier_type_assignment_deref(struct ecm_db_connection_instance *ci,
 							   ecm_classifier_type_t ca_type);
-void ecm_db_connection_regenerate_by_assignment_type(ecm_classifier_type_t ca_type);
-void ecm_db_connection_make_defunct_by_assignment_type(ecm_classifier_type_t ca_type);
 #endif
 
+void ecm_db_connection_regenerate_by_assignment_type(ecm_classifier_type_t ca_type);
+void ecm_db_connection_make_defunct_by_assignment_type(ecm_classifier_type_t ca_type);
 struct ecm_db_connection_instance *ecm_db_connection_alloc(void);
 void ecm_db_connection_add(struct ecm_db_connection_instance *ci,
 			   struct ecm_db_mapping_instance *mapping[],
@@ -480,7 +504,9 @@ int ecm_db_protocol_get_first(void);
 #endif
 
 struct ecm_db_connection_instance *ecm_db_connection_ipv4_from_ct_get_and_ref(struct nf_conn *ct);
+
 struct ecm_db_connection_instance *ecm_db_connection_ipv6_from_ct_get_and_ref(struct nf_conn *ct);
+
 #ifdef ECM_INTERFACE_OVS_BRIDGE_ENABLE
 struct ecm_db_connection_instance *ecm_db_connection_from_ovs_flow_get_and_ref(struct ovsmgr_dp_flow *flow);
 #endif
@@ -494,6 +520,7 @@ void ecm_db_netdevs_get_and_hold(struct ecm_db_connection_instance *ci, ecm_trac
 				struct net_device **src_dev, struct net_device **dest_dev);
 
 void ecm_db_connection_flag_set(struct ecm_db_connection_instance *ci, uint32_t flag);
+bool ecm_db_connection_flag_check(struct ecm_db_connection_instance *ci, uint32_t flag);
 
 void ecm_db_connection_l2_encap_proto_set(struct ecm_db_connection_instance *ci, uint16_t l2_encap_proto);
 uint16_t ecm_db_connection_l2_encap_proto_get(struct ecm_db_connection_instance *ci);
@@ -506,6 +533,9 @@ uint32_t ecm_db_connection_mark_get(struct ecm_db_connection_instance *ci);
 void ecm_db_connection_defunct_by_classifier(int ip_ver, ip_addr_t src_addr, uint16_t src_port, ip_addr_t dest_addr,
 						uint16_t dest_port, int proto, bool is_routed, ecm_classifier_type_t ca_type);
 bool ecm_db_connection_defunct_5tuple_buffer(char *buf);
+
+bool ecm_db_connection_unidir_ready_for_accel(struct ecm_db_connection_instance *ci, ecm_tracker_sender_type_t sender);
+ecm_tracker_sender_type_t ecm_db_connection_accel_sender_get(struct ecm_db_connection_instance *ci);
 
 bool ecm_db_connection_init(struct dentry *dentry);
 void ecm_db_connection_exit(void);

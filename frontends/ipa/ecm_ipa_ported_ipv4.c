@@ -94,7 +94,6 @@ extern int nf_ct_tcp_be_liberal;
 static void ecm_ipa_ported_ipv4_connection_callback(void *app_data, struct ipa_ipv4_msg *nim)
 {
 	struct ipa_ipv4_rule_create_msg * __attribute__((unused)) nircm = &nim->msg.rule_create;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 	ecm_front_end_acceleration_mode_t result_mode;
@@ -104,16 +103,17 @@ static void ecm_ipa_ported_ipv4_connection_callback(void *app_data, struct ipa_i
 	 * Is this a response to a create message?
 	 */
 	if (nim->cm.type != IPA_TX_CREATE_RULE_MSG) {
-		IPAFEERR("%px: ported create callback with improper type: %d, serial: %u\n", nim, nim->cm.type, serial);
+		IPAFEERR("%px: ported create callback with improper type: %d, serial: %u\n",
+				nim, nim->cm.type, nircm->tuple.flow_rule_id);
 		return;
 	}
 
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(nircm->tuple.flow_rule_id);
 	if (!ci) {
-		IPAFEDBG_LOW("%px: create callback, connection not found, serial: %u\n", nim, serial);
+		IPAFEDBG_LOW("%px: create callback, connection not found, serial: %u\n", nim, nircm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -138,7 +138,7 @@ static void ecm_ipa_ported_ipv4_connection_callback(void *app_data, struct ipa_i
 	/*
 	 * Dump some useful trace information.
 	 */
-	IPAFEDBG_LOW("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, serial);
+	IPAFEDBG_LOW("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, nircm->tuple.flow_rule_id);
 	IPAFEDBG_LOW("%px: rule_flags: %x, valid_flags: %x\n", feci, nircm->rule_flags, nircm->valid_flags);
 	IPAFEDBG_LOW("%px: flow_ip: %pI4n:%d\n", feci, &nircm->tuple.flow_ip, nircm->tuple.flow_ident);
 	IPAFEDBG_LOW("%px: return_ip: %pI4n:%d\n", feci, &nircm->tuple.return_ip, nircm->tuple.return_ident);
@@ -322,7 +322,7 @@ static void ecm_ipa_ported_ipv4_connection_callback(void *app_data, struct ipa_i
  */
 static void ecm_ipa_ported_ipv4_connection_accelerate(struct ecm_front_end_connection_instance *feci,
 									struct ecm_classifier_process_response *pr, bool is_l2_encap,
-									struct nf_conn *ct, struct sk_buff *skb)
+									struct nf_conn *ct, struct sk_buff *skb, ecm_tracker_sender_type_t sender)
 {
 	uint16_t regen_occurrances;
 	int protocol;
@@ -332,6 +332,7 @@ static void ecm_ipa_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	struct ecm_db_iface_instance *to_ifaces[ECM_DB_IFACE_HEIRARCHY_MAX];
 	struct ecm_db_iface_instance *from_ipa_iface;
 	struct ecm_db_iface_instance *to_ipa_iface;
+	struct ecm_db_connection_instance *ci = feci->ci;
 	int32_t from_ipa_iface_id;
 	int32_t to_ipa_iface_id;
 	uint8_t from_ipa_iface_address[ETH_ALEN];
@@ -375,6 +376,13 @@ static void ecm_ipa_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		return;
 	}
 
+	/*
+ 	 * Setting the acceleration sender for uni-direction flows
+ 	 */
+	spin_lock_bh(&feci->lock);
+	ci->accel_sender = sender;
+	spin_unlock_bh(&feci->lock);
+
 	nim = (struct ipa_ipv4_msg *)kzalloc(sizeof(struct ipa_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
 	if (!nim) {
 		ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_NO_MEM);
@@ -397,6 +405,7 @@ static void ecm_ipa_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 	nircm = &nim->msg.rule_create;
 	nircm->valid_flags = 0;
 	nircm->rule_flags = 0;
+	nircm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Initialize VLAN tag information
@@ -1314,6 +1323,22 @@ static void ecm_ipa_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 		//ecm_ipa_common_fast_xmit_set(&nircm->rule_flags, &nircm->valid_flags, &nircm->qdisc_rule, from_ifaces, to_ifaces, from_ifaces_first, to_ifaces_first);
 	}
 
+
+	if  (ci->unidir_accel_en) {
+		nircm->valid_flags |= 	IPA_RULE_CREATE_DIRECTION_VALID;
+		if (ecm_db_connection_accel_sender_get(ci) == ECM_TRACKER_SENDER_TYPE_SRC) {
+			nircm->direction_rule.flow_accel = true;
+			feci->udp_flow_dir_accel = true;
+			nircm->direction_rule.return_accel = false;
+			feci->udp_return_dir_accel = false;
+		} else {
+			nircm->direction_rule.flow_accel = false;
+			feci->udp_flow_dir_accel = false;
+			nircm->direction_rule.return_accel = true;
+			feci->udp_return_dir_accel = true;
+		}
+	}
+
 	/*
 	 * Release the interface lists
 	 */
@@ -1322,6 +1347,7 @@ static void ecm_ipa_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 
 	IPAFEDBG("%px: Ported Accelerate connection %px\n"
 			"Protocol: %d\n"
+			"serial:%u\n"
 			"from_mtu: %u\n"
 			"to_mtu: %u\n"
 			"from_ip: %pI4n:%d\n"
@@ -1364,6 +1390,7 @@ static void ecm_ipa_ported_ipv4_connection_accelerate(struct ecm_front_end_conne
 			feci,
 			feci->ci,
 			nircm->tuple.protocol,
+			nircm->tuple.flow_rule_id,
 			nircm->conn_rule.flow_mtu,
 			nircm->conn_rule.return_mtu,
 			&nircm->tuple.flow_ip, ntohs(nircm->tuple.flow_ident),
@@ -1549,7 +1576,6 @@ ported_accel_bad_rule:
 static void ecm_ipa_ported_ipv4_connection_destroy_callback(void *app_data, struct ipa_ipv4_msg *nim)
 {
 	struct ipa_ipv4_rule_destroy_msg * __attribute__((unused))nirdm = &nim->msg.rule_destroy;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 
@@ -1564,9 +1590,9 @@ static void ecm_ipa_ported_ipv4_connection_destroy_callback(void *app_data, stru
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(nirdm->tuple.flow_rule_id);
 	if (!ci) {
-		IPAFEDBG_LOW("%px: destroy callback, connection not found, serial: %u\n", nim, serial);
+		IPAFEDBG_LOW("%px: destroy callback, connection not found, serial: %u\n", nim, nirdm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -1701,6 +1727,7 @@ static bool ecm_ipa_ported_ipv4_connection_decelerate_msg_send(struct ecm_front_
 
 	nirdm = &nim->msg.rule_destroy;
 	nirdm->tuple.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
+	nirdm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Get addressing information
@@ -2149,19 +2176,12 @@ struct ecm_front_end_connection_instance *ecm_ipa_ported_ipv4_connection_instanc
 /*
  * ecm_ipa_ported_ipv4_debugfs_init()
  */
-bool ecm_ipa_ported_ipv4_debugfs_init(struct dentry *dentry)
+void ecm_ipa_ported_ipv4_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("udp_accelerated_count", S_IRUGO, dentry,
-				    &ecm_ipa_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_UDP])) {
-		IPAFEERR("Failed to create ecm ipa ipv4 udp_accelerated_count file in debugfs\n");
-		return false;
-	}
+	ecm_debugfs_create_u32("udp_accelerated_count", S_IRUGO, dentry,
+				    &ecm_ipa_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_UDP]);
 
-	if (!ecm_debugfs_create_u32("tcp_accelerated_count", S_IRUGO, dentry,
-					&ecm_ipa_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_TCP])) {
-		IPAFEERR("Failed to create ecm ipa ipv4 tcp_accelerated_count file in debugfs\n");
-		return false;
-	}
+	ecm_debugfs_create_u32("tcp_accelerated_count", S_IRUGO, dentry,
+					&ecm_ipa_ported_ipv4_accelerated_count[ECM_FRONT_END_PORTED_PROTO_TCP]);
 
-	return true;
 }

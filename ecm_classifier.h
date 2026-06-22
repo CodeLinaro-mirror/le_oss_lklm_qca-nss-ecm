@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2015, 2018-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -169,7 +158,7 @@ struct ecm_classifier_process_response {
 #ifdef ECM_CLASSIFIER_OVS_ENABLE
 	uint32_t ingress_vlan_tag[2];			/* Ingress VLAN tags */
 	uint32_t egress_vlan_tag[2];			/* Egress VLAN tags */
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	int32_t egress_netdev_index[ECM_DB_MULTICAST_IF_MAX];	 /* Multicast egress net device interface index */
 	uint32_t egress_mc_vlan_tag[ECM_DB_MULTICAST_IF_MAX][2]; /* Multicast egress VLAN tags */
 #endif
@@ -204,6 +193,12 @@ struct ecm_classifier_process_response {
 #ifdef ECM_CLASSIFIER_WIFI_ENABLE
 	uint32_t flow_wifi_ds_node_id;			/* Flow Wi-Fi ppe ds metadata i.e. node id */
 	uint32_t return_wifi_ds_node_id;		/* Return Wi-Fi ppe ds metadata i.e. node id */
+	uint16_t flow_ast_info;				/* Flow AST info */
+	uint16_t return_ast_info;			/* Return AST info */
+	uint8_t flow_stream_id;				/* Flow stream ID */
+	uint8_t return_stream_id;			/* Return stream ID */
+	uint16_t flow_peer_id;				/* Flow peer ID */
+	uint16_t return_peer_id;			/* Return peer ID */
 #endif
 };
 
@@ -229,6 +224,10 @@ struct ecm_classifier_rule_sync {
 struct ecm_classifier_rule_create {
 #ifdef ECM_CLASSIFIER_EMESH_ENABLE
 	struct sk_buff *skb;
+#endif
+#ifdef ECM_CLASSIFIER_WIFI_ENABLE
+	struct ecm_classifier_wifi_flow_info *flow_info;
+	bool flow_info_valid;
 #endif
 };
 
@@ -396,10 +395,10 @@ static inline int ecm_classifier_process_response_state_get(struct ecm_state_fil
 	}
 
 	if (pr->process_actions & ECM_CLASSIFIER_PROCESS_ACTION_MARK) {
-		if ((result = ecm_state_write(sfi, "flow_mark", "%u", pr->flow_mark))) {
+		if ((result = ecm_state_write(sfi, "flow_mark", "0x%x", pr->flow_mark))) {
 			return result;
 		}
-		if ((result = ecm_state_write(sfi, "return_mark", "%u", pr->return_mark))) {
+		if ((result = ecm_state_write(sfi, "return_mark", "0x%x", pr->return_mark))) {
 			return result;
 		}
 	}
