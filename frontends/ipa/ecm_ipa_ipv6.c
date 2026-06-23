@@ -455,6 +455,27 @@ sync_conntrack:
 	h = nf_conntrack_find_get(&init_net, &nf_ct_zone_dflt, &tuple);
 	if (!h) {
 		IPAFEWARN("%px: IPA Sync: no conntrack connection\n", sync);
+
+		/*
+		 * conntrack entry is gone but ECM may still have this connection
+		 * accelerated (e.g. if the conntrack DESTROY event was missed).
+		 * Re-look up the ECM connection and defunct it so the FST entry
+		 * and filter rules are cleaned up.
+		 */
+		ci = ecm_db_connection_find_and_ref_hash_first(flow_ip, return_ip_xlate,
+							       sync->protocol,
+							       (int)ntohs(sync->flow_ident),
+							       (int)ntohs(sync->return_ident_xlate));
+		if (ci) {
+			IPAFEWARN("%px: IPA Sync: defuncting orphaned ECM connection %px"
+				  " (conntrack gone, proto=%d src=" ECM_IP_ADDR_OCTAL_FMT
+				  ":%d dst=" ECM_IP_ADDR_OCTAL_FMT ":%d)\n",
+				  sync, ci, sync->protocol,
+				  ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				  ECM_IP_ADDR_TO_OCTAL(return_ip_xlate), ntohs(sync->return_ident_xlate));
+			ecm_db_connection_make_defunct(ci);
+			ecm_db_connection_deref(ci);
+		}
 		return;
 	}
 
