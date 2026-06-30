@@ -159,7 +159,7 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 		/*
 		 * Creation command failed (specific reason ignored).
 		 */
-		IPAFEDBG_LOW("%px: accel nack: %d\n", feci, nim->cm.error);
+		IPAFEWARN("%px: accel nack: %d serial:%u\n", feci, nim->cm.error, nircm->tuple.flow_rule_id);
 		spin_lock_bh(&feci->lock);
 		DEBUG_ASSERT(feci->accel_mode == ECM_FRONT_END_ACCELERATION_MODE_ACCEL_PENDING, "%px: Unexpected mode: %d\n", ci, feci->accel_mode);
 		feci->stats.ae_nack++;
@@ -188,6 +188,12 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 		spin_unlock_bh(&ecm_ipa_ipv6_lock);
 
 		spin_unlock_bh(&feci->lock);
+
+		IPAFEDBG("%px: conn:%px serial:%u IPv6 accel nack result mode:%d nack_count:%u/%u " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				feci, feci->ci, nircm->tuple.flow_rule_id, result_mode,
+				feci->stats.ae_nack, feci->stats.ae_nack_limit,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(nircm->tuple.flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(nircm->tuple.return_ident));
 
 		/*
 		 * Release the connection.
@@ -227,6 +233,11 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 
 		spin_unlock_bh(&feci->lock);
 
+		IPAFEDBG("%px: conn:%px serial:%u IPv6 accel OOO flush - cleared to mode:%d " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				feci, feci->ci, nircm->tuple.flow_rule_id, feci->accel_mode,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(nircm->tuple.flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(nircm->tuple.return_ident));
+
 		/*
 		 * Release the connection.
 		 */
@@ -261,6 +272,11 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 		int assignment_count;
 		int aci_index;
 		struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
+
+		IPAFEDBG("%px: conn:%px serial:%u IPv6 accel ACK - now accelerated " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				feci, feci->ci, nircm->tuple.flow_rule_id,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(nircm->tuple.flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(nircm->tuple.return_ident));
 		/*
 		 * Increment the no-action counter, this is reset if offload action is seen
 		 */
@@ -291,7 +307,10 @@ static void ecm_ipa_ported_ipv6_connection_callback(void *app_data, struct ipa_i
 		return;
 	}
 
-	IPAFEDBG("%px: Decelerate was pending\n", ci);
+	IPAFEDBG("%px: conn:%px serial:%u IPv6 decelerate pending " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			feci, feci->ci, nircm->tuple.flow_rule_id,
+			ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(nircm->tuple.flow_ident),
+			ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(nircm->tuple.return_ident));
 
 	/*
 	 * Check if the pending decelerate was done with the defunct process.
@@ -382,7 +401,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	 */
 	if (!ecm_ipa_ipv6_accel_pending_set(feci)) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_ACCEL_NOT_PERMITTED);
-		IPAFEDBG_LOW("%px: Acceleration not permitted: %px skb=%px\n", feci, feci->ci, skb);
+		IPAFEDBG_LOW_RL("%px: Acceleration not permitted: %px skb=%px\n", feci, feci->ci, skb);
 		return;
 	}
 
@@ -431,14 +450,14 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	from_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, from_ifaces, ECM_DB_OBJ_DIR_FROM);
 	if (from_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_FROM_INTERFACES);
-		IPAFEWARN("%px: Accel attempt failed - no interfaces in from_interfaces list!\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u Accel attempt failed - no interfaces in from_interfaces list!\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 		goto ported_accel_bad_rule;
 	}
 
 	to_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, to_ifaces, ECM_DB_OBJ_DIR_TO);
 	if (to_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_TO_INTERFACES);
-		IPAFEWARN("%px: Accel attempt failed - no interfaces in to_interfaces list!\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u Accel attempt failed - no interfaces in to_interfaces list!\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		goto ported_accel_bad_rule;
 	}
@@ -765,7 +784,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	}
 
 	if (rule_invalid) {
-		IPAFEWARN("%px: from/src Rule invalid\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u from/src Rule invalid\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 		goto ported_accel_bad_rule;
@@ -1030,7 +1049,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	}
 
 	if (rule_invalid) {
-		IPAFEWARN("%px: to/dest Rule invalid\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u to/dest Rule invalid\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 		goto ported_accel_bad_rule;
@@ -1058,7 +1077,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	}
 
 	if (ecm_interface_src_check) {
-		IPAFEDBG("%px: Source interface check flag is enabled\n", feci);
+		IPAFEDBG_LOW("%px: Source interface check flag is enabled\n", feci);
 		nircm->rule_flags |= IPA_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK;
 		nircm->rule_flags |= IPA_RULE_CREATE_FLAG_RETURN_SRC_INTERFACE_CHECK;
 	}
@@ -1108,7 +1127,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 
 #ifdef ECM_BRIDGE_VLAN_FILTERING_ENABLE
 	if (feci->ci->vlan_filter_valid) {
-		IPAFEDBG("%px: Bridge vlan filter is valid. Updating the create rule\n", feci);
+		IPAFEDBG_LOW("%px: Bridge vlan filter is valid. Updating the create rule\n", feci);
 		if (ecm_ipa_common_vlan_filter_set(feci->ci, &nircm->flow_vlan_filter_rule, true) &&
 			ecm_ipa_common_vlan_filter_set(feci->ci, &nircm->return_vlan_filter_rule, false)) {
 			/*
@@ -1372,7 +1391,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			nircm->direction_rule.return_accel = true;
 			feci->udp_return_dir_accel = true;
 		}
-	}	
+	}
 
 	/*
 	 * Release the interface lists
@@ -1380,7 +1399,19 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 	ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 
-	IPAFEDBG("%px: Ported Accelerate connection %px\n"
+	IPAFEDBG("%px: IPv6 ported accel conn:%px serial:%u proto:%d\n"
+			"  flow: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d iface:%u->%u\n"
+			"  xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d mac:%pM->%pM rule=%x valid=%x\n",
+			feci, feci->ci,
+			nircm->tuple.flow_rule_id, nircm->tuple.protocol,
+			ECM_IP_ADDR_TO_OCTAL(src_ip), ntohs(nircm->tuple.flow_ident),
+			ECM_IP_ADDR_TO_OCTAL(dest_ip), ntohs(nircm->tuple.return_ident),
+			nircm->conn_rule.flow_interface_num, nircm->conn_rule.return_interface_num,
+			ECM_IP_ADDR_TO_OCTAL(src_nat_ip), ntohs(nircm->conn_rule.flow_ident_xlate),
+			ECM_IP_ADDR_TO_OCTAL(dest_nat_ip), ntohs(nircm->conn_rule.return_ident_xlate),
+			nircm->conn_rule.flow_mac, nircm->conn_rule.return_mac,
+			nircm->rule_flags, nircm->valid_flags);
+	IPAFEDBG_LOW("%px: Ported Accelerate connection %px\n"
 			"Protocol: %d\n"
 			"serial:%u\n"
 			"from_mtu: %u\n"
@@ -1417,7 +1448,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			feci,
 			feci->ci,
 			nircm->tuple.protocol,
-			nircm->tuple.flow_rule_id,	
+			nircm->tuple.flow_rule_id,
 			nircm->conn_rule.flow_mtu,
 			nircm->conn_rule.return_mtu,
 			ECM_IP_ADDR_TO_OCTAL(src_ip), ntohs(nircm->tuple.flow_ident),
@@ -1453,7 +1484,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 			nircm->mark_rule.return_mark);
 
 #ifdef ECM_BRIDGE_VLAN_FILTERING_ENABLE
-	IPAFEDBG("flow_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
+	IPAFEDBG_LOW("flow_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
 			"flow_vlan_filter_egress_vlan_tag: %x, flags: %x\n"
 			"return_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
 			"return_vlan_filter_egress_vlan_tag: %x, flags: %x\n",
@@ -1464,7 +1495,7 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 #endif
 
 	if (protocol == IPPROTO_TCP) {
-		IPAFEDBG("flow_window_scale: %u\n"
+		IPAFEDBG_LOW("flow_window_scale: %u\n"
 			"flow_max_window: %u\n"
 			"flow_end: %u\n"
 			"flow_max_end: %u\n"
@@ -1494,7 +1525,10 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	 */
 	if (regen_occurrances != ecm_db_connection_regeneration_occurrances_get(feci->ci)) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_REGEN_OCCURRED);
-		IPAFEDBG("%px: connection:%px regen occurred - aborting accel rule.\n", feci, feci->ci);
+		IPAFEDBG("%px: conn:%px serial:%u IPv6 regen occurred - aborting accel " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				feci, feci->ci, nircm->tuple.flow_rule_id,
+				ECM_IP_ADDR_TO_OCTAL(src_ip), ntohs(nircm->tuple.flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(dest_ip), ntohs(nircm->tuple.return_ident));
 		ecm_ipa_ipv6_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_DECEL);
 		kfree(nim);
 		return;
@@ -1564,9 +1598,12 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	feci->stats.driver_fail_total++;
 	feci->stats.driver_fail++;
 	if (feci->stats.driver_fail >= feci->stats.driver_fail_limit) {
-		IPAFEWARN("%px: Accel failed - driver fail limit\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u Accel failed - driver fail limit\n", feci, feci->ci, nircm->tuple.flow_rule_id);
 		result_mode = ECM_FRONT_END_ACCELERATION_MODE_FAIL_DRIVER;
 	} else {
+		IPAFEWARN("%px: conn:%px IPv6 accel TX failed: %d driver_fail:%u/%u\n",
+				feci, feci->ci, ipa_tx_status,
+				feci->stats.driver_fail, feci->stats.driver_fail_limit);
 		result_mode = ECM_FRONT_END_ACCELERATION_MODE_DECEL;
 	}
 
@@ -1584,7 +1621,7 @@ ported_accel_bad_rule:
 	/*
 	 * Jump to here when rule data is bad and an offload command cannot be constructed
 	 */
-	IPAFEWARN("%px: Accel failed - bad rule\n", feci);
+	IPAFEWARN("%px: conn:%px serial:%u Accel failed - bad rule\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 	ecm_ipa_ipv6_accel_pending_clear(feci, ECM_FRONT_END_ACCELERATION_MODE_FAIL_RULE);
 	kfree(nim);
 }
@@ -1674,8 +1711,16 @@ static void ecm_ipa_ported_ipv6_connection_destroy_callback(void *app_data, stru
 
 	IPAFEDBG_LOW("%px: response: %d\n", feci, nim->cm.response);
 	if (nim->cm.response != IPA_CMN_RESPONSE_ACK) {
+		IPAFEWARN("%px: conn:%px serial:%u IPv6 decel nack: %d " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			feci, feci->ci, nirdm->tuple.flow_rule_id, nim->cm.error,
+			ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(nirdm->tuple.flow_ident),
+			ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(nirdm->tuple.return_ident));
 		feci->accel_mode = ECM_FRONT_END_ACCELERATION_MODE_FAIL_DECEL;
 	} else {
+		IPAFEDBG("%px: conn:%px serial:%u IPv6 decel ACK - now decelerated " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				feci, feci->ci, nirdm->tuple.flow_rule_id,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(nirdm->tuple.flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(nirdm->tuple.return_ident));
 		feci->accel_mode = ECM_FRONT_END_ACCELERATION_MODE_DECEL;
 	}
 
@@ -1780,14 +1825,14 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 	from_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, from_ifaces, ECM_DB_OBJ_DIR_FROM);
 	if (from_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_FROM_INTERFACES);
-		IPAFEWARN("%px: Decel attempt failed - no interfaces in from_interfaces list!\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u Decel attempt failed - no interfaces in from_interfaces list!\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 		goto ported_decel_bad_rule;
 	}
 
 	to_ifaces_first = ecm_db_connection_interfaces_get_and_ref(feci->ci, to_ifaces, ECM_DB_OBJ_DIR_TO);
 	if (to_ifaces_first == ECM_DB_IFACE_HEIRARCHY_MAX) {
 		ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_NO_TO_INTERFACES);
-		IPAFEWARN("%px: Decel attempt failed - no interfaces in to_interfaces list!\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u Decel attempt failed - no interfaces in to_interfaces list!\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		goto ported_decel_bad_rule;
 	}
@@ -2046,7 +2091,7 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 	}
 
 	if (rule_invalid) {
-		IPAFEWARN("%px: from/src Rule invalid\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u from/src Rule invalid\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 		goto ported_decel_bad_rule;
@@ -2256,7 +2301,7 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 	}
 
 	if (rule_invalid) {
-		IPAFEWARN("%px: to/dest Rule invalid\n", feci);
+		IPAFEWARN("%px: conn:%px serial:%u to/dest Rule invalid\n", feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 		ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 		goto ported_decel_bad_rule;
@@ -2344,13 +2389,23 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 	ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 	ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 
-	IPAFEDBG("%px: Ported Connection %px decelerate\n"
+	IPAFEDBG("%px: IPv6 ported decel conn:%px serial:%u proto:%d\n"
+			"  flow: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d iface:%u->%u\n"
+			"  xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d mac:%pM->%pM\n",
+			feci, feci->ci, nirdm->tuple.flow_rule_id, nirdm->tuple.protocol,
+			ECM_IP_ADDR_TO_OCTAL(src_ip), ntohs(nirdm->tuple.flow_ident),
+			ECM_IP_ADDR_TO_OCTAL(dest_ip), ntohs(nirdm->tuple.return_ident),
+			nirdm->conn_rule.flow_interface_num, nirdm->conn_rule.return_interface_num,
+			ECM_IP_ADDR_TO_OCTAL(src_nat_ip), ntohs(nirdm->conn_rule.flow_ident_xlate),
+			ECM_IP_ADDR_TO_OCTAL(dest_nat_ip), ntohs(nirdm->conn_rule.return_ident_xlate),
+			nirdm->conn_rule.flow_mac, nirdm->conn_rule.return_mac);
+	IPAFEDBG_LOW("%px: Ported Connection %px decelerate\n"
 			"protocol: %d\n"
 			"src_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
 			"dest_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
 			feci, feci->ci, nirdm->tuple.protocol,
-			ECM_IP_ADDR_TO_OCTAL(src_ip), nirdm->tuple.flow_ident,
-			ECM_IP_ADDR_TO_OCTAL(dest_ip), nirdm->tuple.return_ident);
+			ECM_IP_ADDR_TO_OCTAL(src_ip), ntohs(nirdm->tuple.flow_ident),
+			ECM_IP_ADDR_TO_OCTAL(dest_ip), ntohs(nirdm->tuple.return_ident));
 
 	/*
 	 * Take a ref to the feci->ci so that it will persist until we get a response from the IPA.
@@ -2385,6 +2440,7 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 	/*
 	 * TX failed
 	 */
+	IPAFEWARN("%px: conn:%px IPv6 decel TX failed: %d\n", feci, feci->ci, ipa_tx_status);
 	ret = ecm_front_end_destroy_failure_handle(feci);
 
 	/*
@@ -2436,6 +2492,7 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate(struct ecm_front_end_conne
 	 */
 	spin_lock_bh(&feci->lock);
 	if (!ecm_front_end_common_connection_decelerate_accel_mode_check(feci)) {
+		IPAFEDBG_LOW("%px: conn:%px IPv6 decelerate - wrong accel mode:%d\n", feci, feci->ci, feci->accel_mode);
 		spin_unlock_bh(&feci->lock);
 		return false;
 	}
@@ -2461,6 +2518,7 @@ static bool ecm_ipa_ported_ipv6_connection_defunct_callback(void *arg, int *acce
 	 * Check if the connection can be defuncted.
 	 */
 	if (!ecm_front_end_common_connection_defunct_check(feci)) {
+		IPAFEDBG_LOW("%px: conn:%px IPv6 defunct check failed mode:%d\n", feci, feci->ci, feci->accel_mode);
 		*accel_mode = feci->accel_mode;
 		spin_unlock_bh(&feci->lock);
 		return false;
@@ -2472,12 +2530,16 @@ static bool ecm_ipa_ported_ipv6_connection_defunct_callback(void *arg, int *acce
 	 * NOTE: If the mode is accel pending then the decel will be actioned when that is completed.
 	 */
 	if (!ecm_front_end_common_connection_decelerate_accel_mode_check(feci)) {
+		IPAFEDBG_LOW("%px: conn:%px IPv6 defunct decel mode check failed mode:%d\n", feci, feci->ci, feci->accel_mode);
 		*accel_mode = feci->accel_mode;
 		spin_unlock_bh(&feci->lock);
 		return false;
 	}
 	feci->accel_mode = ECM_FRONT_END_ACCELERATION_MODE_DECEL_PENDING;
 	spin_unlock_bh(&feci->lock);
+
+	IPAFEDBG("%px: conn:%px serial:%u IPv6 defunct callback - triggering decel\n",
+			feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 
 	ret = ecm_ipa_ported_ipv6_connection_decelerate_msg_send(feci);
 
@@ -2506,7 +2568,8 @@ static bool ecm_ipa_ported_ipv6_connection_defunct_callback(void *arg, int *acce
 static void ecm_ipa_ported_ipv6_connection_accel_ceased(struct ecm_front_end_connection_instance *feci)
 {
 	DEBUG_CHECK_MAGIC(feci, ECM_FRONT_END_CONNECTION_INSTANCE_MAGIC, "%px: magic failed", feci);
-	IPAFEDBG("%px: accel ceased\n", feci);
+	IPAFEDBG("%px: conn:%px serial:%u IPv6 accel ceased\n",
+			feci, feci->ci, ecm_db_connection_serial_get(feci->ci));
 
 	spin_lock_bh(&feci->lock);
 
@@ -2527,6 +2590,8 @@ static void ecm_ipa_ported_ipv6_connection_accel_ceased(struct ecm_front_end_con
 	 * If connection is no longer accelerated by the time we get here just ignore the command
 	 */
 	if (feci->accel_mode != ECM_FRONT_END_ACCELERATION_MODE_ACCEL) {
+		IPAFEDBG_LOW("%px: conn:%px IPv6 accel ceased - not in ACCEL mode:%d, ignoring\n",
+				feci, feci->ci, feci->accel_mode);
 		spin_unlock_bh(&feci->lock);
 		return;
 	}
@@ -2548,6 +2613,10 @@ static void ecm_ipa_ported_ipv6_connection_accel_ceased(struct ecm_front_end_con
 		feci->accel_mode = ECM_FRONT_END_ACCELERATION_MODE_DECEL;
 	}
 	spin_unlock_bh(&feci->lock);
+
+	IPAFEDBG("%px: conn:%px serial:%u IPv6 accel ceased - mode:%d no_action:%u/%u\n",
+			feci, feci->ci, ecm_db_connection_serial_get(feci->ci), feci->accel_mode,
+			feci->stats.no_action_seen, feci->stats.no_action_seen_limit);
 
 	/*
 	 * Ported acceleration ends

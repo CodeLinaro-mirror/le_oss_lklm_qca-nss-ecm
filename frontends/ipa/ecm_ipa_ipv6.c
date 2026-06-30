@@ -218,18 +218,17 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 * Note that we use _xlate versions for destination - for egressing connections this would be the wan IP address,
 	 * but for ingressing this would be the LAN side (non-nat'ed) address and is what we need for lookup of our connection.
 	 */
-	
-	IPAFEDBG("%px: IPA Sync, lookup connection using\n" \
+
+	IPAFEDBG_LOW("%px: IPA Sync, lookup connection using\n" \
 			"Protocol: %d\n" \
 			"src_addr: %pI6:%d\n" \
 			"dest_addr: %pI6:%d\n",
 			sync,
 			(int)sync->protocol,
-			sync->flow_ip, (int)sync->flow_ident,
-			sync->return_ip_xlate, (int)sync->return_ident_xlate);
+			sync->flow_ip, ntohs(sync->flow_ident),
+			sync->return_ip_xlate, ntohs(sync->return_ident_xlate));
 
 	ci = ecm_db_connection_serial_find_and_ref(sync->flow_rule_id);
-	
 	if (!ci) {
 		IPAFEDBG_LOW("%px: IPA Sync: no connection\n", sync);
 		return;
@@ -269,7 +268,10 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 */
 	elapsed = ecm_db_connection_elapsed_defunct_timer(ci);
         if (elapsed < 0) {
-		IPAFEDBG_LOW("%px: Defunct timer is expired or not in a valid state\n", ci);
+		IPAFEDBG("%px: conn serial:%u IPv6 defunct timer expired/invalid " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d - no further sync\n",
+				ci, sync->flow_rule_id,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(sync->return_ident));
 		ecm_db_connection_deref(ci);
 		return;
 	}
@@ -350,7 +352,10 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 		 * terminated by the ecm.
 		 * NOTE: We take no action here since that is performed by the destroy message ack.
 		 */
-		IPAFEDBG("%px: ECM initiated final sync seen: %d\n", ci, sync->reason);
+		IPAFEDBG("%px: conn serial:%u IPv6 ECM final sync reason:%d " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				ci, sync->flow_rule_id, sync->reason,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(sync->return_ident));
 
 		/*
 		 * If there is no tx/rx packets to update the other linux subsystems, we shouldn't continue
@@ -373,7 +378,10 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 		/*
 		 * IPA has ended acceleration without instruction from the ECM.
 		 */
-		IPAFEDBG("%px: IPA Initiated final sync seen: %d\n", ci, sync->reason);
+		IPAFEDBG("%px: conn serial:%u IPv6 IPA final sync reason:%d " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				ci, sync->flow_rule_id, sync->reason,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(sync->return_ident));
 
 		/*
 		 * IPA Decelerated the connection
@@ -418,7 +426,10 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 * If connection should be re-generated then we need to force a deceleration
 	 */
 	if (unlikely(ecm_db_connection_regeneration_required_peek(ci))) {
-		IPAFEDBG_LOW("%px: Connection generation changing, terminating acceleration", ci);
+		IPAFEDBG("%px: conn serial:%u IPv6 generation changing - terminating acceleration " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				ci, sync->flow_rule_id,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(sync->return_ident));
 		feci->decelerate(feci);
 	}
 

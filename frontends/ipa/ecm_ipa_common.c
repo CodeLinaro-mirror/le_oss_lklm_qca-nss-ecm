@@ -277,7 +277,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 
 				msg_v4 = (struct ipa_ipv4_msg *)kzalloc(sizeof(struct ipa_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
 				if (!msg_v4) {
-					DEBUG_WARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
+					IPAFEWARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
 					ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
 					return;
 				}
@@ -300,7 +300,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 
 				msg_v6 = (struct ipa_ipv6_msg *)kzalloc(sizeof(struct ipa_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
 				if (!msg_v6) {
-					DEBUG_WARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
+					IPAFEWARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
 					ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
 					return;
 				}
@@ -333,7 +333,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 
 				msg_v4 = (struct ipa_ipv4_msg *)kzalloc(sizeof(struct ipa_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
 				if (!msg_v4) {
-					DEBUG_WARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
+					IPAFEWARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
 					ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
 					return;
 				}
@@ -343,7 +343,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 				update_msg = &msg_v4->msg.rule_update;
 
 				if (ecm_front_end_connection_accel_state_get(feci) != ECM_FRONT_END_ACCELERATION_MODE_ACCEL) {
-					DEBUG_WARN("%px: connection is not in accelerated mode\n", feci);
+					IPAFEDBG_LOW("%px: connection is not in accelerated mode\n", feci);
 					kfree(msg_v4);
 					return;
 				}
@@ -361,7 +361,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 				update_msg->info.connmark.flow_mark = ct->mark;
 				update_msg->info.connmark.return_mark = ct->mark;
 
-				DEBUG_INFO("%px: Update the mark value for the IPA connection\n", feci);
+				IPAFEDBG_LOW("%px: Update the mark value for the IPA connection\n", feci);
 
 				ECM_IP_ADDR_TO_NIN4_ADDR(update_msg->src_ip[0], src_addr);
 				ECM_IP_ADDR_TO_NIN4_ADDR(update_msg->dest_ip[0], dest_addr);
@@ -372,7 +372,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 					return;
 				}*/
 
-				DEBUG_INFO("%px: src_ip: %pI4 dest_ip: %pI4 src_port: %d dest_port: %d protocol: %d\n",
+				IPAFEDBG_LOW("%px: src_ip: %pI4 dest_ip: %pI4 src_port: %d dest_port: %d protocol: %d\n",
 						feci, &update_msg->src_ip[0], &update_msg->dest_ip[0],
 						ntohs(update_msg->src_port), ntohs(update_msg->dest_port), update_msg->protocol);
 
@@ -395,7 +395,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 
 				msg_v6 = (struct ipa_ipv6_msg *)kzalloc(sizeof(struct ipa_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
 				if (!msg_v6) {
-					DEBUG_WARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
+					IPAFEWARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
 					ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
 					return;
 				}
@@ -405,7 +405,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 				update_msg = &msg_v6->msg.rule_update;
 
 				if (ecm_front_end_connection_accel_state_get(feci) != ECM_FRONT_END_ACCELERATION_MODE_ACCEL) {
-					DEBUG_WARN("%px: connection is not in accelerated mode\n", feci);
+					IPAFEDBG_LOW("%px: connection is not in accelerated mode\n", feci);
 					kfree(msg_v6);
 					return;
 				}
@@ -423,7 +423,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 				update_msg->info.connmark.flow_mark = ct->mark;
 				update_msg->info.connmark.return_mark = ct->mark;
 
-				DEBUG_INFO("%px: Update the mark value for the IPA connection\n", feci);
+				IPAFEDBG_LOW("%px: Update the mark value for the IPA connection\n", feci);
 
 				ECM_IP_ADDR_TO_IPA_IPV6_ADDR(update_msg->src_ip, src_addr);
 				ECM_IP_ADDR_TO_IPA_IPV6_ADDR(update_msg->dest_ip, dest_addr);
@@ -434,7 +434,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 					return;
 				}*/
 
-				DEBUG_TRACE("%px: src_ip: " ECM_IP_ADDR_OCTAL_FMT "dest_ip: " ECM_IP_ADDR_OCTAL_FMT
+				IPAFEDBG_LOW("%px: src_ip: " ECM_IP_ADDR_OCTAL_FMT "dest_ip: " ECM_IP_ADDR_OCTAL_FMT
 						" src_port: %d dest_port: %d protocol: %d\n",
 						feci, ECM_IP_ADDR_TO_OCTAL(src_addr), ECM_IP_ADDR_TO_OCTAL(dest_addr),
 						ntohs(update_msg->src_port), ntohs(update_msg->dest_port), update_msg->protocol);
@@ -470,7 +470,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 
 				msg_v4 = (struct ipa_ipv4_msg *)kzalloc(sizeof(struct ipa_ipv4_msg), GFP_ATOMIC | __GFP_NOWARN);
 				if (!msg_v4) {
-					DEBUG_WARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
+					IPAFEWARN("%px: no memory for ipa ipv4 message structure instance: %px\n", feci, feci->ci);
 					ecm_ipa_stats_v4_inc(ECM_IPA_STATS_V4_EXCEPTION_PORTED, ECM_IPA_STATS_V4_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
 					return;
 				}
@@ -479,7 +479,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 										sizeof(struct ipa_rule_update_msg), NULL, NULL);*/
 				update_msg = &msg_v4->msg.rule_update;
 
-				DEBUG_INFO("control reached to deprio in update rule \n");
+				IPAFEDBG_LOW("control reached to deprio in update rule \n");
 
 				update_msg->type = IPA_CONNECTION_MARK_TYPE_BIDIR_SAWF_MARK;
 				update_msg->info.sawf.flow_mark = msg->flow_mark;
@@ -514,7 +514,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 					return;
 				}
 
-				DEBUG_TRACE("%px: sawf flow/return mark=0x%08x/0x%08x %pI4:%u -> %pI4:%u protocol=%u\n",
+				IPAFEDBG_LOW("%px: sawf flow/return mark=0x%08x/0x%08x %pI4:%u -> %pI4:%u protocol=%u\n",
 						feci, update_msg->info.sawf.flow_mark, update_msg->info.sawf.return_mark,
 						update_msg->src_ip, ntohs(update_msg->src_port),
 						update_msg->dest_ip, ntohs(update_msg->dest_port),
@@ -539,7 +539,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 
 				msg_v6 = (struct ipa_ipv6_msg *)kzalloc(sizeof(struct ipa_ipv6_msg), GFP_ATOMIC | __GFP_NOWARN);
 				if (!msg_v6) {
-					DEBUG_WARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
+					IPAFEWARN("%px: no memory for ipa ipv6 message structure instance: %px\n", feci, feci->ci);
 					ecm_ipa_stats_v6_inc(ECM_IPA_STATS_V6_EXCEPTION_PORTED, ECM_IPA_STATS_V6_EXCEPTION_PORTED_UNIDIR_UPDATE_NO_MEM);
 					return;
 				}
@@ -548,7 +548,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 							sizeof(struct ipa_rule_update_msg), NULL, NULL);*/
 				update_msg = &msg_v6->msg.rule_update;
 
-				DEBUG_INFO("control reached to deprio in update rule \n");
+				IPAFEDBG_LOW("control reached to deprio in update rule \n");
 
 				update_msg->type = IPA_CONNECTION_MARK_TYPE_BIDIR_SAWF_MARK;
 				update_msg->info.sawf.flow_mark = msg->flow_mark;
@@ -584,7 +584,7 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 					return;
 				}
 
-				DEBUG_TRACE("%px: sawf flow/return mark=0x%08x/0x%08x %pI6c@%u -> %pI6c@%u protocol=%u\n",
+				IPAFEDBG_LOW("%px: sawf flow/return mark=0x%08x/0x%08x %pI6c@%u -> %pI6c@%u protocol=%u\n",
 						feci, update_msg->info.sawf.flow_mark, update_msg->info.sawf.return_mark,
 						update_msg->src_ip, ntohs(update_msg->src_port),
 						update_msg->dest_ip, ntohs(update_msg->dest_port),
@@ -609,11 +609,10 @@ void ecm_ipa_common_update_rule(struct ecm_front_end_connection_instance *feci, 
 		}
 		default:
 		{
-			DEBUG_WARN("%px: unsupported update rule type: %d\n", feci, type);
+			IPAFEWARN("%px: unsupported update rule type: %d\n", feci, type);
 			break;
 		}
 	}
-		
 }
 
 /*
