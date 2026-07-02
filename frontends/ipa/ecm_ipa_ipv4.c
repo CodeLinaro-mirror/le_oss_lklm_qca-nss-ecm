@@ -197,6 +197,8 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	ip_addr_t flow_ip;
 	ip_addr_t return_ip_xlate;
 	ip_addr_t return_ip;
+	ip_addr_t from_ip;
+	ip_addr_t to_ip;
 	struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
 	int aci_index;
 	int assignment_count;
@@ -205,8 +207,13 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	int return_dir;
 	int flow_ident;
 	int return_ident_xlate;
-    unsigned long int delta_jiffies;
-    int elapsed;
+	unsigned long int delta_jiffies;
+	int elapsed;
+	u32 from_rx_packet_count, to_rx_packet_count;
+	u64 from_rx_byte_count, to_rx_byte_count;
+	u32 from_tx_packet_count, to_tx_packet_count;
+	u64 from_tx_byte_count, to_tx_byte_count;
+	bool ipa_uplink_case;
 
 	/*
 	 * Look up ecm connection with a view to synchronising the connection, classifier and data tracker.
@@ -247,17 +254,52 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	IPAFEDBG_LOW("%px: Sync conn %px\n", sync, ci);
 
 	/*
+	 * IPA sets sync->flow_ip = private_ip regardless of initiator, so it does
+	 * not map to ECM FROM on DL. Fetch ECM FROM/TO once and drive direction
+	 * lookup, counter swap, mcast MFC stats and neighbour refresh off them.
+	 */
+	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_FROM, from_ip);
+	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_TO, to_ip);
+
+	/*
+	 * IPA populates sync->flow_rx/tx from the LAN side (private_ip). Downstream
+	 * ECM consumers expect flow_* to be FROM-sent, which only holds when
+	 * private_ip == ECM FROM (UL). For DL, swap flow<->return so all consumers
+	 * see FROM/TO-oriented counts.
+	 */
+	ipa_uplink_case = ECM_IP_ADDR_MATCH(flow_ip, from_ip);
+	if (ipa_uplink_case) {
+		from_rx_packet_count = sync->flow_rx_packet_count;
+		from_rx_byte_count = sync->flow_rx_byte_count;
+		to_rx_packet_count = sync->return_rx_packet_count;
+		to_rx_byte_count = sync->return_rx_byte_count;
+		from_tx_packet_count = sync->flow_tx_packet_count;
+		from_tx_byte_count = sync->flow_tx_byte_count;
+		to_tx_packet_count = sync->return_tx_packet_count;
+		to_tx_byte_count = sync->return_tx_byte_count;
+	} else {
+		from_rx_packet_count = sync->return_rx_packet_count;
+		from_rx_byte_count = sync->return_rx_byte_count;
+		to_rx_packet_count = sync->flow_rx_packet_count;
+		to_rx_byte_count = sync->flow_rx_byte_count;
+		from_tx_packet_count = sync->return_tx_packet_count;
+		from_tx_byte_count = sync->return_tx_byte_count;
+		to_tx_packet_count = sync->flow_tx_packet_count;
+		to_tx_byte_count = sync->flow_tx_byte_count;
+	}
+
+	/*
 	 * Copy the sync data to the classifier sync structure to
 	 * update the classifiers' stats.
 	 */
-	class_sync.tx_packet_count[ECM_CONN_DIR_FLOW] = sync->flow_tx_packet_count;
-	class_sync.tx_byte_count[ECM_CONN_DIR_FLOW] = sync->flow_tx_byte_count;
-	class_sync.rx_packet_count[ECM_CONN_DIR_FLOW] = sync->flow_rx_packet_count;
-	class_sync.rx_byte_count[ECM_CONN_DIR_FLOW] = sync->flow_rx_byte_count;
-	class_sync.tx_packet_count[ECM_CONN_DIR_RETURN] = sync->return_tx_packet_count;
-	class_sync.tx_byte_count[ECM_CONN_DIR_RETURN] = sync->return_tx_byte_count;
-	class_sync.rx_packet_count[ECM_CONN_DIR_RETURN] = sync->return_rx_packet_count;
-	class_sync.rx_byte_count[ECM_CONN_DIR_RETURN] = sync->return_rx_byte_count;
+	class_sync.tx_packet_count[ECM_CONN_DIR_FLOW] = from_tx_packet_count;
+	class_sync.tx_byte_count[ECM_CONN_DIR_FLOW] = from_tx_byte_count;
+	class_sync.rx_packet_count[ECM_CONN_DIR_FLOW] = from_rx_packet_count;
+	class_sync.rx_byte_count[ECM_CONN_DIR_FLOW] = from_rx_byte_count;
+	class_sync.tx_packet_count[ECM_CONN_DIR_RETURN] = to_tx_packet_count;
+	class_sync.tx_byte_count[ECM_CONN_DIR_RETURN] = to_tx_byte_count;
+	class_sync.rx_packet_count[ECM_CONN_DIR_RETURN] = to_rx_packet_count;
+	class_sync.rx_byte_count[ECM_CONN_DIR_RETURN] = to_rx_byte_count;
 	class_sync.reason = sync->reason;
 
 	/*
@@ -278,7 +320,7 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	 * return here and do not update the defunct timer and the conntrack.
 	 */
 	elapsed = ecm_db_connection_elapsed_defunct_timer(ci);
-        if (elapsed < 0) {
+	if (elapsed < 0) {
 		IPAFEDBG("%px: conn serial:%u IPv4 defunct timer expired/invalid %pI4n:%d -> %pI4n:%d - no further sync\n",
 				ci, sync->flow_rule_id,
 				&sync->flow_ip, ntohs(sync->flow_ident),
@@ -287,8 +329,8 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 		return;
 	}
 
-        DEBUG_TRACE("%px: elapsed: %d\n", ci, elapsed);
-        delta_jiffies = elapsed * HZ;
+	DEBUG_TRACE("%px: elapsed: %d\n", ci, elapsed);
+	delta_jiffies = elapsed * HZ;
 
 	/*
 	 * Keep connection alive and updated
@@ -303,49 +345,49 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	 */
 	feci = ecm_db_connection_front_end_get_and_ref(ci);
 
-	if (sync->flow_tx_packet_count || sync->return_tx_packet_count) {
+	if (from_tx_packet_count || to_tx_packet_count) {
 		IPAFEDBG_LOW("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %llu, return_rx_packet_count: %u, return_rx_byte_count: %llu\n",
 				ci, sync->flow_rx_packet_count, sync->flow_rx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
 		IPAFEDBG_LOW("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %llu, return_tx_packet_count: %u, return_tx_byte_count: %llu\n",
 				ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->return_tx_packet_count, sync->return_tx_byte_count);
 
 #ifdef ECM_MULTICAST_ENABLE
-		if (ecm_ip_addr_is_multicast(return_ip)) {
+		if (ecm_ip_addr_is_multicast(to_ip)) {
 			/*
 			 * The amount of data *sent* by the ECM multicast connection 'from' side is the amount the IPA has *received* in the 'flow' direction.
 			 */
-			ecm_db_multicast_connection_data_totals_update(ci, true, sync->flow_rx_byte_count, sync->flow_rx_packet_count);
-			ecm_db_multicast_connection_data_totals_update(ci, false, sync->return_rx_byte_count, sync->return_rx_packet_count);
-			ecm_db_multicast_connection_interface_heirarchy_stats_update(ci, sync->flow_rx_byte_count, sync->flow_rx_packet_count);
+			ecm_db_multicast_connection_data_totals_update(ci, true, from_rx_byte_count, from_rx_packet_count);
+			ecm_db_multicast_connection_data_totals_update(ci, false, to_rx_byte_count, to_rx_packet_count);
+			ecm_db_multicast_connection_interface_heirarchy_stats_update(ci, from_rx_byte_count, from_rx_packet_count);
 
 			/*
 			 * Update interface statistics
 			 */
-			ecm_interface_multicast_stats_update(ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->flow_rx_packet_count, sync->flow_rx_byte_count,
-										sync->return_tx_packet_count, sync->return_tx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
+			ecm_interface_multicast_stats_update(ci, from_tx_packet_count, from_tx_byte_count, from_rx_packet_count, from_rx_byte_count,
+										to_tx_packet_count, to_tx_byte_count, to_rx_packet_count, to_rx_byte_count);
 			/*
 			 * Update IP multicast routing cache stats
 			 */
-			ipmr_mfc_stats_update(&init_net, htonl(flow_ip[0]), htonl(return_ip[0]), sync->flow_rx_packet_count,
-										 sync->flow_rx_byte_count, sync->flow_rx_packet_count, sync->flow_rx_byte_count);
+			ipmr_mfc_stats_update(&init_net, htonl(from_ip[0]), htonl(to_ip[0]), from_rx_packet_count,
+										 from_rx_byte_count, from_rx_packet_count, from_rx_byte_count);
 		} else
 #endif
 		{
 			/*
 			 * The amount of data *sent* by the ECM connection 'from' side is the amount the IPA has *received* in the 'flow' direction.
 			 */
-			ecm_db_connection_data_totals_update(ci, true, sync->flow_rx_byte_count, sync->flow_rx_packet_count);
+			ecm_db_connection_data_totals_update(ci, true, from_rx_byte_count, from_rx_packet_count);
 
 			/*
 			 * The amount of data *sent* by the ECM connection 'to' side is the amount the IPA has *received* in the 'return' direction.
 			 */
-			ecm_db_connection_data_totals_update(ci, false, sync->return_rx_byte_count, sync->return_rx_packet_count);
+			ecm_db_connection_data_totals_update(ci, false, to_rx_byte_count, to_rx_packet_count);
 
 			/*
 			 * Update interface statistics
 			 */
-			ecm_interface_stats_update(ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->flow_rx_packet_count, sync->flow_rx_byte_count,
-							sync->return_tx_packet_count, sync->return_tx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
+			ecm_interface_stats_update(ci, from_tx_packet_count, from_tx_byte_count, from_rx_packet_count, from_rx_byte_count,
+							to_tx_packet_count, to_tx_byte_count, to_rx_packet_count, to_rx_byte_count);
 		}
 
 		/*
@@ -374,7 +416,7 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 		 * When the CT in destroy status, find ct could cause race
 		 * conditions
 		 */
-		if ((!sync->flow_tx_packet_count && !sync->return_tx_packet_count)
+		if ((!from_tx_packet_count && !to_tx_packet_count)
 				|| (ci->flags & ECM_DB_CONNECTION_FLAGS_DEFUNCT_CT_DESTROYED)) {
 			ecm_front_end_connection_deref(feci);
 			ecm_db_connection_deref(ci);
@@ -399,15 +441,18 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 		break;
 	default:
 		if (ecm_db_connection_is_routed_get(ci)) {
+			__be32 from_ip_be = htonl(from_ip[0]);
+			__be32 to_ip_be = htonl(to_ip[0]);
+
 			/*
-			 * Update the neighbour entry for source IP address
+			 * Update the neighbour entry for the ECM FROM IP address.
 			 */
-			neigh = ecm_interface_ipv4_neigh_get(flow_ip);
+			neigh = ecm_interface_ipv4_neigh_get(from_ip);
 			if (!neigh) {
-				IPAFEWARN("Neighbour entry for %pI4n not found\n", &sync->flow_ip);
+				IPAFEWARN("Neighbour entry for %pI4n not found\n", &from_ip_be);
 			} else {
-				if (sync->flow_tx_packet_count) {
-					IPAFEDBG_LOW("Neighbour entry event send for %pI4n: %px\n", &sync->flow_ip, neigh);
+				if (from_tx_packet_count) {
+					IPAFEDBG_LOW("Neighbour entry event send for %pI4n: %px\n", &from_ip_be, neigh);
 					neigh_event_send(neigh, NULL);
 				}
 
@@ -415,14 +460,14 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 			}
 
 			/*
-			 * Update the neighbour entry for destination IP address
+			 * Update the neighbour entry for the ECM TO IP address.
 			 */
-			neigh = ecm_interface_ipv4_neigh_get(return_ip);
+			neigh = ecm_interface_ipv4_neigh_get(to_ip);
 			if (!neigh) {
-				IPAFEWARN("Neighbour entry for %pI4n not found\n", &sync->return_ip);
+				IPAFEWARN("Neighbour entry for %pI4n not found\n", &to_ip_be);
 			} else {
-				if (sync->return_tx_packet_count) {
-					IPAFEDBG_LOW("Neighbour entry event send for %pI4n: %px\n", &sync->return_ip, neigh);
+				if (to_tx_packet_count) {
+					IPAFEDBG_LOW("Neighbour entry event send for %pI4n: %px\n", &to_ip_be, neigh);
 					neigh_event_send(neigh, NULL);
 				}
 
@@ -504,69 +549,85 @@ sync_conntrack:
 #endif
 	IPAFEDBG_LOW("%px: IPA Sync: conntrack connection\n", ct);
 
-	ecm_front_end_flow_and_return_directions_get(ct, flow_ip, 4, &flow_dir, &return_dir);
+	ecm_front_end_flow_and_return_directions_get(ct, from_ip, 4, &flow_dir, &return_dir);
 
 	/*
-	 * Only update if this is not a fixed timeout
+	 * sync->inc_ticks is (ts_live - ts_cached) for this entry's hardware
+	 * Time_Stamp. It is a per-entry activity flag with no direction semantics
+	 * baked in - the observed IPA behavior is that some entries (typically
+	 * TCP) may not have their Time_Stamp written back on every hit while
+	 * others (typically UDP) do. Byte/packet counters advance independently
+	 * of Time_Stamp. Gate only the ct->timeout bump on inc_ticks, and always
+	 * fall through to byte/packet accounting so we do not drop counts on
+	 * entries whose Time_Stamp did not move this sync interval.
 	 */
 	if (!test_bit(IPS_FIXED_TIMEOUT_BIT, &ct->status)) {
-
-		/*
-		 * Convert ms ticks from the IPA to jiffies. We know that inc_ticks is small
-		 * and we expect HZ to be small too so we can multiply without worrying about
-		 * wrap-around problems.  We add a rounding constant to ensure that the different
-		 * time bases don't cause truncation errors.
-		 */
-              spin_lock_bh(&ct->lock);
-              if (!(sync->inc_ticks)) {
-                        DEBUG_TRACE("sync_inc_ticks: %d\n", sync->inc_ticks);
-                        DEBUG_TRACE("udp timeouts not updated\n");
-                        spin_unlock_bh(&ct->lock);
-                        nf_ct_put(ct);
-                        return;
-                }
-
+		if (sync->inc_ticks) {
+			/*
+			 * Convert ms ticks from the IPA to jiffies. We know that inc_ticks is small
+			 * and we expect HZ to be small too so we can multiply without worrying about
+			 * wrap-around problems.  We add a rounding constant to ensure that the different
+			 * time bases don't cause truncation errors.
+			 */
+			spin_lock_bh(&ct->lock);
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0))
-		ct->timeout.expires += delta_jiffies;
+			ct->timeout.expires += delta_jiffies;
 #else
-		ct->timeout += delta_jiffies;
+			ct->timeout += delta_jiffies;
 #endif
-		spin_unlock_bh(&ct->lock);
+			spin_unlock_bh(&ct->lock);
+		} else {
+			DEBUG_TRACE("sync_inc_ticks: %d\n", sync->inc_ticks);
+			DEBUG_TRACE("udp timeouts not updated\n");
+		}
 	}
 
-	acct = nf_conn_acct_find(ct)->counter;
+	{
+		struct nf_conn_acct *ca = nf_conn_acct_find(ct);
+		acct = ca ? ca->counter : NULL;
+	}
 	if (acct) {
 		spin_lock_bh(&ct->lock);
-		atomic64_add(sync->flow_rx_packet_count, &acct[flow_dir].packets);
-		atomic64_add(sync->flow_rx_byte_count, &acct[flow_dir].bytes);
+		atomic64_add(from_rx_packet_count, &acct[flow_dir].packets);
+		atomic64_add(from_rx_byte_count, &acct[flow_dir].bytes);
 
-		atomic64_add(sync->return_rx_packet_count, &acct[return_dir].packets);
-		atomic64_add(sync->return_rx_byte_count, &acct[return_dir].bytes);
+		atomic64_add(to_rx_packet_count, &acct[return_dir].packets);
+		atomic64_add(to_rx_byte_count, &acct[return_dir].bytes);
 		spin_unlock_bh(&ct->lock);
 	}
 
 	switch (sync->protocol) {
 	case IPPROTO_TCP:
+	{
+		/*
+		 * sync->flow_ / sync->return_ TCP fields are IPA-convention (LAN side = flow).
+		 * flow_dir/return_dir are ECM-oriented; remap for DL so LAN-side values
+		 * land in the REPLY slot and WAN-side values in the ORIGINAL slot.
+		 */
+		int tcp_flow_dir = ipa_uplink_case ? flow_dir : return_dir;
+		int tcp_return_dir = ipa_uplink_case ? return_dir : flow_dir;
+
 		spin_lock_bh(&ct->lock);
-		if (ct->proto.tcp.seen[flow_dir].td_maxwin < sync->flow_max_window) {
-			ct->proto.tcp.seen[flow_dir].td_maxwin = sync->flow_max_window;
+		if (ct->proto.tcp.seen[tcp_flow_dir].td_maxwin < sync->flow_max_window) {
+			ct->proto.tcp.seen[tcp_flow_dir].td_maxwin = sync->flow_max_window;
 		}
-		if ((int32_t)(ct->proto.tcp.seen[flow_dir].td_end - sync->flow_end) < 0) {
-			ct->proto.tcp.seen[flow_dir].td_end = sync->flow_end;
+		if ((int32_t)(ct->proto.tcp.seen[tcp_flow_dir].td_end - sync->flow_end) < 0) {
+			ct->proto.tcp.seen[tcp_flow_dir].td_end = sync->flow_end;
 		}
-		if ((int32_t)(ct->proto.tcp.seen[flow_dir].td_maxend - sync->flow_max_end) < 0) {
-			ct->proto.tcp.seen[flow_dir].td_maxend = sync->flow_max_end;
+		if ((int32_t)(ct->proto.tcp.seen[tcp_flow_dir].td_maxend - sync->flow_max_end) < 0) {
+			ct->proto.tcp.seen[tcp_flow_dir].td_maxend = sync->flow_max_end;
 		}
-		if (ct->proto.tcp.seen[return_dir].td_maxwin < sync->return_max_window) {
-			ct->proto.tcp.seen[return_dir].td_maxwin = sync->return_max_window;
+		if (ct->proto.tcp.seen[tcp_return_dir].td_maxwin < sync->return_max_window) {
+			ct->proto.tcp.seen[tcp_return_dir].td_maxwin = sync->return_max_window;
 		}
-		if ((int32_t)(ct->proto.tcp.seen[return_dir].td_end - sync->return_end) < 0) {
-			ct->proto.tcp.seen[return_dir].td_end = sync->return_end;
+		if ((int32_t)(ct->proto.tcp.seen[tcp_return_dir].td_end - sync->return_end) < 0) {
+			ct->proto.tcp.seen[tcp_return_dir].td_end = sync->return_end;
 		}
-		if ((int32_t)(ct->proto.tcp.seen[return_dir].td_maxend - sync->return_max_end) < 0) {
-			ct->proto.tcp.seen[return_dir].td_maxend = sync->return_max_end;
+		if ((int32_t)(ct->proto.tcp.seen[tcp_return_dir].td_maxend - sync->return_max_end) < 0) {
+			ct->proto.tcp.seen[tcp_return_dir].td_maxend = sync->return_max_end;
 		}
 		spin_unlock_bh(&ct->lock);
+	}
 		break;
 	case IPPROTO_UDP:
 		/*
