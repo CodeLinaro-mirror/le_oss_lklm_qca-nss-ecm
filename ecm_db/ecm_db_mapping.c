@@ -385,7 +385,7 @@ int ecm_db_mapping_deref(struct ecm_db_mapping_instance *mi)
 	/*
 	 * Remove from database if inserted
 	 */
-	if ((!mi->flags) & ECM_DB_MAPPING_FLAGS_INSERTED) {
+	if (!(mi->flags & ECM_DB_MAPPING_FLAGS_INSERTED)) {
 		spin_unlock_bh(&ecm_db_lock);
 	} else {
 		struct ecm_db_listener_instance *li;
@@ -440,6 +440,7 @@ int ecm_db_mapping_deref(struct ecm_db_mapping_instance *mi)
 
 		mi->host->mapping_count--;
 #endif
+		mi->flags &= ~ECM_DB_MAPPING_FLAGS_INSERTED;
 		spin_unlock_bh(&ecm_db_lock);
 
 		/*
@@ -802,11 +803,7 @@ EXPORT_SYMBOL(ecm_db_mapping_alloc);
  */
 bool ecm_db_mapping_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("mapping_count", S_IRUGO, dentry,
-					(u32 *)&ecm_db_mapping_count)) {
-		DEBUG_ERROR("Failed to create ecm db mapping count file in debugfs\n");
-		return false;
-	}
+	ecm_debugfs_create_u32("mapping_count", S_IRUGO, dentry, (u32 *)&ecm_db_mapping_count);
 
 	ecm_db_mapping_table = vzalloc(sizeof(struct ecm_db_mapping_instance *) * ECM_DB_MAPPING_HASH_SLOTS);
 	if (!ecm_db_mapping_table) {

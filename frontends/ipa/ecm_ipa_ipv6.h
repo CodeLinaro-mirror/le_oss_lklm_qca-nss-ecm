@@ -47,13 +47,13 @@ extern struct ipa_ctx_instance *ecm_ipa_ipv6_mgr;
  */
 static inline bool ecm_ipa_ipv6_accel_pending_set(struct ecm_front_end_connection_instance *feci)
 {
-	IPAFEDBG("%px: Accel conn: %px\n", feci, feci->ci);
+	IPAFEDBG_LOW_RL("%px: Accel conn: %px\n", feci, feci->ci);
 
 	/*
 	 * If re-generation is required then we cannot permit acceleration
 	 */
 	if (ecm_db_connection_regeneration_required_peek(feci->ci)) {
-		IPAFEDBG_LOW("%px: accel %px failed - regen required\n", feci, feci->ci);
+		IPAFEDBG_LOW_RL("%px: accel %px failed - regen required\n", feci, feci->ci);
 		return false;
 	}
 
@@ -63,7 +63,7 @@ static inline bool ecm_ipa_ipv6_accel_pending_set(struct ecm_front_end_connectio
 	spin_lock_bh(&feci->lock);
 	if (ECM_FRONT_END_ACCELERATION_FAILED(feci->accel_mode)) {
 		spin_unlock_bh(&feci->lock);
-		IPAFEDBG_LOW("%px: accel %px failed\n", feci, feci->ci);
+		IPAFEDBG_LOW_RL("%px: accel %px failed\n", feci, feci->ci);
 		return false;
 	}
 
@@ -72,7 +72,8 @@ static inline bool ecm_ipa_ipv6_accel_pending_set(struct ecm_front_end_connectio
 	 */
 	if (feci->accel_mode != ECM_FRONT_END_ACCELERATION_MODE_DECEL) {
 		spin_unlock_bh(&feci->lock);
-		IPAFEDBG_LOW("%px: Ignoring wrong mode accel for conn: %px\n", feci, feci->ci);
+		IPAFEDBG_LOW_RL("%px: Ignoring wrong mode accel for conn: %px mode:%d\n",
+				feci, feci->ci, feci->accel_mode);
 		return false;
 	}
 
@@ -84,7 +85,7 @@ static inline bool ecm_ipa_ipv6_accel_pending_set(struct ecm_front_end_connectio
 		if ((ecm_ipa_ipv6_pending_accel_count + ecm_ipa_ipv6_accelerated_count) >= ipa_be_ipv6_get_max_accel_conn()) {
 			spin_unlock_bh(&ecm_ipa_ipv6_lock);
 			spin_unlock_bh(&feci->lock);
-			IPAFEDBG("%px: Accel limit reached, accel denied: %px\n", feci, feci->ci);
+			IPAFEDBG_LOW_RL("%px: Accel limit reached, accel denied: %px\n", feci, feci->ci);
 			return false;
 		}
 	}

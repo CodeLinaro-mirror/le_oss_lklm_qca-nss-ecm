@@ -445,7 +445,7 @@ static void ecm_classifier_mscs_process(struct ecm_classifier_instance *aci, ecm
 	struct ecm_classifier_mscs_rule_match_info rule_match_info = {0};
 	ecm_classifier_mscs_scs_priority_callback_t scs_cb = NULL;
 #endif
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	ip_addr_t dst_ip;
 #endif
 
@@ -514,7 +514,7 @@ static void ecm_classifier_mscs_process(struct ecm_classifier_instance *aci, ecm
 	/*
 	 * MSCS classifier is not applicable for Multicast Traffic
 	 */
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_TO, dst_ip);
 	if (ecm_ip_addr_is_multicast(dst_ip)) {
 		DEBUG_TRACE("%px: Multicast Traffic, skip MSCS / SCS classification\n", ci);
@@ -750,7 +750,9 @@ mscs_classifier_exit:
 	}
 
 	if (ECM_FRONT_END_ACCELERATION_NOT_POSSIBLE(accel_mode)) {
-		DEBUG_TRACE("%x: not relevant accel_mode: %d, this is a race condition while ae switch happens from ppe to sfe\n",feci->ci->serial, accel_mode);
+		DEBUG_TRACE("%x: not relevant accel_mode: %d,"
+				" this is a race condition while ae switch happens from ppe to sfe\n",
+				ecm_db_connection_serial_get(feci->ci), accel_mode);
 	}
 
 	/*
@@ -1502,27 +1504,26 @@ int ecm_classifier_mscs_init(struct dentry *dentry)
 		return -1;
 	}
 
-	ecm_classifier_mscs_dentry = debugfs_create_dir("ecm_classifier_mscs", dentry);
-	if (!ecm_classifier_mscs_dentry) {
+	if (!ecm_debugfs_create_dir("ecm_classifier_mscs", dentry, &ecm_classifier_mscs_dentry)) {
 		DEBUG_ERROR("Failed to create ecm mscs directory in debugfs\n");
 		unregister_sysctl_table(ecm_classifier_mscs_ctl_table_header);
 		return -1;
 	}
 
-	if (!debugfs_create_file("enabled", S_IRUGO | S_IWUSR, ecm_classifier_mscs_dentry,
+	if (!ecm_debugfs_create_file("enabled", S_IRUGO | S_IWUSR, ecm_classifier_mscs_dentry,
 				NULL, &ecm_classifier_mscs_enabled_fops)) {
 		DEBUG_ERROR("Failed to create ecm mscs classifier enabled file in debugfs\n");
 		goto init_cleanup;
 	}
 
-	if (!debugfs_create_file("multi_ap_enabled", S_IRUGO | S_IWUSR, ecm_classifier_mscs_dentry,
+	if (!ecm_debugfs_create_file("multi_ap_enabled", S_IRUGO | S_IWUSR, ecm_classifier_mscs_dentry,
 			NULL, &ecm_classifier_mscs_scs_multi_ap_enabled_fops)) {
 		DEBUG_ERROR("Failed to create multi ap enabled file in debugfs\n");
 		goto init_cleanup;
 	}
 
 #ifdef ECM_CLASSIFIER_MSCS_SCS_ENABLE
-	if (!debugfs_create_file("scs_enabled", S_IRUGO | S_IWUSR, ecm_classifier_mscs_dentry,
+	if (!ecm_debugfs_create_file("scs_enabled", S_IRUGO | S_IWUSR, ecm_classifier_mscs_dentry,
 				NULL, &ecm_classifier_scs_enabled_fops)) {
 		DEBUG_ERROR("Failed to create ecm scs classifier enabled file in debugfs\n");
 		goto init_cleanup;
@@ -1537,7 +1538,7 @@ int ecm_classifier_mscs_init(struct dentry *dentry)
 
 init_cleanup:
 
-	debugfs_remove_recursive(ecm_classifier_mscs_dentry);
+	ecm_debugfs_remove_recursive(ecm_classifier_mscs_dentry);
 	unregister_sysctl_table(ecm_classifier_mscs_ctl_table_header);
 	return -1;
 }
@@ -1558,7 +1559,7 @@ void ecm_classifier_mscs_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_classifier_mscs_dentry) {
-		debugfs_remove_recursive(ecm_classifier_mscs_dentry);
+		ecm_debugfs_remove_recursive(ecm_classifier_mscs_dentry);
 	}
 
 	/*

@@ -56,7 +56,7 @@
 #include "ecm_classifier_default.h"
 #include "ecm_db.h"
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 #define ECM_DB_MULTICAST_INSTANCE_MAGIC 0xc34a
 
 #define ECM_DB_MULTICAST_TUPLE_INSTANCE_HASH_SLOTS 16
@@ -248,6 +248,8 @@ int _ecm_db_multicast_tuple_instance_deref(struct ecm_db_multicast_tuple_instanc
 		if (ti->next) {
 			ti->next->prev = ti->prev;
 		}
+
+		ti->flags &= ~ECM_DB_MULTICAST_TUPLE_INSTANCE_FLAGS_INSERTED;
 	}
 
 	if (ti->l2_br_dev) {

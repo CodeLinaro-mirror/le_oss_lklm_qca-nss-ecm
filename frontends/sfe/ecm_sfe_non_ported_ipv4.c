@@ -160,7 +160,6 @@ void ecm_sfe_non_ported_ipv4_sit_set_peer(struct ecm_front_end_connection_instan
 static void ecm_sfe_non_ported_ipv4_connection_callback(void *app_data, struct sfe_ipv4_msg *nim)
 {
 	struct sfe_ipv4_rule_create_msg *__attribute__((unused))nircm = &nim->msg.rule_create;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 	ecm_front_end_acceleration_mode_t result_mode;
@@ -170,16 +169,17 @@ static void ecm_sfe_non_ported_ipv4_connection_callback(void *app_data, struct s
 	 * Is this a response to a create message?
 	 */
 	if (nim->cm.type != SFE_TX_CREATE_RULE_MSG) {
-		DEBUG_ERROR("%px: non_ported create callback with improper type: %d, serial: %u\n", nim, nim->cm.type, serial);
+		DEBUG_ERROR("%px: non_ported create callback with improper type: %d, serial: %u\n",
+				nim, nim->cm.type, nircm->tuple.flow_rule_id);
 		return;
 	}
 
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(nircm->tuple.flow_rule_id);
 	if (!ci) {
-		DEBUG_TRACE("%px: create callback, connection not found, serial: %u\n", nim, serial);
+		DEBUG_TRACE("%px: create callback, connection not found, serial: %u\n", nim, nircm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -204,7 +204,7 @@ static void ecm_sfe_non_ported_ipv4_connection_callback(void *app_data, struct s
 	/*
 	 * Dump some useful trace information.
 	 */
-	DEBUG_TRACE("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, serial);
+	DEBUG_TRACE("%px: accelerate response for connection: %px, serial: %u\n", feci, feci->ci, nircm->tuple.flow_rule_id);
 	DEBUG_TRACE("%px: rule_flags: %x, valid_flags: %x\n", feci, nircm->rule_flags, nircm->valid_flags);
 	DEBUG_TRACE("%px: flow_ip: %pI4h:%d\n", feci, &nircm->tuple.flow_ip, nircm->tuple.flow_ident);
 	DEBUG_TRACE("%px: return_ip: %pI4h:%d\n", feci, &nircm->tuple.return_ip, nircm->tuple.return_ident);
@@ -374,7 +374,8 @@ static void ecm_sfe_non_ported_ipv4_connection_callback(void *app_data, struct s
  */
 static void ecm_sfe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_connection_instance *feci,
                                                                         struct ecm_classifier_process_response *pr, bool is_l2_encap,
-                                                                        struct nf_conn *ct, struct sk_buff *skb)
+                                                                        struct nf_conn *ct, struct sk_buff *skb,
+									ecm_tracker_sender_type_t sender)
 {
 	uint16_t regen_occurrances;
 	int32_t from_ifaces_first;
@@ -449,6 +450,21 @@ static void ecm_sfe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 	nircm = &nim->msg.rule_create;
 	nircm->valid_flags = 0;
 	nircm->rule_flags = 0;
+	nircm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
+
+	/*
+	 * If connection is for Tunnel Outer packet, then mark same in sfe create valid flag.
+	 */
+	if (feci->ci->flags & ECM_DB_CONNECTION_FLAGS_TUNNEL_OUTER) {
+		nircm->valid_flags |= SFE_RULE_CREATE_TUNNEL_OUTER_FLOW_VALID;
+	}
+
+	/*
+	 * If connection is for Tunnel packet, either outer or inner, then mark same in sfe create valid flag.
+	 */
+	if (feci->ci->flags & ECM_DB_CONNECTION_FLAGS_TUNNEL_FLOW) {
+		nircm->valid_flags |= SFE_RULE_CREATE_TUNNEL_FLOW_VALID;
+	}
 
 	/*
 	 * Initialize VLAN tag information
@@ -519,6 +535,17 @@ static void ecm_sfe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 	 */
 	nircm->conn_rule.flow_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_FROM);
 	nircm->conn_rule.return_mtu = (uint32_t)ecm_db_connection_iface_mtu_get(feci->ci, ECM_DB_OBJ_DIR_TO);
+
+#if defined(ECM_FRONT_END_ESP_SPI_PASSTHROUGH)
+	/*
+	 * Set the SPI rule for ESP passthrough connection.
+	 */
+	if (feci->ci->flags & ECM_DB_CONNECTION_FLAGS_ESP_SPI_PASSTH) {
+		nircm->spi_rule.l_spi = ecm_db_connection_spi_get(feci->ci, ECM_DB_OBJ_DIR_FROM);
+		nircm->spi_rule.r_spi = ecm_db_connection_spi_get(feci->ci, ECM_DB_OBJ_DIR_TO);
+		nircm->rule_flags |= SFE_RULE_CREATE_FLAG_ESP_PASSTHROUGH;
+	}
+#endif
 
 	/*
 	 * Set the port information. These ports can be overwritten by the PPTP protocol values,
@@ -1332,6 +1359,7 @@ static void ecm_sfe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 
 	DEBUG_INFO("%px: Non-Ported Accelerate connection %px\n"
 			"Protocol: %u\n"
+			"serial:%u\n"
 			"from_mtu: %u\n"
 			"to_mtu: %u\n"
 			"from_ip: %pI4n:%u\n"
@@ -1365,6 +1393,7 @@ static void ecm_sfe_non_ported_ipv4_connection_accelerate(struct ecm_front_end_c
 			feci,
 			feci->ci,
 			nircm->tuple.protocol,
+			nircm->tuple.flow_rule_id,
 			nircm->conn_rule.flow_mtu,
 			nircm->conn_rule.return_mtu,
 			&nircm->tuple.flow_ip, htons(nircm->tuple.flow_ident),
@@ -1506,7 +1535,6 @@ non_ported_accel_bad_rule:
 static void ecm_sfe_non_ported_ipv4_connection_destroy_callback(void *app_data, struct sfe_ipv4_msg *nim)
 {
 	struct sfe_ipv4_rule_destroy_msg *__attribute__((unused))nirdm = &nim->msg.rule_destroy;
-	uint32_t serial = (uint32_t)(ecm_ptr_t)app_data;
 	struct ecm_db_connection_instance *ci;
 	struct ecm_front_end_connection_instance *feci;
 
@@ -1521,9 +1549,9 @@ static void ecm_sfe_non_ported_ipv4_connection_destroy_callback(void *app_data, 
 	/*
 	 * Look up ecm connection so that we can update the status.
 	 */
-	ci = ecm_db_connection_serial_find_and_ref(serial);
+	ci = ecm_db_connection_serial_find_and_ref(nirdm->tuple.flow_rule_id);
 	if (!ci) {
-		DEBUG_TRACE("%px: destroy callback, connection not found, serial: %u\n", nim, serial);
+		DEBUG_TRACE("%px: destroy callback, connection not found, serial: %u\n", nim, nirdm->tuple.flow_rule_id);
 		return;
 	}
 
@@ -1646,6 +1674,7 @@ static bool ecm_sfe_non_ported_ipv4_connection_decelerate_msg_send(struct ecm_fr
 
 	nirdm = &nim->msg.rule_destroy;
 	nirdm->tuple.protocol = (int32_t)ecm_db_connection_protocol_get(feci->ci);
+	nirdm->tuple.flow_rule_id = ecm_db_connection_serial_get(feci->ci);
 
 	/*
 	 * Get addressing information
@@ -2008,15 +2037,10 @@ struct ecm_front_end_connection_instance *ecm_sfe_non_ported_ipv4_connection_ins
 }
 
 /*
- * ecm_sfe_non_ported_ipv4_debugfs_init()
+ * ecm_sfe_non_ported_ipv4_init()
  */
-bool ecm_sfe_non_ported_ipv4_debugfs_init(struct dentry *dentry)
+void ecm_sfe_non_ported_ipv4_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("non_ported_accelerated_count", S_IRUGO, dentry,
-					(u32 *)&ecm_sfe_non_ported_ipv4_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm sfe ipv4 non_ported_accelerated_count file in debugfs\n");
-		return false;
-	}
-
-	return true;
+	ecm_debugfs_create_u32("non_ported_accelerated_count", S_IRUGO, dentry,
+				(u32 *)&ecm_sfe_non_ported_ipv4_accelerated_count);
 }

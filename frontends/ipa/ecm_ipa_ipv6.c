@@ -218,16 +218,17 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 * Note that we use _xlate versions for destination - for egressing connections this would be the wan IP address,
 	 * but for ingressing this would be the LAN side (non-nat'ed) address and is what we need for lookup of our connection.
 	 */
-	IPAFEDBG("%px: IPA Sync, lookup connection using\n" \
+
+	IPAFEDBG_LOW("%px: IPA Sync, lookup connection using\n" \
 			"Protocol: %d\n" \
-			"src_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n" \
-			"dest_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			"src_addr: %pI6:%d\n" \
+			"dest_addr: %pI6:%d\n",
 			sync,
 			(int)sync->protocol,
-			ECM_IP_ADDR_TO_OCTAL(flow_ip), (int)sync->flow_ident,
-			ECM_IP_ADDR_TO_OCTAL(return_ip_xlate), (int)sync->return_ident_xlate);
+			sync->flow_ip, ntohs(sync->flow_ident),
+			sync->return_ip_xlate, ntohs(sync->return_ident_xlate));
 
-	ci = ecm_db_connection_find_and_ref(flow_ip, return_ip_xlate, sync->protocol, (int)ntohs(sync->flow_ident), (int)ntohs(sync->return_ident_xlate));
+	ci = ecm_db_connection_serial_find_and_ref(sync->flow_rule_id);
 	if (!ci) {
 		IPAFEDBG_LOW("%px: IPA Sync: no connection\n", sync);
 		return;
@@ -267,7 +268,10 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 */
 	elapsed = ecm_db_connection_elapsed_defunct_timer(ci);
         if (elapsed < 0) {
-		IPAFEDBG_LOW("%px: Defunct timer is expired or not in a valid state\n", ci);
+		IPAFEDBG("%px: conn serial:%u IPv6 defunct timer expired/invalid " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d - no further sync\n",
+				ci, sync->flow_rule_id,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(sync->return_ident));
 		ecm_db_connection_deref(ci);
 		return;
 	}
@@ -287,9 +291,9 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	feci = ecm_db_connection_front_end_get_and_ref(ci);
 
 	if (sync->flow_tx_packet_count || sync->return_tx_packet_count) {
-		IPAFEDBG_LOW("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %u, return_rx_packet_count: %u, , return_rx_byte_count: %u\n",
+		IPAFEDBG_LOW("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %llu, return_rx_packet_count: %u, return_rx_byte_count: %llu\n",
 				ci, sync->flow_rx_packet_count, sync->flow_rx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
-		IPAFEDBG_LOW("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %u, return_tx_packet_count: %u, return_tx_byte_count: %u\n",
+		IPAFEDBG_LOW("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %llu, return_tx_packet_count: %u, return_tx_byte_count: %llu\n",
 				ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->return_tx_packet_count, sync->return_tx_byte_count);
 
 #ifdef ECM_MULTICAST_ENABLE
@@ -348,7 +352,10 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 		 * terminated by the ecm.
 		 * NOTE: We take no action here since that is performed by the destroy message ack.
 		 */
-		IPAFEDBG("%px: ECM initiated final sync seen: %d\n", ci, sync->reason);
+		IPAFEDBG("%px: conn serial:%u IPv6 ECM final sync reason:%d " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				ci, sync->flow_rule_id, sync->reason,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(sync->return_ident));
 
 		/*
 		 * If there is no tx/rx packets to update the other linux subsystems, we shouldn't continue
@@ -371,7 +378,10 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 		/*
 		 * IPA has ended acceleration without instruction from the ECM.
 		 */
-		IPAFEDBG("%px: IPA Initiated final sync seen: %d\n", ci, sync->reason);
+		IPAFEDBG("%px: conn serial:%u IPv6 IPA final sync reason:%d " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				ci, sync->flow_rule_id, sync->reason,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(sync->return_ident));
 
 		/*
 		 * IPA Decelerated the connection
@@ -416,7 +426,10 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 * If connection should be re-generated then we need to force a deceleration
 	 */
 	if (unlikely(ecm_db_connection_regeneration_required_peek(ci))) {
-		IPAFEDBG_LOW("%px: Connection generation changing, terminating acceleration", ci);
+		IPAFEDBG("%px: conn serial:%u IPv6 generation changing - terminating acceleration " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+				ci, sync->flow_rule_id,
+				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				ECM_IP_ADDR_TO_OCTAL(return_ip), ntohs(sync->return_ident));
 		feci->decelerate(feci);
 	}
 
@@ -453,6 +466,27 @@ sync_conntrack:
 	h = nf_conntrack_find_get(&init_net, &nf_ct_zone_dflt, &tuple);
 	if (!h) {
 		IPAFEWARN("%px: IPA Sync: no conntrack connection\n", sync);
+
+		/*
+		 * conntrack entry is gone but ECM may still have this connection
+		 * accelerated (e.g. if the conntrack DESTROY event was missed).
+		 * Re-look up the ECM connection and defunct it so the FST entry
+		 * and filter rules are cleaned up.
+		 */
+		ci = ecm_db_connection_find_and_ref_hash_first(flow_ip, return_ip_xlate,
+							       sync->protocol,
+							       (int)ntohs(sync->flow_ident),
+							       (int)ntohs(sync->return_ident_xlate));
+		if (ci) {
+			IPAFEWARN("%px: IPA Sync: defuncting orphaned ECM connection %px"
+				  " (conntrack gone, proto=%d src=" ECM_IP_ADDR_OCTAL_FMT
+				  ":%d dst=" ECM_IP_ADDR_OCTAL_FMT ":%d)\n",
+				  sync, ci, sync->protocol,
+				  ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
+				  ECM_IP_ADDR_TO_OCTAL(return_ip_xlate), ntohs(sync->return_ident_xlate));
+			ecm_db_connection_make_defunct(ci);
+			ecm_db_connection_deref(ci);
+		}
 		return;
 	}
 
@@ -797,7 +831,7 @@ static void ecm_ipa_ipv6_connection_sync_many_callback(void *app_data, struct ip
 		/*
 		 * We get a NACK from FW, which should not happen, restart the request
 		 */
-		IPAFEWARN("IPv4 conn stats request failed, restarting\n");
+		IPAFEWARN("IPv6 conn stats request failed, restarting\n");
 		ecm_ipa_ipv6_stats_request_nack++;
 		ecm_ipa_ipv6_sync_req_msg->msg.conn_stats_many.index = 0;
 	}
@@ -958,80 +992,55 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 
 	IPAFEDBG("ECM IPA IPv6 init\n");
 
-	ecm_ipa_ipv6_dentry = debugfs_create_dir("ecm_ipa_ipv6", dentry);
-	if (!ecm_ipa_ipv6_dentry) {
+
+	if (!ecm_debugfs_create_dir("ecm_ipa_ipv6", dentry, &ecm_ipa_ipv6_dentry)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 directory in debugfs\n");
 		return result;
 	}
 
 #ifdef CONFIG_XFRM
-	if (!ecm_debugfs_create_u32("reject_acceleration_for_ipsec", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_reject_acceleration_for_ipsec)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 reject_acceleration_for_ipsec file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("reject_acceleration_for_ipsec", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_reject_acceleration_for_ipsec);
 #endif
 
-	if (!ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_no_action_limit_default)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 no_action_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_no_action_limit_default);
+	ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_driver_fail_limit_default);
 
-	if (!ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_driver_fail_limit_default)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 driver_fail_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_nack_limit_default);
 
-	if (!ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_nack_limit_default)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 nack_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_accelerated_count);
 
-	if (!ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_accelerated_count)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 accelerated_count file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_pending_accel_count);
 
-	if (!ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_pending_accel_count)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 pending_accel_count file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
+					(u32 *)&ecm_ipa_ipv6_pending_decel_count);
 
-	if (!ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_pending_decel_count)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 pending_decel_count file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
+	if (!ecm_debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_accel_limit_mode_fops)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 accel_limit_mode file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
+	if (!ecm_debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_accel_cmd_avg_millis_fops)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 accel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
+	if (!ecm_debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_decel_cmd_avg_millis_fops)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 decel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!ecm_ipa_ported_ipv6_debugfs_init(ecm_ipa_ipv6_dentry)) {
-		IPAFEERR("Failed to create ecm ported files in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_ipa_ported_ipv6_init(ecm_ipa_ipv6_dentry);
 
-	if (!debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ipa_ipv6_dentry,
+	if (!ecm_debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_stats_request_counter_fops)) {
 		IPAFEERR("Failed to create ecm ipa ipv6 stats_request_counter file in debugfs\n");
 		goto task_cleanup;
@@ -1044,8 +1053,7 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 	}
 #endif
 
-	ecm_stats_dentry = debugfs_lookup("stats", dentry);
-	if (!ecm_stats_dentry) {
+	if (!ecm_debugfs_lookup("stats", dentry, &ecm_stats_dentry)) {
 		IPAFEERR("Stats dentry not created\n");
 		goto task_cleanup;
 	}
@@ -1081,7 +1089,7 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 
 task_cleanup:
 
-	debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
+	ecm_debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
 	return result;
 }
 EXPORT_SYMBOL(ecm_ipa_ipv6_init);
@@ -1114,7 +1122,7 @@ void ecm_ipa_ipv6_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_ipa_ipv6_dentry) {
-		debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
+		ecm_debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
 	}
 }
 EXPORT_SYMBOL(ecm_ipa_ipv6_exit);

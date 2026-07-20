@@ -1,19 +1,8 @@
 /*
  **************************************************************************
  * Copyright (c) 2014-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022, 2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
  **************************************************************************
  */
 
@@ -97,7 +86,7 @@
 #include "ecm_interface.h"
 #include "ecm_nss_common.h"
 #include "ecm_nss_ported_ipv6.h"
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 #include "ecm_nss_multicast_ipv6.h"
 #endif
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE
@@ -249,7 +238,7 @@ static inline void ecm_nss_ipv6_process_one_conn_sync_msg(struct nss_ipv6_conn_s
 			ECM_IP_ADDR_TO_OCTAL(flow_ip), (int)sync->flow_ident,
 			ECM_IP_ADDR_TO_OCTAL(return_ip), (int)sync->return_ident);
 
-	ci = ecm_db_connection_find_and_ref(flow_ip, return_ip, sync->protocol, (int)sync->flow_ident, (int)sync->return_ident);
+	ci = ecm_db_connection_find_and_ref_hash_first(flow_ip, return_ip, sync->protocol, (int)sync->flow_ident, (int)sync->return_ident);
 	if (!ci) {
 		DEBUG_TRACE("%px: NSS Sync: no connection\n", sync);
 		return;
@@ -314,7 +303,7 @@ static inline void ecm_nss_ipv6_process_one_conn_sync_msg(struct nss_ipv6_conn_s
 				ci, sync->flow_rx_packet_count, sync->flow_rx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
 		DEBUG_TRACE("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %u, return_tx_packet_count: %u, return_tx_byte_count: %u\n",
 				ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->return_tx_packet_count, sync->return_tx_byte_count);
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 		if (ecm_ip_addr_is_multicast(return_ip)) {
 			/*
 			 * The amount of data *sent* by the ECM multicast connection 'from' side is the amount the NSS has *received* in the 'flow' direction.
@@ -422,7 +411,7 @@ static inline void ecm_nss_ipv6_process_one_conn_sync_msg(struct nss_ipv6_conn_s
 				neigh_release(neigh);
 			}
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 			/*
 			 * Update the neighbour entry for destination IP address
 			 */
@@ -979,96 +968,56 @@ int ecm_nss_ipv6_init(struct dentry *dentry)
 
 	DEBUG_INFO("ECM NSS IPv6 init\n");
 
-	ecm_nss_ipv6_dentry = debugfs_create_dir("ecm_nss_ipv6", dentry);
-	if (!ecm_nss_ipv6_dentry) {
+	if (!ecm_debugfs_create_dir("ecm_nss_ipv6", dentry, &ecm_nss_ipv6_dentry)) {
 		DEBUG_ERROR("Failed to create ecm nss ipv6 directory in debugfs\n");
-		return result;
+		return -1;
 	}
 
-	if (!ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
-					(u32 *)&ecm_nss_ipv6_no_action_limit_default)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv6 no_action_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
+				(u32 *)&ecm_nss_ipv6_no_action_limit_default);
+	ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
+				(u32 *)&ecm_nss_ipv6_driver_fail_limit_default);
+	ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
+				(u32 *)&ecm_nss_ipv6_nack_limit_default);
+	ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_nss_ipv6_dentry,
+				(u32 *)&ecm_nss_ipv6_accelerated_count);
+	ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_nss_ipv6_dentry,
+				(u32 *)&ecm_nss_ipv6_pending_accel_count);
+	ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_nss_ipv6_dentry,
+				(u32 *)&ecm_nss_ipv6_pending_decel_count);
+	ecm_debugfs_create_u32("vlan_passthrough_set", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
+				(u32 *)&ecm_nss_ipv6_vlan_passthrough_enable);
 
-	if (!ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
-					(u32 *)&ecm_nss_ipv6_driver_fail_limit_default)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv6 driver_fail_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
-					(u32 *)&ecm_nss_ipv6_nack_limit_default)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv6 nack_limit_default file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_nss_ipv6_dentry,
-					(u32 *)&ecm_nss_ipv6_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv6 accelerated_count file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_nss_ipv6_dentry,
-					(u32 *)&ecm_nss_ipv6_pending_accel_count)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv6 pending_accel_count file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_nss_ipv6_dentry,
-					(u32 *)&ecm_nss_ipv6_pending_decel_count)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv6 pending_decel_count file in debugfs\n");
-		goto task_cleanup;
-	}
-
-	if (!debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
+	if (!ecm_debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
 					NULL, &ecm_nss_ipv6_accel_limit_mode_fops)) {
 		DEBUG_ERROR("Failed to create ecm nss ipv6 accel_limit_mode file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_nss_ipv6_dentry,
+	if (!ecm_debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_nss_ipv6_dentry,
 					NULL, &ecm_nss_ipv6_accel_cmd_avg_millis_fops)) {
 		DEBUG_ERROR("Failed to create ecm nss ipv6 accel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_nss_ipv6_dentry,
+	if (!ecm_debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_nss_ipv6_dentry,
 					NULL, &ecm_nss_ipv6_decel_cmd_avg_millis_fops)) {
 		DEBUG_ERROR("Failed to create ecm nss ipv6 decel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!ecm_nss_ported_ipv6_debugfs_init(ecm_nss_ipv6_dentry)) {
-		DEBUG_ERROR("Failed to create ecm ported files in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_nss_ported_ipv6_init(ecm_nss_ipv6_dentry);
 
-	if (!debugfs_create_file("stats_request_counter", S_IRUGO, ecm_nss_ipv6_dentry,
+	if (!ecm_debugfs_create_file("stats_request_counter", S_IRUGO, ecm_nss_ipv6_dentry,
 					NULL, &ecm_nss_ipv6_stats_request_counter_fops)) {
 		DEBUG_ERROR("Failed to create ecm nss ipv6 stats_request_counter file in debugfs\n");
 		goto task_cleanup;
 	}
 
-	if (!ecm_debugfs_create_u32("vlan_passthrough_set", S_IRUGO | S_IWUSR, ecm_nss_ipv6_dentry,
-					(u32 *)&ecm_nss_ipv6_vlan_passthrough_enable)) {
-		DEBUG_ERROR("Failed to create ecm nss ipv6 vlan passthrough file in debugfs\n");
-		goto task_cleanup;
-	}
-
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE
-	if (!ecm_nss_non_ported_ipv6_debugfs_init(ecm_nss_ipv6_dentry)) {
-		DEBUG_ERROR("Failed to create ecm non-ported files in debugfs\n");
-		goto task_cleanup;
-	}
+	ecm_nss_non_ported_ipv6_init(ecm_nss_ipv6_dentry);
 #endif
 
-#ifdef ECM_MULTICAST_ENABLE
-	if (!ecm_nss_multicast_ipv6_debugfs_init(ecm_nss_ipv6_dentry)) {
-		DEBUG_ERROR("Failed to create ecm multicast files in debugfs\n");
-		goto task_cleanup;
-	}
-#endif
 	/*
 	 * Register this module with the Linux NSS Network driver.
 	 * Notify manager should be registered before the netfilter hooks. Because there
@@ -1077,7 +1026,7 @@ int ecm_nss_ipv6_init(struct dentry *dentry)
 	 */
 	ecm_nss_ipv6_nss_ipv6_mgr = nss_ipv6_notify_register(ecm_nss_ipv6_net_dev_callback, NULL);
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	result = ecm_nss_multicast_ipv6_init(ecm_nss_ipv6_dentry);
 	if (result < 0) {
 		DEBUG_ERROR("Failed to init ecm ipv6 multicast frontend\n");
@@ -1093,14 +1042,14 @@ int ecm_nss_ipv6_init(struct dentry *dentry)
 	return 0;
 
 task_cleanup_2:
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	ecm_nss_multicast_ipv6_exit();
 task_cleanup_1:
 #endif
 	nss_ipv6_notify_unregister();
 
 task_cleanup:
-	debugfs_remove_recursive(ecm_nss_ipv6_dentry);
+	ecm_debugfs_remove_recursive(ecm_nss_ipv6_dentry);
 	return result;
 }
 
@@ -1125,10 +1074,10 @@ void ecm_nss_ipv6_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_nss_ipv6_dentry) {
-		debugfs_remove_recursive(ecm_nss_ipv6_dentry);
+		ecm_debugfs_remove_recursive(ecm_nss_ipv6_dentry);
 	}
 
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 	ecm_nss_multicast_ipv6_exit();
 #endif
 

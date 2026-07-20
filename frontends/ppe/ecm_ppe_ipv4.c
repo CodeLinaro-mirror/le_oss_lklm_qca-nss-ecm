@@ -205,8 +205,6 @@ static inline void ecm_ppe_ipv4_process_one_conn_sync_msg(struct ppe_drv_v4_conn
 	struct ecm_classifier_instance *assignments[ECM_CLASSIFIER_TYPES];
 	int aci_index;
 	int assignment_count;
-	int flow_ident;
-	int return_ident_xlate;
 	struct ecm_classifier_rule_sync class_sync;
 	int flow_dir;
 	int return_dir;
@@ -230,10 +228,8 @@ static inline void ecm_ppe_ipv4_process_one_conn_sync_msg(struct ppe_drv_v4_conn
 	ECM_HIN4_ADDR_TO_IP_ADDR(flow_ip, sync->flow_ip);
 	ECM_HIN4_ADDR_TO_IP_ADDR(return_ip_xlate, sync->return_ip_xlate);
 	ECM_HIN4_ADDR_TO_IP_ADDR(return_ip, sync->return_ip);
-	flow_ident = (int)sync->flow_ident;
-	return_ident_xlate = (int)sync->return_ident_xlate;
 
-	ci = ecm_db_connection_find_and_ref(flow_ip, return_ip_xlate, sync->protocol, flow_ident, return_ident_xlate);
+	ci = ecm_db_connection_serial_find_and_ref(sync->flow_rule_id);
 	if (!ci) {
 		DEBUG_TRACE("%px: PPE Sync: no connection\n", sync);
 		return;
@@ -1020,63 +1016,44 @@ int ecm_ppe_ipv4_init(struct dentry *dentry)
 		return -1;
 	}
 
-	ecm_ppe_ipv4_dentry = debugfs_create_dir("ecm_ppe_ipv4", dentry);
-	if (!ecm_ppe_ipv4_dentry) {
+	if (!ecm_debugfs_create_dir("ecm_ppe_ipv4", dentry, &ecm_ppe_ipv4_dentry)) {
 		DEBUG_ERROR("Failed to create ecm ppe ipv4 directory in debugfs\n");
 		unregister_sysctl_table(ecm_ppe_ipv4_ctl_table_header);
 		return -1;
 	}
 
-	if (!ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ppe_ipv4_dentry,
-					(u32 *)&ecm_ppe_ipv4_accelerated_count)) {
-		DEBUG_ERROR("Failed to create ecm ppe ipv4 accelerated_count file in debugfs\n");
-		goto task_cleanup_1;
-	}
+	ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ppe_ipv4_dentry,
+				(u32 *)&ecm_ppe_ipv4_accelerated_count);
+	ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ppe_ipv4_dentry,
+				(u32 *)&ecm_ppe_ipv4_pending_accel_count);
+	ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ppe_ipv4_dentry,
+				(u32 *)&ecm_ppe_ipv4_pending_decel_count);
 
-	if (!ecm_debugfs_create_u32("pending_accel_count", S_IRUGO, ecm_ppe_ipv4_dentry,
-					(u32 *)&ecm_ppe_ipv4_pending_accel_count)) {
-		DEBUG_ERROR("Failed to create ecm ppe ipv4 pending_accel_count file in debugfs\n");
-		goto task_cleanup_1;
-	}
-
-	if (!ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ppe_ipv4_dentry,
-					(u32 *)&ecm_ppe_ipv4_pending_decel_count)) {
-		DEBUG_ERROR("Failed to create ecm ppe ipv4 pending_decel_count file in debugfs\n");
-		goto task_cleanup_1;
-	}
-
-	if (!debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ppe_ipv4_dentry,
+	if (!ecm_debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ppe_ipv4_dentry,
 					NULL, &ecm_ppe_ipv4_accel_cmd_avg_millis_fops)) {
 		DEBUG_ERROR("Failed to create ecm ppe ipv4 accel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup_1;
 	}
 
-	if (!debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ppe_ipv4_dentry,
+	if (!ecm_debugfs_create_file("decel_cmd_avg_millis", S_IRUGO, ecm_ppe_ipv4_dentry,
 					NULL, &ecm_ppe_ipv4_decel_cmd_avg_millis_fops)) {
 		DEBUG_ERROR("Failed to create ecm ppe ipv4 decel_cmd_avg_millis file in debugfs\n");
 		goto task_cleanup_1;
 	}
 
-	if (!ecm_ppe_ported_ipv4_debugfs_init(ecm_ppe_ipv4_dentry)) {
-		DEBUG_ERROR("Failed to create ecm ported files in debugfs\n");
-		goto task_cleanup_1;
-	}
+	ecm_ppe_ported_ipv4_init(ecm_ppe_ipv4_dentry);
 
-	if (!debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ppe_ipv4_dentry,
+	if (!ecm_debugfs_create_file("stats_request_counter", S_IRUGO, ecm_ppe_ipv4_dentry,
 					NULL, &ecm_ppe_ipv4_stats_request_counter_fops)) {
 		DEBUG_ERROR("Failed to create ecm ppe ipv4 stats request counter file in debugfs\n");
 		goto task_cleanup_1;
 	}
 
 #ifdef ECM_NON_PORTED_SUPPORT_ENABLE
-	if (!ecm_ppe_non_ported_ipv4_debugfs_init(ecm_ppe_ipv4_dentry)) {
-		DEBUG_ERROR("Failed to create ecm non-ported files in debugfs\n");
-		goto task_cleanup_1;
-	}
+	ecm_ppe_non_ported_ipv4_init(ecm_ppe_ipv4_dentry);
 #endif
 
-	ecm_stats_dentry = debugfs_lookup("stats", dentry);
-	if (!ecm_stats_dentry) {
+	if (!ecm_debugfs_lookup("stats", dentry, &ecm_stats_dentry)) {
 		DEBUG_ERROR("Stats dentry not created\n");
 		goto task_cleanup_1;
 	}
@@ -1108,7 +1085,7 @@ task_cleanup_2:
 	ppe_drv_v4_stats_callback_unregister();
 
 task_cleanup_1:
-	debugfs_remove_recursive(ecm_ppe_ipv4_dentry);
+	ecm_debugfs_remove_recursive(ecm_ppe_ipv4_dentry);
 	unregister_sysctl_table(ecm_ppe_ipv4_ctl_table_header);
 	return -1;
 }
@@ -1135,7 +1112,7 @@ void ecm_ppe_ipv4_exit(void)
 	 * Remove the debugfs files recursively.
 	 */
 	if (ecm_ppe_ipv4_dentry) {
-		debugfs_remove_recursive(ecm_ppe_ipv4_dentry);
+		ecm_debugfs_remove_recursive(ecm_ppe_ipv4_dentry);
 	}
 
 	/*

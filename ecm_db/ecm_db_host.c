@@ -269,7 +269,7 @@ int ecm_db_host_deref(struct ecm_db_host_instance *hi)
 	/*
 	 * Remove from database if inserted
 	 */
-	if ((!hi->flags) & ECM_DB_HOST_FLAGS_INSERTED) {
+	if (!(hi->flags & ECM_DB_HOST_FLAGS_INSERTED)) {
 		spin_unlock_bh(&ecm_db_lock);
 	} else {
 		struct ecm_db_listener_instance *li;
@@ -306,6 +306,7 @@ int ecm_db_host_deref(struct ecm_db_host_instance *hi)
 		ecm_db_host_table_lengths[hi->hash_index]--;
 		DEBUG_ASSERT(ecm_db_host_table_lengths[hi->hash_index] >= 0, "%px: invalid table len %d\n", hi, ecm_db_host_table_lengths[hi->hash_index]);
 
+		hi->flags &= ~ECM_DB_HOST_FLAGS_INSERTED;
 		spin_unlock_bh(&ecm_db_lock);
 
 		/*
@@ -806,11 +807,7 @@ EXPORT_SYMBOL(ecm_db_host_alloc);
  */
 bool ecm_db_host_init(struct dentry *dentry)
 {
-	if (!ecm_debugfs_create_u32("host_count", S_IRUGO, dentry,
-					(u32 *)&ecm_db_host_count)) {
-		DEBUG_ERROR("Failed to create ecm db host count file in debugfs\n");
-		return false;;
-	}
+	ecm_debugfs_create_u32("host_count", S_IRUGO, dentry, (u32 *)&ecm_db_host_count);
 
 	ecm_db_host_table = vzalloc(sizeof(struct ecm_db_host_instance *) * ECM_DB_HOST_HASH_SLOTS);
 	if (!ecm_db_host_table) {

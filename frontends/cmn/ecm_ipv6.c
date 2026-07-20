@@ -33,7 +33,9 @@
 #include <linux/ppp_defs.h>
 #include <linux/mroute6.h>
 #include <linux/vmalloc.h>
-
+#if defined(ECM_ATH_MCAST_ENABLE)
+#include <br_private.h>
+#endif
 #include <net/ip6_tunnel.h>
 #include <linux/inetdevice.h>
 #include <linux/if_arp.h>
@@ -112,6 +114,49 @@ bool ecm_ipv6_terminate_pending = false;		/* True when the user has signalled we
 extern int register_ip_post_routing;			/* Module param to indicate if ECM should register for post routing*/
 extern int register_br_post_routing;			/* Module param to indicate if ECM should register for bridge post routing*/
 
+#if defined(ECM_ATH_MCAST_ENABLE)
+static const struct rhashtable_params ecm_v6_br_mdb_rht_params = {
+	.head_offset = offsetof(struct net_bridge_mdb_entry, rhnode),
+	.key_offset = offsetof(struct net_bridge_mdb_entry, addr),
+	.key_len = sizeof(struct br_ip),
+	.automatic_shrinking = true,
+};
+
+/*
+ * ecm_v6_br_mdb_get()
+ *	Fetch the MDB entry for the MCAST group.
+ */
+static struct net_bridge_mdb_entry *ecm_v6_br_mdb_get(struct net_bridge_mcast *brmctx, struct in6_addr origin, struct in6_addr group, u16 vid)
+{
+	struct net_bridge *br = brmctx->br;
+	struct br_ip ip;
+
+	if (!br_opt_get(br, BROPT_MULTICAST_ENABLED) ||
+		br_multicast_ctx_vlan_global_disabled(brmctx)) {
+		DEBUG_WARN("%px: Invalid Net Bridge Pointer\n", br);
+		return NULL;
+	}
+
+	memset(&ip, 0, sizeof(ip));
+	ip.proto = htons(ETH_P_IPV6);
+	ip.vid = vid;
+
+	ip.dst.ip6 = group;
+	if (brmctx->multicast_mld_version == 2) {
+		struct net_bridge_mdb_entry *mdb;
+
+		ip.src.ip6 = origin;
+		mdb = rhashtable_lookup(&br->mdb_hash_tbl, &ip, ecm_v6_br_mdb_rht_params);
+		if (mdb)
+			return mdb;
+
+		memset(&ip.src.ip6, 0, sizeof(ip.src.ip6));
+	}
+
+	return rhashtable_lookup(&br->mdb_hash_tbl, &ip, ecm_v6_br_mdb_rht_params);
+}
+#endif
+
 /*
  * ecm_ipv6_dev_has_ipaddr()
  *	Returns true if dev has an IPv6 address with greater scope than link-local
@@ -157,33 +202,119 @@ bool ecm_ipv6_dev_has_ipaddr(struct net_device *dev)
 	return false;
 }
 
+#if defined(ECM_ATH_MCAST_ENABLE)
 /*
- * ecm_ipv6_is_ns_allowed()
- *	Check if Neighbor Solicitation is allowed for a given tunnel interface.
+ * ecm_ipv6_ath_mc_bridge_get_if()
+ *      Fetch the active listeners for the multicast group.
  */
-static bool ecm_ipv6_is_ns_allowed(struct net_device *dev, struct sk_buff *skb)
+int ecm_ipv6_ath_mc_bridge_get_if(struct net_device *brdev, struct in6_addr origin, struct in6_addr group, uint32_t max_dst, uint32_t *dst_dev)
 {
-	struct ipv6hdr *iph;
-	uint8_t proto;
-
-	iph = ipv6_hdr(skb);
-	proto = iph->nexthdr;
+	struct net_bridge_mdb_entry *mdst = NULL;
+	struct net_bridge_mcast *brmctx = NULL;
+	struct net_bridge_port_group *pg = NULL;
+	struct hlist_node *rp = NULL;
+	struct net_bridge *br = NULL;
+	struct ethhdr eth;
+	bool allow_mode_include = true;
+	int if_cnt = 0;
+	u16 vid = 0;
 
 	/*
-	 * For tunnels, sending a Neighbor Solicitation while the
-	 * packet is being transmitted can lead to a deadlock.
-	 * Dont send NS frames on tunnel interface if the IP protocol is of tunnel type
+	 * Check whether the dst_dev pointer is valid.
 	 */
-	if ((dev->priv_flags_ext & IFF_EXT_ETH_L2TPV3) && (proto == IPPROTO_L2TP)) {
-		return false;
+	if (!dst_dev) {
+		DEBUG_WARN("%px:Invalid pointer to the (dst_dev) array passed\n", brdev);
+		return 0;
 	}
 
-	if ((dev->priv_flags_ext & IFF_EXT_GRE_V6_TAP) && (proto == IPPROTO_GRE)) {
-		return false;
+	/*
+	 * Fetch the Bridge Netdev pointer.
+	 */
+	br = netdev_priv(brdev);
+	if (!br) {
+		DEBUG_WARN("%px:net_bridge not found from netdevice(%s)\n", brdev, brdev->name);
+		return 0;
 	}
 
-	return true;
+	/*
+	 * Fetch the Bridge MCAST context.
+	 */
+	brmctx = &br->multicast_ctx;
+	rp = rcu_dereference(hlist_first_rcu(&brmctx->ip6_mc_router_list));
+	memset(&eth, 0, sizeof(eth));
+
+	/*
+	 * Fetch the Bridge MDB entry.
+	 */
+	mdst = ecm_v6_br_mdb_get(brmctx, origin, group, vid);
+	if (mdst) {
+		/*
+		 * Check if the querier exists.
+		 */
+		eth.h_proto = htons(ETH_P_IPV6);
+		if (!br_multicast_querier_exists(brmctx, &eth, mdst)) {
+			DEBUG_WARN("%px: Multicast Querier not exists for Bridge\n", brmctx);
+			return 0;
+		}
+
+		/*
+		 * Check if the obtained MDB is a (*,G) or (S,G) entry.
+		 */
+		pg = rcu_dereference(mdst->ports);
+		if (br_multicast_should_handle_mode(brmctx, mdst->addr.proto) && br_multicast_is_star_g(&mdst->addr))
+			allow_mode_include = false;
+	}
+
+	while (pg || rp) {
+		struct net_bridge_port *port, *lport, *rport;
+		struct net_bridge_mcast_port *mctx = NULL;
+		struct net_device *dev;
+
+		lport = pg ? pg->key.port : NULL;
+		mctx = hlist_entry_safe(rp, struct net_bridge_mcast_port, ip6_rlist);
+		rport = mctx ? mctx->port : NULL;
+
+		if ((unsigned long)lport > (unsigned long)rport) {
+			port = lport;
+
+			/*
+			 * Reject offloading the multicast flows in ECM if Linux MCUC
+			 * is enabled on any of the Tx ports.
+			 */
+			if (port->flags & BR_MULTICAST_TO_UNICAST) {
+				memset(dst_dev, 0, (sizeof(*dst_dev) * ECM_DB_MULTICAST_IF_MAX));
+				return 0;
+			}
+
+			/*
+			 * Exclude the following interface from the list.
+			 */
+			if ((!allow_mode_include && pg->filter_mode == MCAST_INCLUDE) || (pg->flags & MDB_PG_FLAGS_BLOCKED)) {
+				goto skip_port;
+			}
+		} else {
+			port = rport;
+		}
+
+		dev = port->dev;
+		dst_dev[if_cnt] = dev->ifindex;
+		if_cnt++;
+
+		if (if_cnt == max_dst)
+			return if_cnt;
+
+skip_port:
+		if ((unsigned long)lport >= (unsigned long)port)
+			pg = rcu_dereference(pg->next);
+
+		if ((unsigned long)rport >= (unsigned long)port)
+			rp = rcu_dereference(hlist_next_rcu(rp));
+	}
+
+	DEBUG_TRACE("%px: Interfaces(%d) obtained from the netdevice(%s)\n", brdev, if_cnt, brdev->name);
+	return if_cnt;
 }
+#endif
 
 /*
  * ecm_ipv6_node_establish_and_ref()
@@ -606,7 +737,7 @@ struct ecm_db_node_instance *ecm_ipv6_node_establish_and_ref(struct ecm_front_en
 					}
 					ecm_interface_send_neighbour_solicitation(master, gw_addr);
 					dev_put(master);
-				} else if (ecm_ipv6_is_ns_allowed(dev, skb)) {
+				} else if (ecm_interface_is_ns_allowed(dev, skb)) {
 					ecm_interface_send_neighbour_solicitation(dev, gw_addr);
 				}
 
@@ -1292,12 +1423,24 @@ vxlan_done:
 	}
 
 	/*
+	 * Check if we can accelerate ESP porotcol.
+	 */
+	if (ip_hdr.protocol == IPPROTO_ESP) {
+		bool inner;
+		if (!ecm_front_end_is_xfrm_flow(skb, &ip_hdr, &inner)) {
+			ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_CMN, ECM_STATS_V6_EXCEPTION_UNSUPPORTED_ESP_PASSTHROUGH);
+			DEBUG_TRACE("%px: IPsec ESP passthrough is not allowed\n", skb);
+			return NF_ACCEPT;
+		}
+	}
+
+	/*
 	 * Check for a multicast Destination address here.
 	 */
 	ECM_NIN6_ADDR_TO_IP_ADDR(ip_dest_addr, orig_tuple.dst.u3.in6);
 	if (ecm_ip_addr_is_multicast(ip_dest_addr)) {
 		DEBUG_TRACE("skb %px multicast daddr " ECM_IP_ADDR_OCTAL_FMT "\n", skb, ECM_IP_ADDR_TO_OCTAL(ip_dest_addr));
-#ifdef ECM_MULTICAST_ENABLE
+#if defined(ECM_MULTICAST_ENABLE) || defined(ECM_ATH_MCAST_ENABLE)
 		if (unlikely(ecm_front_end_ipv6_mc_stopped)) {
 			DEBUG_TRACE("%px: Multicast disabled by ecm_front_end_ipv6_mc_stopped = %d\n", skb, ecm_front_end_ipv6_mc_stopped);
 			ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_CMN, ECM_STATS_V6_EXCEPTION_MCAST_STOPPED);
@@ -2177,6 +2320,16 @@ static unsigned int ecm_ipv6_bridge_post_routing_hook(void *priv,
 		ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_CMN, ECM_STATS_V6_EXCEPTION_BRIDGE_PORT_NOT_FOUND);
 		return NF_ACCEPT;
 	}
+
+#ifdef ECM_INTERFACE_BRIDGE_ISOLATION_ENABLE
+	if (!ecm_interface_validate_bridge_sub_ids(in, out, skb)) {
+		DEBUG_TRACE("skb: %px, Bridge sub-ID validation failed\n", skb);
+		dev_put(in);
+		dev_put(bridge);
+		ecm_stats_v6_inc(ECM_STATS_V6_EXCEPTION_CMN, ECM_STATS_V6_EXCEPTION_BRIDGE_SUB_ID_MISMATCH);
+		return NF_ACCEPT;
+	}
+#endif
 
 	/*
 	 * This flag needs to be checked in slave port(eth0/ath0)
