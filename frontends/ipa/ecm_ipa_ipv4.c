@@ -957,8 +957,16 @@ static void ecm_ipa_ipv4_stats_sync_req_work(struct work_struct *work)
         		for (i = 0; i < nicsm_req->count; i++) {
     				ecm_ipa_ipv4_process_one_conn_sync_msg(&nicsm_req->conn_sync[i]);
         		}
-        		ecm_ipa_ipv4_sync_req_msg->msg.conn_stats_many.index = nicsm_req->next;
-			break;
+
+			nicsm_req->count = 0;
+			if (nicsm_req->next != 0) {
+				nicsm_req->index = nicsm_req->next;
+				queue_delayed_work(ecm_ipa_ipv4_workqueue, &ecm_ipa_ipv4_work, 0);
+			} else {
+				nicsm_req->index = 0;
+				queue_delayed_work(ecm_ipa_ipv4_workqueue, &ecm_ipa_ipv4_work, ECM_IPA_IPV4_STATS_SYNC_PERIOD);
+			}
+			return;
 		} else {
         		ecm_ipa_ipv4_stats_request_fail++;
         		retry--;
