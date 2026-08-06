@@ -172,10 +172,22 @@ static int ecm_sdx_lan_prefix_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl,
 {
 	/*
 	 * Usage:
-	 *	Get stats for particular ip
+	 *	Add a lan prefix. Writes accumulate, up to 16 entries per array,
+	 *	and a duplicate add is a no-op. A host is tracked if its address
+	 *	falls within any configured entry for its address family.
 	 *	echo ip_type ip_addr mask > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
 	 *	echo "ipv4 192.168.224.1 255.255.252.0 " > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
+	 *	echo "ippt 10.20.30.1 255.255.255.0 " > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
 	 *	echo "ipv6 2405:e700:874:7d3::/64 " > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
+	 *
+	 *	Remove a single lan prefix
+	 *	echo "del ipv4 192.168.224.1 255.255.252.0 " > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
+	 *	echo "del ippt 10.20.30.1 255.255.255.0 " > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
+	 *	echo "del ipv6 2405:e700:874:7d3::/64 " > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
+	 *
+	 *	Drop all entries of one array, or of every array
+	 *	echo "flush ipv4 " > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
+	 *	echo "flush " > /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
 	 *
 	 *	Dump lan_subnets
 	 *	cat /proc/sys/net/ecm/ecm_sdx_stats/lan_prefixes
