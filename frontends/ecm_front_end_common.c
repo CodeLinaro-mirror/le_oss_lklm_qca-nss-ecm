@@ -1638,6 +1638,11 @@ static void ecm_front_end_ported_ipv6_connection_update(struct ecm_front_end_con
 		ecm_ppe_ported_ipv6_connection_set(feci, feci->fe_info.front_end_flags);
 		break;
 #endif
+#ifdef ECM_FRONT_END_IPA_ENABLE
+	case ECM_FRONT_END_ENGINE_IPA:
+		ecm_ipa_ported_ipv6_connection_set(feci, feci->fe_info.front_end_flags);
+		break;
+#endif
 #ifdef ECM_FRONT_END_SFE_ENABLE
 	case ECM_FRONT_END_ENGINE_SFE:
 		ecm_sfe_ported_ipv6_connection_set(feci, feci->fe_info.front_end_flags);

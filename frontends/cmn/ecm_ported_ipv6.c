@@ -575,6 +575,7 @@ unsigned int ecm_ported_ipv6_process(struct net_device *out_dev, struct net_devi
 			 * to the database without accelerating the flow.
 			 */
 			flags &= ~ECM_FRONT_END_ENGINE_FLAG_CAN_ACCEL;
+			flags |= ECM_FRONT_END_ENGINE_FLAG_AE_PRECEDENCE;
 			goto precedence_alloc;
 
 		case ECM_AE_CLASSIFIER_RESULT_DONT_CARE:
@@ -582,6 +583,7 @@ unsigned int ecm_ported_ipv6_process(struct net_device *out_dev, struct net_devi
 			 * External module doesn't care about which AE is selected.
 			 * So, allocate one from the AE precedence array.
 			 */
+			flags |= ECM_FRONT_END_ENGINE_FLAG_AE_PRECEDENCE;
 			goto precedence_alloc;
 
 		default:
