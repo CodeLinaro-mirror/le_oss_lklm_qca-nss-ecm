@@ -706,7 +706,7 @@ static int ecm_classifier_wifi_deref(struct ecm_classifier_instance *ci)
  * ecm_classifier_wifi_update()
  *	Update Wi-Fi classifier related information
  */
-void ecm_classifier_wifi_update(struct ecm_classifier_instance *aci, enum ecm_rule_update_type type, void *arg)
+static void ecm_classifier_wifi_update(struct ecm_classifier_instance *aci, enum ecm_rule_update_type type, void *arg)
 {
 	struct ecm_front_end_flowsawf_msg *msg = (struct ecm_front_end_flowsawf_msg *)arg;
 	struct ecm_classifier_wifi_instance *cwifii;
