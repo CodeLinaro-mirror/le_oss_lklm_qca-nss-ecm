@@ -32,6 +32,7 @@
 #include <linux/tcp.h>
 #include <linux/kernel.h>
 #include <linux/netlink.h>
+#include <linux/etherdevice.h>	/* is_zero_ether_addr() */
 #include <linux/rtnetlink.h>
 #include <linux/socket.h>
 #include <linux/wireless.h>
@@ -10366,15 +10367,60 @@ static int ecm_interface_netevent_callback(struct notifier_block *self, unsigned
 					   void *ctx)
 {
 	struct neighbour *neigh = ctx;
+	int ipver = ECM_DB_IP_VERSION_IGNORE;
+	struct neigh_table *tbl;
+	int family = AF_UNSPEC;
 
 	if (event != NETEVENT_NEIGH_UPDATE) {
 		return NOTIFY_DONE;
 	}
 
-	if (neigh->nud_state & NUD_FAILED) {
-		DEBUG_TRACE("NUD_FAILED for mac=%pM nud_state : 0x%x", neigh->ha, neigh->nud_state);
-		ecm_interface_node_connections_defunct_by_type(neigh->ha, ECM_DB_IP_VERSION_IGNORE, ECM_DB_CONNECTION_DEFUNCT_TYPE_ARP_DELETE);
+	if (!(neigh->nud_state & NUD_FAILED)) {
+		return NOTIFY_DONE;
 	}
+
+	/*
+	 * Guard #1 — reject events where Linux never learned an L2 address.
+	 *
+	 * When a neigh transitions to NUD_FAILED without ever having a
+	 * hardware address, neigh->ha is all zeros.  Looking up ECM DB
+	 * nodes by the all-zero MAC sweeps up unrelated flows — most
+	 * damagingly the WAN-side "placeholder" node on cellular / PPP
+	 * builds, where ECM stores the L3-only iface's next-hop with
+	 * MAC 00:00:00:00:00:00.  A single v6 SLAAC probe failure then
+	 * tears down every routed IPv4 WAN flow.
+	 */
+	if (is_zero_ether_addr(neigh->ha)) {
+		DEBUG_TRACE("NUD_FAILED but neigh->ha is all-zero; "
+			    "not defuncting to avoid MAC-collision with "
+			    "L3-only interface placeholders (nud_state=0x%x)\n",
+			    neigh->nud_state);
+		return NOTIFY_DONE;
+	}
+
+	/*
+	 * Guard #2 — derive the correct IP family from the neigh's table
+	 * and only defunct connections of the same family.  A failing v6
+	 * neighbour must not tear down v4 flows and vice-versa.
+	 */
+	rcu_read_lock();
+	tbl = rcu_dereference(neigh->tbl);
+	if (tbl) {
+		family = tbl->family;
+	}
+	rcu_read_unlock();
+
+	if (family == AF_INET) {
+		ipver = ECM_DB_IP_VERSION_V4;
+	} else if (family == AF_INET6) {
+		ipver = ECM_DB_IP_VERSION_V6;
+	}
+
+	DEBUG_TRACE("NUD_FAILED for mac=%pM nud_state=0x%x ipver=%d\n",
+		    neigh->ha, neigh->nud_state, ipver);
+	ecm_interface_node_connections_defunct_by_type(
+			neigh->ha, ipver,
+			ECM_DB_CONNECTION_DEFUNCT_TYPE_ARP_DELETE);
 
 	return NOTIFY_DONE;
 }
