@@ -39,9 +39,33 @@
 DEFINE_SPINLOCK(ecm_sdx_stats_db_lock);			/* Protect the hash table using lock */
 
 /*
+ * Locking of the lan prefix arrays - concurrency control.
+ * The prefix arrays are read by the host matching path, which runs from the
+ * db listener callbacks in softirq context, and written by the lan_prefixes
+ * sysctl handler in process context. This lock is kept separate from
+ * ecm_sdx_stats_db_lock so that the two are never nested.
+ */
+DEFINE_SPINLOCK(ecm_sdx_stats_prefix_lock);		/* Protect the lan prefix arrays */
+
+/*
  * Max message size
  */
 #define ECM_SDX_STATS_MSG_SIZE 600
+
+/*
+ * Max number of lan prefixes tracked per address family.
+ */
+#define ECM_SDX_STATS_MAX_LAN_PREFIX 16
+
+/*
+ * Max lan_prefixes message size.
+ * Worst case is one line per entry for each of the three arrays, where a line
+ * is "ipv4_ippt[15] ip_addr=<40 char addr> prefix=<40 char mask>\n", plus a
+ * count header per array.
+ */
+#define ECM_SDX_STATS_LAN_PREFIX_LINE_SIZE 128
+#define ECM_SDX_STATS_LAN_PREFIX_MSG_SIZE \
+	((3 * ECM_SDX_STATS_MAX_LAN_PREFIX * ECM_SDX_STATS_LAN_PREFIX_LINE_SIZE) + 256)
 
 /*
  * Max per_client message size
@@ -92,16 +116,38 @@ struct ecm_sdx_stats_ipv6_lan_prefix {
 };
 
 /*
+ * Prefix array selector for the lan_prefixes operations.
+ */
+enum ecm_sdx_stats_prefix_type {
+	ECM_SDX_STATS_PREFIX_TYPE_V4,		/* v4 lan subnets */
+	ECM_SDX_STATS_PREFIX_TYPE_V6,		/* v6 lan prefixes */
+	ECM_SDX_STATS_PREFIX_TYPE_IPPT_V4,	/* v4 subnets for ippt */
+	ECM_SDX_STATS_PREFIX_TYPE_MAX,
+};
+
+/*
  * ecm_sdx_stats_info_instance structure
  */
 struct ecm_sdx_stats_info_instance {
-	uint8_t num_of_pack_stat_nodes_v4;			/* number of v4 host entries */
-	uint8_t num_of_pack_stat_nodes_v6;			/* number of v6 host entries */
+	uint16_t num_of_pack_stat_nodes_v4;			/* number of v4 host entries */
+	uint16_t num_of_pack_stat_nodes_v6;			/* number of v6 host entries */
 	ip_addr_t per_ip_address;				/* ip for per ip client stats */
 	ecm_db_iface_type_t packet_stats_iface_type;		/* iface_type on which call is up */
-	struct ecm_sdx_stats_ipv4_lan_prefix v4_prefix;		/* v4 subnet information */
-	struct ecm_sdx_stats_ipv6_lan_prefix v6_prefix;		/* v6 prefix information */
-	struct ecm_sdx_stats_ipv4_lan_prefix ippt_v4_prefix;	/* v4 subnet information for ippt*/
+
+	/*
+	 * Lan prefix arrays. A host is tracked if its address falls within any
+	 * configured entry of the array for its address family. Entries are kept
+	 * packed in [0, count) so the matching loops are bounded by the count.
+	 */
+	struct ecm_sdx_stats_ipv4_lan_prefix
+		v4_prefix[ECM_SDX_STATS_MAX_LAN_PREFIX];	/* v4 subnet information */
+	uint8_t v4_prefix_count;				/* configured v4 subnets */
+	struct ecm_sdx_stats_ipv6_lan_prefix
+		v6_prefix[ECM_SDX_STATS_MAX_LAN_PREFIX];	/* v6 prefix information */
+	uint8_t v6_prefix_count;				/* configured v6 prefixes */
+	struct ecm_sdx_stats_ipv4_lan_prefix
+		ippt_v4_prefix[ECM_SDX_STATS_MAX_LAN_PREFIX];	/* v4 subnet information for ippt*/
+	uint8_t ippt_v4_prefix_count;				/* configured ippt v4 subnets */
 };
 
 /*
@@ -279,109 +325,128 @@ static void ecm_sdx_stats_remove_host_stats(ip_addr_t host_ip)
 }
 
 /*
- * ecm_sdx_stats_is_valid_lan_prefix()
- * 	Check if host ip is in same subnet as lan prefixes.
+ * ecm_sdx_stats_ipv4_prefix_match()
+ *	Check if host ip falls within a single v4 prefix entry.
+ *
+ * The stored prefix is a raw AND mask, not a cidr length.
+ * Must be called with ecm_sdx_stats_prefix_lock held.
  */
-static bool ecm_sdx_stats_is_valid_lan_prefix(ip_addr_t host_ip)
+static bool ecm_sdx_stats_ipv4_prefix_match(ip_addr_t host_ip,
+			struct ecm_sdx_stats_ipv4_lan_prefix *entry)
 {
-	int prefix, full_prefixes;
-	int remaining_bits;
+	if ((host_ip[0] & entry->prefix) != (entry->ip_addr[0] & entry->prefix)) {
+		return false;
+	}
+
+	DEBUG_TRACE("In lan_prefix ip=%u,host_ip=%u,mask1=%u,mask2=%u\n",
+		*(entry->ip_addr),
+		*(host_ip),
+		host_ip[0] & entry->prefix,
+		entry->ip_addr[0] & entry->prefix);
+	return true;
+}
+
+/*
+ * ecm_sdx_stats_ipv6_prefix_match()
+ *	Check if host ip falls within a single v6 prefix entry.
+ *
+ * The stored prefix is a cidr length. ip_addr_t holds the most significant
+ * group at index 3, so the full words are walked downwards from index 3 and
+ * any leftover bits are compared with a mask on the next word down, which is
+ * at index 3 - full_prefixes.
+ * Must be called with ecm_sdx_stats_prefix_lock held.
+ */
+static bool ecm_sdx_stats_ipv6_prefix_match(ip_addr_t host_ip,
+			struct ecm_sdx_stats_ipv6_lan_prefix *entry)
+{
 	int total_prefixes = 4;
-	bool full_prefixes_matched = true;
-	bool remaining_bits_matched = false;
+	int prefix = entry->prefix;
+	int full_prefixes = prefix / 32;
+	int remaining_bits = prefix % 32;
+	int partial_idx;
 	uint32_t mask;
-	bool ippt_prefix_null = true;
 
-	if(ECM_IP_ADDR_IS_V4(host_ip)) {
-		DEBUG_TRACE("validate ipv4 host prefix ip=%u", *(host_ip));
-		if(ECM_IP_ADDR_IS_NULL(ecm_sdx_stats_instance->v4_prefix.ip_addr)) {
-			DEBUG_ERROR("NULL ipv4 lan prefix found");
+	DEBUG_TRACE("In lan_prefix full_prefixes=%d, remaining=%d",
+		full_prefixes, remaining_bits);
+
+	for (int prefix_idx = 3; prefix_idx >= (total_prefixes - full_prefixes); prefix_idx--) {
+		DEBUG_TRACE("validate ipv6 host subnet prefix_idx=%u, h_pre=%u, s_pre=%u",
+			prefix_idx, host_ip[prefix_idx], entry->ip_addr[prefix_idx]);
+		if (host_ip[prefix_idx] != entry->ip_addr[prefix_idx]) {
+			DEBUG_TRACE("In lan_prefix prefix=%d,ip_addr=%u,host_ip=%u \n",
+				prefix, entry->ip_addr[prefix_idx], host_ip[prefix_idx]);
 			return false;
-		}
-
-		if(!ECM_IP_ADDR_IS_NULL(ecm_sdx_stats_instance->ippt_v4_prefix.ip_addr)) {
-			DEBUG_ERROR("ippt lan prefix is not NULL");
-			ippt_prefix_null = false;
-		}
-
-		if((host_ip[0] & ecm_sdx_stats_instance->v4_prefix.prefix) ==
-			(ecm_sdx_stats_instance->v4_prefix.ip_addr[0] &
-			ecm_sdx_stats_instance->v4_prefix.prefix)) {
-			DEBUG_TRACE("In lan_prefix ip=%u,host_ip=%u,mask1=%u,mask2=%u\n",
-				*(ecm_sdx_stats_instance->v4_prefix.ip_addr),
-				*(host_ip),
-				host_ip[0] & ecm_sdx_stats_instance->v4_prefix.prefix,
-				(ecm_sdx_stats_instance->v4_prefix.ip_addr[0] &
-				ecm_sdx_stats_instance->v4_prefix.prefix));
-			return true;
-		}
-
-		if(!ippt_prefix_null &&
-			(host_ip[0] & ecm_sdx_stats_instance->ippt_v4_prefix.prefix) ==
-			(ecm_sdx_stats_instance->ippt_v4_prefix.ip_addr[0] &
-			ecm_sdx_stats_instance->ippt_v4_prefix.prefix))
-		{
-			DEBUG_TRACE("In ippt_lan_prefix ip=%u,host_ip=%u,mask1=%u,mask2=%u\n",
-				*(ecm_sdx_stats_instance->ippt_v4_prefix.ip_addr),
-				*(host_ip),
-				host_ip[0] & ecm_sdx_stats_instance->ippt_v4_prefix.prefix,
-				(ecm_sdx_stats_instance->ippt_v4_prefix.ip_addr[0] &
-				ecm_sdx_stats_instance->ippt_v4_prefix.prefix));
-			return true;
-		}
-	} else {
-		if(ECM_IP_ADDR_IS_NULL(ecm_sdx_stats_instance->v6_prefix.ip_addr)) {
-			DEBUG_ERROR("NULL lan ip found");
-			return false;
-		}
-
-		DEBUG_TRACE("validate ipv6 host subnet ip=%u", *(host_ip));
-		full_prefixes_matched = true;
-		remaining_bits_matched = true;
-		prefix = ecm_sdx_stats_instance->v6_prefix.prefix;
-		full_prefixes = prefix / 32;
-		remaining_bits = prefix % 32;
-		DEBUG_TRACE("In lan_prefix full_prefixes=%d, remaining=%d",
-			full_prefixes, remaining_bits);
-		for (int prefix_idx = 3; prefix_idx >= (total_prefixes - full_prefixes); prefix_idx--) {
-			DEBUG_TRACE("validate ipv6 host subnet prefix_idx=%u, h_pre=%u, s_pre=%u",
-			prefix_idx,
-			host_ip[prefix_idx], ecm_sdx_stats_instance->v6_prefix.ip_addr[prefix_idx]);
-			if((host_ip[prefix_idx] !=
-				ecm_sdx_stats_instance->v6_prefix.ip_addr[prefix_idx])) {
-				DEBUG_TRACE("In lan_prefix prefix=%d,ip_addr=%u,host_ip=%u \n",
-					prefix,
-					ecm_sdx_stats_instance->v6_prefix.ip_addr[prefix_idx],
-					host_ip[prefix_idx]);
-				full_prefixes_matched = false;
-				remaining_bits_matched = false;
-				break;
-			}
-		}
-
-		if(full_prefixes_matched && remaining_bits > 0) {
-			mask = (~0U << (32 - remaining_bits));
-			DEBUG_TRACE("host remaning ip_addr=%u,host_ip=%u \n",
-					ecm_sdx_stats_instance->v6_prefix.ip_addr[full_prefixes],
-					host_ip[full_prefixes]);
-			if((host_ip[full_prefixes] & mask) !=
-			(ecm_sdx_stats_instance->v6_prefix.ip_addr[full_prefixes] & mask)) {
-				DEBUG_TRACE("host prefix remaning didn't match db_ip=%u,host_ip=%u \n",
-					ecm_sdx_stats_instance->v6_prefix.ip_addr[full_prefixes],
-				host_ip[full_prefixes]);
-				remaining_bits_matched = false;
-			}
-		}
-
-		if(remaining_bits_matched) {
-			DEBUG_TRACE("host is in lan_prefix ip=%u,host_ip=%u\n",
-				*(ecm_sdx_stats_instance->v6_prefix.ip_addr),
-				*(host_ip));
-			return true;
 		}
 	}
 
-	return false;
+	if (remaining_bits > 0) {
+		partial_idx = 3 - full_prefixes;
+		mask = (~0U << (32 - remaining_bits));
+		DEBUG_TRACE("host remaning ip_addr=%u,host_ip=%u \n",
+			entry->ip_addr[partial_idx], host_ip[partial_idx]);
+		if ((host_ip[partial_idx] & mask) !=
+			(entry->ip_addr[partial_idx] & mask)) {
+			DEBUG_TRACE("host prefix remaning didn't match db_ip=%u,host_ip=%u \n",
+				entry->ip_addr[partial_idx], host_ip[partial_idx]);
+			return false;
+		}
+	}
+
+	DEBUG_TRACE("host is in lan_prefix ip=%u,host_ip=%u\n",
+		*(entry->ip_addr), *(host_ip));
+	return true;
+}
+
+/*
+ * ecm_sdx_stats_is_valid_lan_prefix()
+ * 	Check if host ip is in same subnet as any of the configured lan prefixes.
+ *
+ * A v4 host is matched against the lan subnets first and then against the ippt
+ * subnets. The two arrays are independent, so an ippt only configuration is
+ * valid. An empty array matches nothing, so a host is rejected when no prefix
+ * has been configured for its address family.
+ */
+static bool ecm_sdx_stats_is_valid_lan_prefix(ip_addr_t host_ip)
+{
+	bool matched = false;
+	uint8_t i;
+
+	spin_lock_bh(&ecm_sdx_stats_prefix_lock);
+
+	if(ECM_IP_ADDR_IS_V4(host_ip)) {
+		DEBUG_TRACE("validate ipv4 host prefix ip=%u", *(host_ip));
+
+		for (i = 0; i < ecm_sdx_stats_instance->v4_prefix_count; i++) {
+			if (ecm_sdx_stats_ipv4_prefix_match(host_ip,
+					&ecm_sdx_stats_instance->v4_prefix[i])) {
+				matched = true;
+				goto done;
+			}
+		}
+
+		for (i = 0; i < ecm_sdx_stats_instance->ippt_v4_prefix_count; i++) {
+			if (ecm_sdx_stats_ipv4_prefix_match(host_ip,
+					&ecm_sdx_stats_instance->ippt_v4_prefix[i])) {
+				DEBUG_TRACE("host is in ippt_lan_prefix idx=%u\n", i);
+				matched = true;
+				goto done;
+			}
+		}
+	} else {
+		DEBUG_TRACE("validate ipv6 host subnet ip=%u", *(host_ip));
+
+		for (i = 0; i < ecm_sdx_stats_instance->v6_prefix_count; i++) {
+			if (ecm_sdx_stats_ipv6_prefix_match(host_ip,
+					&ecm_sdx_stats_instance->v6_prefix[i])) {
+				matched = true;
+				goto done;
+			}
+		}
+	}
+
+done:
+	spin_unlock_bh(&ecm_sdx_stats_prefix_lock);
+	return matched;
 }
 
 /*
@@ -632,8 +697,8 @@ int ecm_sdx_stats_handler_read(void *buffer, size_t *lenp, loff_t *ppos)
 	char sip_addr[ECM_IP_ADDR_STR_BUFF_SIZE] = {0};
 	uint64_t rx_bytes = 0;
 	uint64_t tx_bytes = 0;
-	uint8_t num_connections_v4 = 0;
-	uint8_t num_connections_v6 = 0;
+	uint16_t num_connections_v4 = 0;
+	uint16_t num_connections_v6 = 0;
 	uint32_t ip6[4];
 	int bkt = 0;
 	int bytes = 0;
@@ -678,9 +743,9 @@ int ecm_sdx_stats_handler_read(void *buffer, size_t *lenp, loff_t *ppos)
 			if (ECM_IP_ADDR_IS_V4(curr->host_instance.client_src_addr)) {
 				len = snprintf(read_buf + bytes, ECM_SDX_STATS_PER_CLIENT_MSG_SIZE,
 				"\t\t\t<ipv4 "
-				"client_addr=\"%pI4\" "
+				"client_addr=\"%s\" "
 				"rx_bytes=\"%llu\" tx_bytes=\"%llu\" />\n",
-				&curr->host_instance.client_src_addr,
+				sip_addr,
 				rx_bytes, tx_bytes);
 			} else {
 				ECM_IP_ADDR_TO_NET_IPV6_ADDR(ip6,
@@ -802,9 +867,9 @@ int ecm_sdx_stats_per_client_handler_read(void *buffer, size_t *lenp, loff_t *pp
 			if (ECM_IP_ADDR_IS_V4(curr->host_instance.client_src_addr)) {
 				len = snprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE,
 				"\t\t\t<ipv4 "
-				"client_addr=\"%pI4\" "
+				"client_addr=\"%s\" "
 				"rx_bytes=\"%llu\" tx_bytes=\"%llu\" />\n",
-				&curr->host_instance.client_src_addr,
+				sip_addr,
 				rx_bytes, tx_bytes);
 			} else {
 				ECM_IP_ADDR_TO_NET_IPV6_ADDR(ip6,
@@ -931,6 +996,42 @@ int ecm_sdx_stats_interface_type_handler_read(void *buffer, size_t *lenp, loff_t
 }
 
 /*
+ * ecm_sdx_stats_prefix_flush()
+ *	Drop all entries from one or all lan prefix arrays.
+ *
+ * Passing ECM_SDX_STATS_PREFIX_TYPE_MAX flushes every array.
+ */
+static void ecm_sdx_stats_prefix_flush(enum ecm_sdx_stats_prefix_type type)
+{
+	spin_lock_bh(&ecm_sdx_stats_prefix_lock);
+
+	if (type == ECM_SDX_STATS_PREFIX_TYPE_V4 ||
+		type == ECM_SDX_STATS_PREFIX_TYPE_MAX) {
+		memset(ecm_sdx_stats_instance->v4_prefix, 0,
+			sizeof(ecm_sdx_stats_instance->v4_prefix));
+		ecm_sdx_stats_instance->v4_prefix_count = 0;
+	}
+
+	if (type == ECM_SDX_STATS_PREFIX_TYPE_V6 ||
+		type == ECM_SDX_STATS_PREFIX_TYPE_MAX) {
+		memset(ecm_sdx_stats_instance->v6_prefix, 0,
+			sizeof(ecm_sdx_stats_instance->v6_prefix));
+		ecm_sdx_stats_instance->v6_prefix_count = 0;
+	}
+
+	if (type == ECM_SDX_STATS_PREFIX_TYPE_IPPT_V4 ||
+		type == ECM_SDX_STATS_PREFIX_TYPE_MAX) {
+		memset(ecm_sdx_stats_instance->ippt_v4_prefix, 0,
+			sizeof(ecm_sdx_stats_instance->ippt_v4_prefix));
+		ecm_sdx_stats_instance->ippt_v4_prefix_count = 0;
+	}
+
+	spin_unlock_bh(&ecm_sdx_stats_prefix_lock);
+	DEBUG_INFO("flushed lan prefixes type=%d\n", type);
+}
+
+
+/*
  * ecm_sdx_stats_interface_type_handler_write()
  *	Proc handler function for write operation on packet_stats_interface.
  */
@@ -940,7 +1041,6 @@ int ecm_sdx_stats_interface_type_handler_write(void *buffer, size_t *lenp)
 	char *pfree;
 	char *token;
 	int count;
-	ip_addr_t temp_ip = ECM_IP_ADDR_NULL;
 
 	count = *lenp;
 	buf = kzalloc(ECM_SDX_STATS_MAX_INTERFACE_SIZE * sizeof(char), GFP_KERNEL);
@@ -971,9 +1071,13 @@ int ecm_sdx_stats_interface_type_handler_write(void *buffer, size_t *lenp)
 			ecm_sdx_stats_instance->packet_stats_iface_type = ECM_DB_IFACE_TYPE_COUNT;
 			DEBUG_TRACE("iface_type=%d \n",
 					ecm_sdx_stats_instance->packet_stats_iface_type);
-			ECM_IP_ADDR_COPY(ecm_sdx_stats_instance->v4_prefix.ip_addr, temp_ip);
-			ECM_IP_ADDR_COPY(ecm_sdx_stats_instance->v6_prefix.ip_addr, temp_ip);
-			ECM_IP_ADDR_COPY(ecm_sdx_stats_instance->ippt_v4_prefix.ip_addr, temp_ip);
+
+			/*
+			 * Drop every configured prefix on backhaul teardown. Writes to
+			 * lan_prefixes accumulate, so without this the arrays would
+			 * retain stale subnets across teardowns until they filled up.
+			 */
+			ecm_sdx_stats_prefix_flush(ECM_SDX_STATS_PREFIX_TYPE_MAX);
 		} else {
 			goto fail;
 		}
@@ -989,101 +1093,253 @@ fail:
 	return -EINVAL;
 }
 
-/*
- * ecm_sdx_stats_update_lan_prefix()
- *	Proc handler function for packet_stats_interface read/write operation.
- */
-static void ecm_sdx_stats_update_lan_prefix(ip_addr_t ip, uint32_t prefix,
-			bool ipv4, bool ippt_enabled)
-{
-	char ip_addr[ECM_IP_ADDR_STR_BUFF_SIZE] = {0};
 
-	if (ipv4) {
-		if(ippt_enabled) {
-			ECM_IP_ADDR_COPY(ecm_sdx_stats_instance->ippt_v4_prefix.ip_addr, ip);
-			ecm_sdx_stats_instance->ippt_v4_prefix.prefix = prefix;
-			ecm_ip_addr_to_string(ip_addr,
-					ecm_sdx_stats_instance->ippt_v4_prefix.ip_addr);
-			DEBUG_INFO("ip=%s, subnet=%u\n",
-				ip_addr,
-				ecm_sdx_stats_instance->ippt_v4_prefix.prefix);
-		} else {
-			ECM_IP_ADDR_COPY(ecm_sdx_stats_instance->v4_prefix.ip_addr, ip);
-			ecm_sdx_stats_instance->v4_prefix.prefix = prefix;
-			ecm_ip_addr_to_string(ip_addr,ecm_sdx_stats_instance->v4_prefix.ip_addr);
-			DEBUG_INFO("ip=%s, subnet=%u\n",
-				ip_addr,
-				ecm_sdx_stats_instance->v4_prefix.prefix);
+/*
+ * ecm_sdx_stats_ipv4_prefix_add()
+ *	Add a v4 subnet to the lan or ippt array.
+ *
+ * A duplicate add is ignored so that repeated writes for an unchanged profile
+ * do not consume slots. Returns -ENOSPC when the array is full.
+ */
+static int ecm_sdx_stats_ipv4_prefix_add(ip_addr_t ip, uint32_t prefix, bool ippt_enabled)
+{
+	struct ecm_sdx_stats_ipv4_lan_prefix *arr;
+	char ip_addr[ECM_IP_ADDR_STR_BUFF_SIZE] = {0};
+	uint8_t *count;
+	int ret = 0;
+	uint8_t i;
+
+	spin_lock_bh(&ecm_sdx_stats_prefix_lock);
+
+	if (ippt_enabled) {
+		arr = ecm_sdx_stats_instance->ippt_v4_prefix;
+		count = &ecm_sdx_stats_instance->ippt_v4_prefix_count;
+	} else {
+		arr = ecm_sdx_stats_instance->v4_prefix;
+		count = &ecm_sdx_stats_instance->v4_prefix_count;
+	}
+
+	for (i = 0; i < *count; i++) {
+		if (ECM_IP_ADDR_MATCH(arr[i].ip_addr, ip) && arr[i].prefix == prefix) {
+			DEBUG_TRACE("duplicate v4 prefix ignored idx=%u ippt=%d\n",
+				i, ippt_enabled);
+			goto done;
+		}
+	}
+
+	if (*count == ECM_SDX_STATS_MAX_LAN_PREFIX) {
+		DEBUG_WARN("v4 prefix array full ippt=%d, max=%d\n",
+			ippt_enabled, ECM_SDX_STATS_MAX_LAN_PREFIX);
+		ret = -ENOSPC;
+		goto done;
+	}
+
+	ECM_IP_ADDR_COPY(arr[*count].ip_addr, ip);
+	arr[*count].prefix = prefix;
+	(*count)++;
+
+	ecm_ip_addr_to_string(ip_addr, ip);
+	DEBUG_INFO("added ipv4 prefix ip=%s, subnet=%u, ippt=%d, count=%u\n",
+		ip_addr, prefix, ippt_enabled, *count);
+done:
+	spin_unlock_bh(&ecm_sdx_stats_prefix_lock);
+	return ret;
+}
+
+/*
+ * ecm_sdx_stats_ipv6_prefix_add()
+ *	Add a v6 prefix to the lan array.
+ *
+ * A duplicate add is ignored so that repeated writes for an unchanged profile
+ * do not consume slots. Returns -ENOSPC when the array is full.
+ */
+static int ecm_sdx_stats_ipv6_prefix_add(ip_addr_t ip, uint8_t prefix)
+{
+	struct ecm_sdx_stats_ipv6_lan_prefix *arr = ecm_sdx_stats_instance->v6_prefix;
+	uint8_t *count = &ecm_sdx_stats_instance->v6_prefix_count;
+	char ip_addr[ECM_IP_ADDR_STR_BUFF_SIZE] = {0};
+	int ret = 0;
+	uint8_t i;
+
+	spin_lock_bh(&ecm_sdx_stats_prefix_lock);
+
+	for (i = 0; i < *count; i++) {
+		if (ECM_IP_ADDR_MATCH(arr[i].ip_addr, ip) && arr[i].prefix == prefix) {
+			DEBUG_TRACE("duplicate v6 prefix ignored idx=%u\n", i);
+			goto done;
+		}
+	}
+
+	if (*count == ECM_SDX_STATS_MAX_LAN_PREFIX) {
+		DEBUG_WARN("v6 prefix array full, max=%d\n", ECM_SDX_STATS_MAX_LAN_PREFIX);
+		ret = -ENOSPC;
+		goto done;
+	}
+
+	ECM_IP_ADDR_COPY(arr[*count].ip_addr, ip);
+	arr[*count].prefix = prefix;
+	(*count)++;
+
+	ecm_ip_addr_to_string(ip_addr, ip);
+	DEBUG_INFO("added ipv6 prefix ip=%s, prefix=%u, count=%u\n",
+		ip_addr, prefix, *count);
+done:
+	spin_unlock_bh(&ecm_sdx_stats_prefix_lock);
+	return ret;
+}
+
+/*
+ * ecm_sdx_stats_ipv4_prefix_del()
+ *	Remove a v4 subnet from the lan or ippt array.
+ *
+ * The array is an unordered match any set, so the hole is filled with the last
+ * entry rather than shifting the tail down. Returns -ENOENT if not found.
+ */
+static int ecm_sdx_stats_ipv4_prefix_del(ip_addr_t ip, uint32_t prefix, bool ippt_enabled)
+{
+	struct ecm_sdx_stats_ipv4_lan_prefix *arr;
+	uint8_t *count;
+	int ret = -ENOENT;
+	uint8_t i;
+
+	spin_lock_bh(&ecm_sdx_stats_prefix_lock);
+
+	if (ippt_enabled) {
+		arr = ecm_sdx_stats_instance->ippt_v4_prefix;
+		count = &ecm_sdx_stats_instance->ippt_v4_prefix_count;
+	} else {
+		arr = ecm_sdx_stats_instance->v4_prefix;
+		count = &ecm_sdx_stats_instance->v4_prefix_count;
+	}
+
+	for (i = 0; i < *count; i++) {
+		if (!ECM_IP_ADDR_MATCH(arr[i].ip_addr, ip) || arr[i].prefix != prefix) {
+			continue;
 		}
 
-	} else {
-		ECM_IP_ADDR_COPY(ecm_sdx_stats_instance->v6_prefix.ip_addr, ip);
-		ecm_sdx_stats_instance->v6_prefix.prefix = prefix;
-		ecm_ip_addr_to_string(ip_addr, ecm_sdx_stats_instance->v6_prefix.ip_addr);
-		DEBUG_INFO("ip=%s, subnet=%u\n",
-			ip_addr,
-			ecm_sdx_stats_instance->v6_prefix.prefix);
+		arr[i] = arr[*count - 1];
+		memset(&arr[*count - 1], 0, sizeof(arr[0]));
+		(*count)--;
+		ret = 0;
+		DEBUG_INFO("deleted ipv4 prefix idx=%u ippt=%d, count=%u\n",
+			i, ippt_enabled, *count);
+		break;
 	}
+
+	spin_unlock_bh(&ecm_sdx_stats_prefix_lock);
+	return ret;
+}
+
+/*
+ * ecm_sdx_stats_ipv6_prefix_del()
+ *	Remove a v6 prefix from the lan array.
+ *
+ * The array is an unordered match any set, so the hole is filled with the last
+ * entry rather than shifting the tail down. Returns -ENOENT if not found.
+ */
+static int ecm_sdx_stats_ipv6_prefix_del(ip_addr_t ip, uint8_t prefix)
+{
+	struct ecm_sdx_stats_ipv6_lan_prefix *arr = ecm_sdx_stats_instance->v6_prefix;
+	uint8_t *count = &ecm_sdx_stats_instance->v6_prefix_count;
+	int ret = -ENOENT;
+	uint8_t i;
+
+	spin_lock_bh(&ecm_sdx_stats_prefix_lock);
+
+	for (i = 0; i < *count; i++) {
+		if (!ECM_IP_ADDR_MATCH(arr[i].ip_addr, ip) || arr[i].prefix != prefix) {
+			continue;
+		}
+
+		arr[i] = arr[*count - 1];
+		memset(&arr[*count - 1], 0, sizeof(arr[0]));
+		(*count)--;
+		ret = 0;
+		DEBUG_INFO("deleted ipv6 prefix idx=%u, count=%u\n", i, *count);
+		break;
+	}
+
+	spin_unlock_bh(&ecm_sdx_stats_prefix_lock);
+	return ret;
 }
 
 /*
  * ecm_sdx_stats_lan_prefix_handler_read()
- *	Proc handler function for packet stats interface_type read operation.
+ *	Proc handler function for lan_prefixes read operation.
+ *
+ * Emits a count header per array followed by one indexed line per configured
+ * entry. Empty slots are not printed. The v4 mask is stored as a raw AND mask
+ * and is printed in dotted form; the v6 prefix is a cidr length.
  */
 int ecm_sdx_stats_lan_prefix_handler_read(void *buffer, size_t *lenp, loff_t *ppos)
 {
+	struct ecm_sdx_stats_ipv4_lan_prefix v4[ECM_SDX_STATS_MAX_LAN_PREFIX];
+	struct ecm_sdx_stats_ipv4_lan_prefix ippt[ECM_SDX_STATS_MAX_LAN_PREFIX];
+	struct ecm_sdx_stats_ipv6_lan_prefix v6[ECM_SDX_STATS_MAX_LAN_PREFIX];
+	uint8_t v4_count, v6_count, ippt_count;
+	char ip_addr[ECM_IP_ADDR_STR_BUFF_SIZE] = {0};
+	ip_addr_t mask_addr;
+	char *read_buf;
 	int bytes = 0;
 	int len;
-	char *read_buf;
-	char ip_addr[ECM_IP_ADDR_STR_BUFF_SIZE] = {0};
+	uint8_t i;
 
-	read_buf = kmalloc(ECM_SDX_STATS_MSG_SIZE * sizeof(char), GFP_KERNEL);
+	read_buf = kzalloc(ECM_SDX_STATS_LAN_PREFIX_MSG_SIZE * sizeof(char), GFP_KERNEL);
 	if(!read_buf) {
 		DEBUG_ERROR("read_buf memory allocation failed");
 		return -ENOMEM;
 	}
 
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "%s ", "ipv4");
-	bytes += len;
-	ecm_ip_addr_to_string(ip_addr, ecm_sdx_stats_instance->v4_prefix.ip_addr);
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "ip_addr=%s ", ip_addr);
-	bytes += len;
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "prefix = %u ",
-	ecm_sdx_stats_instance->v4_prefix.prefix);
-	bytes += len;
-	DEBUG_TRACE("ipv4 ip=%s, prefix=%u\n",
-			ip_addr,
-			ecm_sdx_stats_instance->v4_prefix.prefix);
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "\n");
-	bytes += len;
+	/*
+	 * Snapshot the arrays so that the formatting below, which is not trivial,
+	 * runs outside the lock.
+	 */
+	spin_lock_bh(&ecm_sdx_stats_prefix_lock);
+	v4_count = ecm_sdx_stats_instance->v4_prefix_count;
+	v6_count = ecm_sdx_stats_instance->v6_prefix_count;
+	ippt_count = ecm_sdx_stats_instance->ippt_v4_prefix_count;
+	memcpy(v4, ecm_sdx_stats_instance->v4_prefix, sizeof(v4));
+	memcpy(v6, ecm_sdx_stats_instance->v6_prefix, sizeof(v6));
+	memcpy(ippt, ecm_sdx_stats_instance->ippt_v4_prefix, sizeof(ippt));
+	spin_unlock_bh(&ecm_sdx_stats_prefix_lock);
 
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "%s ", "ipv4_ippt");
+	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_LAN_PREFIX_MSG_SIZE - bytes,
+			"ipv4 count=%u\n", v4_count);
 	bytes += len;
-	ecm_ip_addr_to_string(ip_addr, ecm_sdx_stats_instance->ippt_v4_prefix.ip_addr);
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "ip_addr=%s ", ip_addr);
-	bytes += len;
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "prefix = %u ",
-	ecm_sdx_stats_instance->ippt_v4_prefix.prefix);
-	bytes += len;
-	DEBUG_TRACE("ipv4 ip=%s, prefix=%u\n",
-			ip_addr,
-			ecm_sdx_stats_instance->ippt_v4_prefix.prefix);
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "\n");
-	bytes += len;
+	for (i = 0; i < v4_count; i++) {
+		ecm_ip_addr_to_string(ip_addr, v4[i].ip_addr);
+		ECM_HIN4_ADDR_TO_IP_ADDR(mask_addr, v4[i].prefix);
+		len = scnprintf(read_buf + bytes, ECM_SDX_STATS_LAN_PREFIX_MSG_SIZE - bytes,
+				"ipv4[%u] ip_addr=%s prefix=" ECM_IP_ADDR_DOT_FMT "\n",
+				i, ip_addr, ECM_IP_ADDR_TO_DOT(mask_addr));
+		bytes += len;
+		DEBUG_TRACE("ipv4[%u] ip=%s, prefix=%u\n", i, ip_addr, v4[i].prefix);
+	}
 
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "%s ", "ipv6");
+	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_LAN_PREFIX_MSG_SIZE - bytes,
+			"ipv4_ippt count=%u\n", ippt_count);
 	bytes += len;
-	ecm_ip_addr_to_string(ip_addr, ecm_sdx_stats_instance->v6_prefix.ip_addr);
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "ip_addr=%s ", ip_addr);
+	for (i = 0; i < ippt_count; i++) {
+		ecm_ip_addr_to_string(ip_addr, ippt[i].ip_addr);
+		ECM_HIN4_ADDR_TO_IP_ADDR(mask_addr, ippt[i].prefix);
+		len = scnprintf(read_buf + bytes, ECM_SDX_STATS_LAN_PREFIX_MSG_SIZE - bytes,
+				"ipv4_ippt[%u] ip_addr=%s prefix=" ECM_IP_ADDR_DOT_FMT "\n",
+				i, ip_addr, ECM_IP_ADDR_TO_DOT(mask_addr));
+		bytes += len;
+		DEBUG_TRACE("ipv4_ippt[%u] ip=%s, prefix=%u\n", i, ip_addr, ippt[i].prefix);
+	}
+
+	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_LAN_PREFIX_MSG_SIZE - bytes,
+			"ipv6 count=%u\n", v6_count);
 	bytes += len;
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "prefix = %u ",
-			ecm_sdx_stats_instance->v6_prefix.prefix);
-	bytes += len;
-	DEBUG_TRACE("ipv6 ip=%s, prefix=%u\n",
-		ip_addr,
-		ecm_sdx_stats_instance->v6_prefix.prefix);
-	len = scnprintf(read_buf + bytes, ECM_SDX_STATS_MSG_SIZE, "\n");
-	bytes += len;
+	for (i = 0; i < v6_count; i++) {
+		ecm_ip_addr_to_string(ip_addr, v6[i].ip_addr);
+		len = scnprintf(read_buf + bytes, ECM_SDX_STATS_LAN_PREFIX_MSG_SIZE - bytes,
+				"ipv6[%u] ip_addr=%s prefix=%u\n",
+				i, ip_addr, v6[i].prefix);
+		bytes += len;
+		DEBUG_TRACE("ipv6[%u] ip=%s, prefix=%u\n", i, ip_addr, v6[i].prefix);
+	}
 
 	bytes = memory_read_from_buffer(buffer, *lenp, ppos, read_buf, bytes);
 	*lenp = bytes;
@@ -1093,8 +1349,66 @@ int ecm_sdx_stats_lan_prefix_handler_read(void *buffer, size_t *lenp, loff_t *pp
 }
 
 /*
+ * ecm_sdx_stats_parse_ipv4_prefix()
+ *	Parse "<ip> <dotted mask>" from the token stream.
+ */
+static int ecm_sdx_stats_parse_ipv4_prefix(char **buf, ip_addr_t ip_addr, uint32_t *subnet)
+{
+	ip_addr_t tmp_subnet;
+	char *token;
+
+	token = strsep(buf, " ");
+	if(!token || !ecm_string_to_ip_addr(ip_addr, token)) {
+		DEBUG_ERROR("null token or invalid ip passed \n");
+		return -EINVAL;
+	}
+
+	token = strsep(buf, " ");
+	if(!token || !ecm_string_to_ip_addr(tmp_subnet, token)) {
+		DEBUG_ERROR("null token or invalid ip passed \n");
+		return -EINVAL;
+	}
+
+	*subnet = *tmp_subnet;
+	return 0;
+}
+
+/*
+ * ecm_sdx_stats_parse_ipv6_prefix()
+ *	Parse "<prefix>/<cidr len>" from the token stream.
+ */
+static int ecm_sdx_stats_parse_ipv6_prefix(char **buf, ip_addr_t ip_addr, uint8_t *prefix)
+{
+	int mask_value;
+	char *token;
+
+	token = strsep(buf, "/");
+	if(!token || !ecm_string_to_ip_addr(ip_addr, token)) {
+		DEBUG_ERROR("null token or invalid ip passed \n");
+		return -EINVAL;
+	}
+
+	token = strsep(buf, " ");
+	if(!token || sscanf(token, "%d", &mask_value) != 1) {
+		DEBUG_ERROR("error in parsing token");
+		return -EINVAL;
+	}
+
+	if (mask_value < 0 || mask_value > 128) {
+		DEBUG_ERROR("invalid ipv6 prefix length=%d\n", mask_value);
+		return -EINVAL;
+	}
+
+	*prefix = (uint8_t)mask_value;
+	return 0;
+}
+
+/*
  * ecm_sdx_stats_lan_prefix_handler_write()
  *	Proc handler function for packet_stats_lan_subnet write operation.
+ *
+ * Writes accumulate into the arrays, up to ECM_SDX_STATS_MAX_LAN_PREFIX entries
+ * per array, rather than replacing a single entry. A duplicate add is a no-op.
  */
 int ecm_sdx_stats_lan_prefix_handler_write(void *buffer, size_t *lenp)
 {
@@ -1102,10 +1416,10 @@ int ecm_sdx_stats_lan_prefix_handler_write(void *buffer, size_t *lenp)
 	char *pfree;
 	char *token;
 	int count;
-	int mask_value;
+	int ret;
 	ip_addr_t ip_addr;
-	ip_addr_t tmp_subnet;
 	uint32_t subnet;
+	uint8_t v6_prefix;
 
 	count = *lenp;
 	buf = kzalloc(ECM_SDX_STATS_MSG_SIZE * sizeof(char), GFP_KERNEL);
@@ -1125,53 +1439,85 @@ int ecm_sdx_stats_lan_prefix_handler_write(void *buffer, size_t *lenp)
 	}
 
 	if (!strncmp(token, "ipv4", 4)) {
-		DEBUG_TRACE("update ipv4 lan subnet to db\n");
-		token = strsep(&buf, " ");
-		if(!token || !ecm_string_to_ip_addr(ip_addr, token)) {
-			DEBUG_ERROR("null token or invalid ip passed \n");
+		DEBUG_TRACE("add ipv4 lan subnet to db\n");
+		if (ecm_sdx_stats_parse_ipv4_prefix(&buf, ip_addr, &subnet)) {
 			goto fail;
 		}
 
-		token = strsep(&buf, " ");
-		if(!token || !ecm_string_to_ip_addr(tmp_subnet, token)) {
-			DEBUG_ERROR("null token or invalid ip passed \n");
-			goto fail;
+		if (ecm_sdx_stats_ipv4_prefix_add(ip_addr, subnet, false)) {
+			goto fail_nospc;
 		}
-
-		subnet = *tmp_subnet;
-		ecm_sdx_stats_update_lan_prefix(ip_addr, subnet, true, false);
 	} else if (!strncmp(token, "ipv6", 4)) {
-		DEBUG_TRACE("update ipv6 lan subnet to db\n");
-		token = strsep(&buf, "/");
-		if(!token || !ecm_string_to_ip_addr(ip_addr, token)) {
-			DEBUG_ERROR("null token or invalid ip passed \n");
+		DEBUG_TRACE("add ipv6 lan subnet to db\n");
+		if (ecm_sdx_stats_parse_ipv6_prefix(&buf, ip_addr, &v6_prefix)) {
 			goto fail;
 		}
 
-		token = strsep(&buf, " ");
-		if(!token || sscanf(token, "%d", &mask_value) != 1) {
-			DEBUG_ERROR("error in parsing token");
-			goto fail;
+		if (ecm_sdx_stats_ipv6_prefix_add(ip_addr, v6_prefix)) {
+			goto fail_nospc;
 		}
-
-		subnet = mask_value;
-		ecm_sdx_stats_update_lan_prefix(ip_addr, subnet, false, false);
 	} else if (!strncmp(token, "ippt", 4)) {
-		DEBUG_TRACE ("update ippt lan subnet to db\n");
-		token = strsep(&buf, " ");
-		if(!token || !ecm_string_to_ip_addr(ip_addr, token)) {
-			DEBUG_ERROR("null token or invalid ip passed \n");
+		DEBUG_TRACE ("add ippt lan subnet to db\n");
+		if (ecm_sdx_stats_parse_ipv4_prefix(&buf, ip_addr, &subnet)) {
 			goto fail;
 		}
 
+		if (ecm_sdx_stats_ipv4_prefix_add(ip_addr, subnet, true)) {
+			goto fail_nospc;
+		}
+	} else if (!strncmp(token, "del", 3)) {
 		token = strsep(&buf, " ");
-		if(!token || !ecm_string_to_ip_addr(tmp_subnet, token)) {
-			DEBUG_ERROR("null token or invalid ip passed \n");
+		if(!token) {
+			DEBUG_ERROR("Null token passed\n");
 			goto fail;
 		}
 
-		subnet = *tmp_subnet;
-		ecm_sdx_stats_update_lan_prefix(ip_addr, subnet, true, true);
+		if (!strncmp(token, "ipv4", 4)) {
+			if (ecm_sdx_stats_parse_ipv4_prefix(&buf, ip_addr, &subnet)) {
+				goto fail;
+			}
+
+			ret = ecm_sdx_stats_ipv4_prefix_del(ip_addr, subnet, false);
+		} else if (!strncmp(token, "ippt", 4)) {
+			if (ecm_sdx_stats_parse_ipv4_prefix(&buf, ip_addr, &subnet)) {
+				goto fail;
+			}
+
+			ret = ecm_sdx_stats_ipv4_prefix_del(ip_addr, subnet, true);
+		} else if (!strncmp(token, "ipv6", 4)) {
+			if (ecm_sdx_stats_parse_ipv6_prefix(&buf, ip_addr, &v6_prefix)) {
+				goto fail;
+			}
+
+			ret = ecm_sdx_stats_ipv6_prefix_del(ip_addr, v6_prefix);
+		} else {
+			DEBUG_ERROR("Invalid ip type passed to del \n");
+			goto fail;
+		}
+
+		if (ret) {
+			DEBUG_WARN("prefix to delete not found\n");
+			kfree(pfree);
+			return -ENOENT;
+		}
+	} else if (!strncmp(token, "flush", 5)) {
+		token = strsep(&buf, " ");
+
+		/*
+		 * A bare flush, possibly with trailing whitespace, clears every array.
+		 */
+		if (!token || *token == '\0' || *token == '\n') {
+			ecm_sdx_stats_prefix_flush(ECM_SDX_STATS_PREFIX_TYPE_MAX);
+		} else if (!strncmp(token, "ipv4", 4)) {
+			ecm_sdx_stats_prefix_flush(ECM_SDX_STATS_PREFIX_TYPE_V4);
+		} else if (!strncmp(token, "ipv6", 4)) {
+			ecm_sdx_stats_prefix_flush(ECM_SDX_STATS_PREFIX_TYPE_V6);
+		} else if (!strncmp(token, "ippt", 4)) {
+			ecm_sdx_stats_prefix_flush(ECM_SDX_STATS_PREFIX_TYPE_IPPT_V4);
+		} else {
+			DEBUG_ERROR("Invalid ip type passed to flush \n");
+			goto fail;
+		}
 	} else {
 		DEBUG_ERROR("Invalid command passed \n");
 		goto fail;
@@ -1179,6 +1525,9 @@ int ecm_sdx_stats_lan_prefix_handler_write(void *buffer, size_t *lenp)
 
 	kfree(pfree);
 	return 0;
+fail_nospc:
+	kfree(pfree);
+	return -ENOSPC;
 fail:
 	kfree(pfree);
 	return -EINVAL;
