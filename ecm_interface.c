@@ -8301,7 +8301,7 @@ void ecm_interface_dev_regenerate_connections(struct net_device *dev)
  * ecm_interface_defunct_connections()
  *	Cause defunct of all connections that are using the specified interface.
  */
-static void ecm_interface_defunct_connections(struct ecm_db_iface_instance *ii)
+static void ecm_interface_defunct_connections(struct ecm_db_iface_instance *ii, struct net_device *dev)
 {
 #ifndef ECM_DB_XREF_ENABLE
 	ecm_db_connection_defunct_all();
@@ -8319,12 +8319,12 @@ static void ecm_interface_defunct_connections(struct ecm_db_iface_instance *ii)
 	}
 
 	/*
-	 * Defunct ALL if all the four connection instances are NULL
+	 * Defunct by netdev if all the four connection instances are NULL
 	 */
 	if (!ci[ECM_DB_OBJ_DIR_FROM] && !ci[ECM_DB_OBJ_DIR_TO] &&
 			!ci[ECM_DB_OBJ_DIR_FROM_NAT] && !ci[ECM_DB_OBJ_DIR_TO_NAT]) {
-		ecm_db_connection_defunct_all();
-		DEBUG_TRACE("%px: Defunct (ALL) COMPLETE\n", ii);
+		ecm_interface_defunct_connections_by_netdev(dev);
+		DEBUG_TRACE("%px: Defunct by netdev COMPLETE\n", ii);
 		return;
 	}
 
@@ -8368,7 +8368,7 @@ void ecm_interface_dev_defunct_connections(struct net_device *dev)
 		 * Defunct connections if ii is representing dev.
 		 */
 		if (dev->ifindex == ecm_db_iface_interface_identifier_get(ii)) {
-			ecm_interface_defunct_connections(ii);
+			ecm_interface_defunct_connections(ii, dev);
 			DEBUG_TRACE("%px: defunct for %px: COMPLETE\n", dev, ii);
 
 			/*
@@ -8392,10 +8392,10 @@ void ecm_interface_dev_defunct_connections(struct net_device *dev)
 }
 
 /*
- * ecm_interface_defunct_connections_by_bridge_port()
- *	Cause defunct of connections for the specified bridge port dev.
+ * ecm_interface_defunct_connections_by_netdev()
+ *	Cause defunct of connections whose interface heirarchy includes the specified dev.
  */
-void ecm_interface_defunct_connections_by_bridge_port(struct net_device *dev)
+void ecm_interface_defunct_connections_by_netdev(struct net_device *dev)
 {
 	struct ecm_db_connection_instance *ci;
 
