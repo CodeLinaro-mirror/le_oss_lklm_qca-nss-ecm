@@ -14,6 +14,7 @@
 #include <linux/icmp.h>
 #include <linux/kthread.h>
 #include <linux/debugfs.h>
+#include <linux/sysctl.h>
 #include <linux/pkt_sched.h>
 #include <linux/string.h>
 #include <net/route.h>
@@ -80,9 +81,13 @@
 #include "ecm_ipa_stats_v4.h"
 #include "ecm_ipa_log.h"
 
-int ecm_ipa_ipv4_no_action_limit_default = 250;		/* Default no-action limit. */
-int ecm_ipa_ipv4_driver_fail_limit_default = 250;		/* Default driver fail limit. */
-int ecm_ipa_ipv4_nack_limit_default = 250;			/* Default nack limit. */
+#define ECM_IPA_IPV4_PATH "net/ecm/ecm_ipa_ipv4"	/* Default path for sysctl */
+
+static struct ctl_table_header *ecm_ipa_ipv4_ctl_table_header;	/* Sysctl table header */
+
+int ecm_ipa_ipv4_no_action_limit_default = 1;		/* Default no-action limit. */
+int ecm_ipa_ipv4_driver_fail_limit_default = 1;		/* Default driver fail limit. */
+int ecm_ipa_ipv4_nack_limit_default = 1;			/* Default nack limit. */
 int ecm_ipa_ipv4_accelerated_count = 0;			/* Total offloads */
 int ecm_ipa_ipv4_pending_accel_count = 0;			/* Total pending offloads issued to the IPA / awaiting completion */
 int ecm_ipa_ipv4_pending_decel_count = 0;			/* Total pending deceleration requests issued to the IPA / awaiting completion */
@@ -346,10 +351,31 @@ static void ecm_ipa_ipv4_process_one_conn_sync_msg(struct ipa_ipv4_conn_sync *sy
 	feci = ecm_db_connection_front_end_get_and_ref(ci);
 
 	if (from_tx_packet_count || to_tx_packet_count) {
-		IPAFEDBG_LOW("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %llu, return_rx_packet_count: %u, return_rx_byte_count: %llu\n",
-				ci, sync->flow_rx_packet_count, sync->flow_rx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
-		IPAFEDBG_LOW("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %llu, return_tx_packet_count: %u, return_tx_byte_count: %llu\n",
-				ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->return_tx_packet_count, sync->return_tx_byte_count);
+		/* UL = FROM->TO, DL = TO->FROM; from_/to_ counters swapped on DL-init. */
+		IPAFEDBG_LOW("%px: sync stats %pI4n:%d <-> %pI4n:%d [%s-case]\n",
+				ci,
+				&sync->flow_ip, ntohs(sync->flow_ident),
+				&sync->return_ip, ntohs(sync->return_ident),
+				ipa_uplink_case ? "UL" : "DL");
+		/*
+		 * UL = LAN->WAN, DL = WAN->LAN. In UL-init flows FROM==LAN, so
+		 * from->to is UL. In DL-init flows FROM==WAN, so from->to is DL.
+		 * Derive the physical direction label from ipa_uplink_case.
+		 */
+		IPAFEDBG_LOW("%px: %s(from->to) pkts:%u bytes:%llu | %s(to->from) pkts:%u bytes:%llu\n",
+				ci,
+				ipa_uplink_case ? "UL" : "DL",
+				from_rx_packet_count, from_rx_byte_count,
+				ipa_uplink_case ? "DL" : "UL",
+				to_rx_packet_count, to_rx_byte_count);
+		IPAFEDBG_LOW("%px: raw flow_rx:%u/%llu return_rx:%u/%llu\n",
+				ci,
+				sync->flow_rx_packet_count, sync->flow_rx_byte_count,
+				sync->return_rx_packet_count, sync->return_rx_byte_count);
+		IPAFEDBG_LOW("%px: raw flow_tx:%u/%llu return_tx:%u/%llu\n",
+				ci,
+				sync->flow_tx_packet_count, sync->flow_tx_byte_count,
+				sync->return_tx_packet_count, sync->return_tx_byte_count);
 
 #ifdef ECM_MULTICAST_ENABLE
 		if (ecm_ip_addr_is_multicast(to_ip)) {
@@ -695,42 +721,6 @@ static void ecm_ipa_ipv4_stats_sync_callback(void *app_data, struct ipa_ipv4_msg
 }
 
 /*
- * ecm_ipa_ipv4_get_accel_limit_mode()
- */
-static int ecm_ipa_ipv4_get_accel_limit_mode(void *data, u64 *val)
-{
-	*val = ecm_ipa_ipv4_accel_limit_mode;
-
-	return 0;
-}
-
-/*
- * ecm_ipa_ipv4_set_accel_limit_mode()
- */
-static int ecm_ipa_ipv4_set_accel_limit_mode(void *data, u64 val)
-{
-	IPAFEDBG_LOW("ecm_ipa_ipv4_accel_limit_mode = %x\n", (int)val);
-
-	/*
-	 * Check that only valid bits are set.
-	 * It's fine for no bits to be set as that suggests no modes are wanted.
-	 */
-	if (val && (val ^ (ECM_FRONT_END_ACCEL_LIMIT_MODE_FIXED | ECM_FRONT_END_ACCEL_LIMIT_MODE_UNLIMITED))) {
-		IPAFEWARN("ecm_ipa_ipv4_accel_limit_mode = %x bad\n", (int)val);
-		return -EINVAL;
-	}
-
-	ecm_ipa_ipv4_accel_limit_mode = (int)val;
-
-	return 0;
-}
-
-/*
- * Debugfs attribute for accel limit mode.
- */
-DEFINE_SIMPLE_ATTRIBUTE(ecm_ipa_ipv4_accel_limit_mode_fops, ecm_ipa_ipv4_get_accel_limit_mode, ecm_ipa_ipv4_set_accel_limit_mode, "%llu\n");
-
-/*
  * ecm_ipa_ipv4_get_accel_cmd_avg_millis()
  */
 static ssize_t ecm_ipa_ipv4_get_accel_cmd_avg_millis(struct file *file,
@@ -1040,6 +1030,168 @@ static void ecm_ipa_ipv4_sync_queue_exit(void)
 }
 
 /*
+ * ecm_ipa_ipv4_accel_limit_mode_handler()
+ *	Proc handler for accel_limit_mode.
+ */
+static int ecm_ipa_ipv4_accel_limit_mode_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	uint32_t current_val;
+
+	current_val = ecm_ipa_ipv4_accel_limit_mode;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if (ecm_ipa_ipv4_accel_limit_mode & ~(ECM_FRONT_END_ACCEL_LIMIT_MODE_FIXED | ECM_FRONT_END_ACCEL_LIMIT_MODE_UNLIMITED)) {
+		IPAFEERR("ecm_ipa_ipv4_accel_limit_mode = %x bad\n", ecm_ipa_ipv4_accel_limit_mode);
+		ecm_ipa_ipv4_accel_limit_mode = current_val;
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+/*
+ * ecm_ipa_ipv4_driver_fail_limit_default_handler()
+ *	Proc handler for driver_fail_limit_default.
+ */
+static int ecm_ipa_ipv4_driver_fail_limit_default_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_val;
+
+	current_val = ecm_ipa_ipv4_driver_fail_limit_default;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if (ecm_ipa_ipv4_driver_fail_limit_default < 0) {
+		ecm_ipa_ipv4_driver_fail_limit_default = current_val;
+		IPAFEERR("Invalid input, valid input is a positive integer\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+/*
+ * ecm_ipa_ipv4_nack_limit_default_handler()
+ *	Proc handler for nack_limit_default.
+ */
+static int ecm_ipa_ipv4_nack_limit_default_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_val;
+
+	current_val = ecm_ipa_ipv4_nack_limit_default;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if (ecm_ipa_ipv4_nack_limit_default < 0) {
+		ecm_ipa_ipv4_nack_limit_default = current_val;
+		IPAFEERR("Invalid input, valid input is a positive integer\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+/*
+ * ecm_ipa_ipv4_no_action_limit_default_handler()
+ *	Proc handler for no_action_limit_default.
+ */
+static int ecm_ipa_ipv4_no_action_limit_default_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_val;
+
+	current_val = ecm_ipa_ipv4_no_action_limit_default;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if (ecm_ipa_ipv4_no_action_limit_default < 0) {
+		ecm_ipa_ipv4_no_action_limit_default = current_val;
+		IPAFEERR("Invalid input, valid input is a positive integer\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+#ifdef CONFIG_XFRM
+/*
+ * ecm_ipa_ipv4_reject_acceleration_for_ipsec_handler()
+ *	Proc handler for reject_acceleration_for_ipsec.
+ */
+static int ecm_ipa_ipv4_reject_acceleration_for_ipsec_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_val;
+
+	current_val = ecm_ipa_ipv4_reject_acceleration_for_ipsec;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if ((ecm_ipa_ipv4_reject_acceleration_for_ipsec != 0) && (ecm_ipa_ipv4_reject_acceleration_for_ipsec != 1)) {
+		ecm_ipa_ipv4_reject_acceleration_for_ipsec = current_val;
+		IPAFEERR("Invalid input, valid input 0/1\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+#endif
+
+static struct ctl_table ecm_ipa_ipv4_ctl_table[] = {
+	{
+		.procname	= "accel_limit_mode",
+		.data		= &ecm_ipa_ipv4_accel_limit_mode,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv4_accel_limit_mode_handler,
+	},
+	{
+		.procname	= "driver_fail_limit_default",
+		.data		= &ecm_ipa_ipv4_driver_fail_limit_default,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv4_driver_fail_limit_default_handler,
+	},
+	{
+		.procname	= "nack_limit_default",
+		.data		= &ecm_ipa_ipv4_nack_limit_default,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv4_nack_limit_default_handler,
+	},
+	{
+		.procname	= "no_action_limit_default",
+		.data		= &ecm_ipa_ipv4_no_action_limit_default,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv4_no_action_limit_default_handler,
+	},
+#ifdef CONFIG_XFRM
+	{
+		.procname	= "reject_acceleration_for_ipsec",
+		.data		= &ecm_ipa_ipv4_reject_acceleration_for_ipsec,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv4_reject_acceleration_for_ipsec_handler,
+	},
+#endif
+};
+
+/*
  * ecm_ipa_ipv4_init()
  */
 int ecm_ipa_ipv4_init(struct dentry *dentry)
@@ -1073,19 +1225,11 @@ int ecm_ipa_ipv4_init(struct dentry *dentry)
 		return result;
 	}
 
-#ifdef CONFIG_XFRM
-	ecm_debugfs_create_u32("reject_acceleration_for_ipsec", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
-					(u32 *)&ecm_ipa_ipv4_reject_acceleration_for_ipsec);
-#endif
-
-	ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
-					(u32 *)&ecm_ipa_ipv4_no_action_limit_default);
-
-	ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
-					(u32 *)&ecm_ipa_ipv4_driver_fail_limit_default);
-
-	ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
-					(u32 *)&ecm_ipa_ipv4_nack_limit_default);
+	ecm_ipa_ipv4_ctl_table_header = register_sysctl(ECM_IPA_IPV4_PATH, ecm_ipa_ipv4_ctl_table);
+	if (!ecm_ipa_ipv4_ctl_table_header) {
+		IPAFEERR("Failed to create ecm ipa ipv4 directory in sysctl\n");
+		goto task_cleanup;
+	}
 
 	ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_accelerated_count);
@@ -1095,12 +1239,6 @@ int ecm_ipa_ipv4_init(struct dentry *dentry)
 
 	ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ipa_ipv4_dentry,
 					(u32 *)&ecm_ipa_ipv4_pending_decel_count);
-
-	if (!ecm_debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_ipa_ipv4_dentry,
-					NULL, &ecm_ipa_ipv4_accel_limit_mode_fops)) {
-		IPAFEERR("Failed to create ecm ipa ipv4 accel_limit_mode file in debugfs\n");
-		goto task_cleanup;
-	}
 
 	if (!ecm_debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv4_dentry,
 					NULL, &ecm_ipa_ipv4_accel_cmd_avg_millis_fops)) {
@@ -1164,6 +1302,10 @@ int ecm_ipa_ipv4_init(struct dentry *dentry)
 
 task_cleanup:
 
+	if (ecm_ipa_ipv4_ctl_table_header) {
+		unregister_sysctl_table(ecm_ipa_ipv4_ctl_table_header);
+		ecm_ipa_ipv4_ctl_table_header = NULL;
+	}
 	ecm_debugfs_remove_recursive(ecm_ipa_ipv4_dentry);
 	return result;
 }
@@ -1187,6 +1329,11 @@ void ecm_ipa_ipv4_exit(void)
 	IPAFEDBG("ECM IPA IPv4 Module exit\n");
 	ipa_ipv4_notify_unregister();
 	ecm_ipa_ipv4_sync_queue_exit();
+
+	if (ecm_ipa_ipv4_ctl_table_header) {
+		unregister_sysctl_table(ecm_ipa_ipv4_ctl_table_header);
+		ecm_ipa_ipv4_ctl_table_header = NULL;
+	}
 
 	/*
 	 * Remove the debugfs files recursively.
