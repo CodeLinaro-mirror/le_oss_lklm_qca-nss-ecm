@@ -171,6 +171,12 @@ typedef void (*ecm_db_timer_group_entry_callback_t)(void *arg);	/* Timer entry h
 #define ECM_DB_IP_VERSION_IGNORE 0
 
 /*
+ * IP version in connection instance
+ */
+#define ECM_DB_IP_VERSION_V4 4
+#define ECM_DB_IP_VERSION_V6 6
+
+/*
  * Connection defunct
  * Structure containing events that causes node connection defunct and related info
  */

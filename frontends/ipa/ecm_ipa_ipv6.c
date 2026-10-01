@@ -13,6 +13,7 @@
 #include <linux/skbuff.h>
 #include <linux/icmp.h>
 #include <linux/debugfs.h>
+#include <linux/sysctl.h>
 #include <linux/kthread.h>
 #include <linux/pkt_sched.h>
 #include <linux/string.h>
@@ -83,12 +84,16 @@
 #include "ecm_front_end_ipv6.h"
 #include "ecm_ipa_stats_v6.h"
 
+#define ECM_IPA_IPV6_PATH "net/ecm/ecm_ipa_ipv6"	/* Default path for sysctl */
+
+static struct ctl_table_header *ecm_ipa_ipv6_ctl_table_header;	/* Sysctl table header */
+
 #define ECM_IPA_IPV6_STATS_SYNC_PERIOD msecs_to_jiffies(20000)
 #define ECM_IPA_IPV6_STATS_SYNC_UDELAY 4000	/* Delay for 4ms */
 
-int ecm_ipa_ipv6_no_action_limit_default = 250;		/* Default no-action limit. */
-int ecm_ipa_ipv6_driver_fail_limit_default = 250;		/* Default driver fail limit. */
-int ecm_ipa_ipv6_nack_limit_default = 250;			/* Default nack limit. */
+int ecm_ipa_ipv6_no_action_limit_default = 1;		/* Default no-action limit. */
+int ecm_ipa_ipv6_driver_fail_limit_default = 1;		/* Default driver fail limit. */
+int ecm_ipa_ipv6_nack_limit_default = 1;			/* Default nack limit. */
 int ecm_ipa_ipv6_accelerated_count = 0;			/* Total offloads */
 int ecm_ipa_ipv6_pending_accel_count = 0;			/* Total pending offloads issued to the IPA / awaiting completion */
 int ecm_ipa_ipv6_pending_decel_count = 0;			/* Total pending deceleration requests issued to the IPA / awaiting completion */
@@ -201,13 +206,20 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	ip_addr_t flow_ip;
 	ip_addr_t return_ip_xlate;
 	ip_addr_t return_ip;
+	ip_addr_t from_ip;
+	ip_addr_t to_ip;
 	struct in6_addr group6 __attribute__((unused));
 	struct in6_addr origin6 __attribute__((unused));
 	struct ecm_classifier_rule_sync class_sync;
 	int flow_dir;
 	int return_dir;
-        unsigned long int delta_jiffies;
-        int elapsed;
+	unsigned long int delta_jiffies;
+	int elapsed;
+	u32 from_rx_packet_count, to_rx_packet_count;
+	u64 from_rx_byte_count, to_rx_byte_count;
+	u32 from_tx_packet_count, to_tx_packet_count;
+	u64 from_tx_byte_count, to_tx_byte_count;
+	bool ipa_uplink_case;
 
 	ECM_IPA_IPV6_ADDR_TO_IP_ADDR(flow_ip, sync->flow_ip);
 	ECM_IPA_IPV6_ADDR_TO_IP_ADDR(return_ip, sync->return_ip);
@@ -219,14 +231,12 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 * but for ingressing this would be the LAN side (non-nat'ed) address and is what we need for lookup of our connection.
 	 */
 
-	IPAFEDBG_LOW("%px: IPA Sync, lookup connection using\n" \
-			"Protocol: %d\n" \
-			"src_addr: %pI6:%d\n" \
-			"dest_addr: %pI6:%d\n",
-			sync,
-			(int)sync->protocol,
-			sync->flow_ip, ntohs(sync->flow_ident),
-			sync->return_ip_xlate, ntohs(sync->return_ident_xlate));
+	IPAFEDBG_LOW("%px: IPA Sync, lookup connection using proto:%d\n",
+			sync, (int)sync->protocol);
+	IPAFEDBG_LOW("%px: src_addr: %pI6:%d\n",
+			sync, sync->flow_ip, ntohs(sync->flow_ident));
+	IPAFEDBG_LOW("%px: dest_addr: %pI6:%d\n",
+			sync, sync->return_ip_xlate, ntohs(sync->return_ident_xlate));
 
 	ci = ecm_db_connection_serial_find_and_ref(sync->flow_rule_id);
 	if (!ci) {
@@ -236,17 +246,52 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	IPAFEDBG_LOW("%px: Sync conn %px\n", sync, ci);
 
 	/*
+	 * IPA sets sync->flow_ip = private_ip regardless of initiator, so it does
+	 * not map to ECM FROM on DL. Fetch ECM FROM/TO once and drive direction
+	 * lookup, counter swap, mcast MFC stats and neighbour refresh off them.
+	 */
+	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_FROM, from_ip);
+	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_TO, to_ip);
+
+	/*
+	 * IPA populates sync->flow_rx/tx from the LAN side (private_ip). Downstream
+	 * ECM consumers expect flow_* to be FROM-sent, which only holds when
+	 * private_ip == ECM FROM (UL). For DL, swap flow<->return so all consumers
+	 * see FROM/TO-oriented counts.
+	 */
+	ipa_uplink_case = ECM_IP_ADDR_MATCH(flow_ip, from_ip);
+	if (ipa_uplink_case) {
+		from_rx_packet_count = sync->flow_rx_packet_count;
+		from_rx_byte_count = sync->flow_rx_byte_count;
+		to_rx_packet_count = sync->return_rx_packet_count;
+		to_rx_byte_count = sync->return_rx_byte_count;
+		from_tx_packet_count = sync->flow_tx_packet_count;
+		from_tx_byte_count = sync->flow_tx_byte_count;
+		to_tx_packet_count = sync->return_tx_packet_count;
+		to_tx_byte_count = sync->return_tx_byte_count;
+	} else {
+		from_rx_packet_count = sync->return_rx_packet_count;
+		from_rx_byte_count = sync->return_rx_byte_count;
+		to_rx_packet_count = sync->flow_rx_packet_count;
+		to_rx_byte_count = sync->flow_rx_byte_count;
+		from_tx_packet_count = sync->return_tx_packet_count;
+		from_tx_byte_count = sync->return_tx_byte_count;
+		to_tx_packet_count = sync->flow_tx_packet_count;
+		to_tx_byte_count = sync->flow_tx_byte_count;
+	}
+
+	/*
 	 * Copy the sync data to the classifier sync structure to
 	 * update the classifiers' stats.
 	 */
-	class_sync.tx_packet_count[ECM_CONN_DIR_FLOW] = sync->flow_tx_packet_count;
-	class_sync.tx_byte_count[ECM_CONN_DIR_FLOW] = sync->flow_tx_byte_count;
-	class_sync.rx_packet_count[ECM_CONN_DIR_FLOW] = sync->flow_rx_packet_count;
-	class_sync.rx_byte_count[ECM_CONN_DIR_FLOW] = sync->flow_rx_byte_count;
-	class_sync.tx_packet_count[ECM_CONN_DIR_RETURN] = sync->return_tx_packet_count;
-	class_sync.tx_byte_count[ECM_CONN_DIR_RETURN] = sync->return_tx_byte_count;
-	class_sync.rx_packet_count[ECM_CONN_DIR_RETURN] = sync->return_rx_packet_count;
-	class_sync.rx_byte_count[ECM_CONN_DIR_RETURN] = sync->return_rx_byte_count;
+	class_sync.tx_packet_count[ECM_CONN_DIR_FLOW] = from_tx_packet_count;
+	class_sync.tx_byte_count[ECM_CONN_DIR_FLOW] = from_tx_byte_count;
+	class_sync.rx_packet_count[ECM_CONN_DIR_FLOW] = from_rx_packet_count;
+	class_sync.rx_byte_count[ECM_CONN_DIR_FLOW] = from_rx_byte_count;
+	class_sync.tx_packet_count[ECM_CONN_DIR_RETURN] = to_tx_packet_count;
+	class_sync.tx_byte_count[ECM_CONN_DIR_RETURN] = to_tx_byte_count;
+	class_sync.rx_packet_count[ECM_CONN_DIR_RETURN] = to_rx_packet_count;
+	class_sync.rx_byte_count[ECM_CONN_DIR_RETURN] = to_rx_byte_count;
 	class_sync.reason = sync->reason;
 
 	/*
@@ -267,7 +312,7 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 * return here and do not update the defunct timer and the conntrack.
 	 */
 	elapsed = ecm_db_connection_elapsed_defunct_timer(ci);
-        if (elapsed < 0) {
+	if (elapsed < 0) {
 		IPAFEDBG("%px: conn serial:%u IPv6 defunct timer expired/invalid " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d - no further sync\n",
 				ci, sync->flow_rule_id,
 				ECM_IP_ADDR_TO_OCTAL(flow_ip), ntohs(sync->flow_ident),
@@ -275,8 +320,8 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 		ecm_db_connection_deref(ci);
 		return;
 	}
-        DEBUG_TRACE("%px: elapsed: %d\n", ci, elapsed);
-        delta_jiffies = elapsed * HZ;
+	DEBUG_TRACE("%px: elapsed: %d\n", ci, elapsed);
+	delta_jiffies = elapsed * HZ;
 	/*
 	 * Keep connection alive and updated
 	 */
@@ -290,53 +335,74 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	 */
 	feci = ecm_db_connection_front_end_get_and_ref(ci);
 
-	if (sync->flow_tx_packet_count || sync->return_tx_packet_count) {
-		IPAFEDBG_LOW("%px: flow_rx_packet_count: %u, flow_rx_byte_count: %llu, return_rx_packet_count: %u, return_rx_byte_count: %llu\n",
-				ci, sync->flow_rx_packet_count, sync->flow_rx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
-		IPAFEDBG_LOW("%px: flow_tx_packet_count: %u, flow_tx_byte_count: %llu, return_tx_packet_count: %u, return_tx_byte_count: %llu\n",
-				ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->return_tx_packet_count, sync->return_tx_byte_count);
+	if (from_tx_packet_count || to_tx_packet_count) {
+		/* UL = FROM->TO, DL = TO->FROM; from_/to_ counters swapped on DL-init. */
+		IPAFEDBG_LOW("%px: sync stats %pI6:%d <-> %pI6:%d [%s-case]\n",
+				ci,
+				sync->flow_ip, ntohs(sync->flow_ident),
+				sync->return_ip, ntohs(sync->return_ident),
+				ipa_uplink_case ? "UL" : "DL");
+		/*
+		 * UL = LAN->WAN, DL = WAN->LAN. In UL-init flows FROM==LAN, so
+		 * from->to is UL. In DL-init flows FROM==WAN, so from->to is DL.
+		 * Derive the physical direction label from ipa_uplink_case.
+		 */
+		IPAFEDBG_LOW("%px: %s(from->to) pkts:%u bytes:%llu | %s(to->from) pkts:%u bytes:%llu\n",
+				ci,
+				ipa_uplink_case ? "UL" : "DL",
+				from_rx_packet_count, from_rx_byte_count,
+				ipa_uplink_case ? "DL" : "UL",
+				to_rx_packet_count, to_rx_byte_count);
+		IPAFEDBG_LOW("%px: raw flow_rx:%u/%llu return_rx:%u/%llu\n",
+				ci,
+				sync->flow_rx_packet_count, sync->flow_rx_byte_count,
+				sync->return_rx_packet_count, sync->return_rx_byte_count);
+		IPAFEDBG_LOW("%px: raw flow_tx:%u/%llu return_tx:%u/%llu\n",
+				ci,
+				sync->flow_tx_packet_count, sync->flow_tx_byte_count,
+				sync->return_tx_packet_count, sync->return_tx_byte_count);
 
 #ifdef ECM_MULTICAST_ENABLE
-		if (ecm_ip_addr_is_multicast(return_ip)) {
+		if (ecm_ip_addr_is_multicast(to_ip)) {
 			/*
-			 * The amount of data *sent* by the ECM multicast connection 'from' side is the amount the NSS has *received* in the 'flow' direction.
+			 * The amount of data *sent* by the ECM multicast connection 'from' side is the amount the IPA has *received* in the 'flow' direction.
 			 */
-			ecm_db_multicast_connection_data_totals_update(ci, true, sync->flow_rx_byte_count, sync->flow_rx_packet_count);
-			ecm_db_multicast_connection_data_totals_update(ci, true, sync->return_rx_byte_count, sync->return_rx_packet_count);
-			ecm_db_multicast_connection_interface_heirarchy_stats_update(ci, sync->flow_rx_byte_count, sync->flow_rx_packet_count);
+			ecm_db_multicast_connection_data_totals_update(ci, true, from_rx_byte_count, from_rx_packet_count);
+			ecm_db_multicast_connection_data_totals_update(ci, false, to_rx_byte_count, to_rx_packet_count);
+			ecm_db_multicast_connection_interface_heirarchy_stats_update(ci, from_rx_byte_count, from_rx_packet_count);
 
 			/*
 			 * Update interface statistics
 			 */
-			ecm_interface_multicast_stats_update(ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->flow_rx_packet_count, sync->flow_rx_byte_count,
-										sync->return_tx_packet_count, sync->return_tx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
+			ecm_interface_multicast_stats_update(ci, from_tx_packet_count, from_tx_byte_count, from_rx_packet_count, from_rx_byte_count,
+										to_tx_packet_count, to_tx_byte_count, to_rx_packet_count, to_rx_byte_count);
 
-			ECM_IP_ADDR_TO_NIN6_ADDR(origin6, flow_ip);
-			ECM_IP_ADDR_TO_NIN6_ADDR(group6, return_ip);
+			ECM_IP_ADDR_TO_NIN6_ADDR(origin6, from_ip);
+			ECM_IP_ADDR_TO_NIN6_ADDR(group6, to_ip);
 
 			/*
 			 * Update IP multicast routing cache stats
 			 */
-			ip6mr_mfc_stats_update(&init_net, &origin6, &group6, sync->flow_rx_packet_count,
-								 sync->flow_rx_byte_count, sync->flow_rx_packet_count, sync->flow_rx_byte_count);
+			ip6mr_mfc_stats_update(&init_net, &origin6, &group6, from_rx_packet_count,
+								 from_rx_byte_count, from_rx_packet_count, from_rx_byte_count);
 		} else
 #endif
 		{
 			/*
 			 * The amount of data *sent* by the ECM connection 'from' side is the amount the IPA has *received* in the 'flow' direction.
 			 */
-			ecm_db_connection_data_totals_update(ci, true, sync->flow_rx_byte_count, sync->flow_rx_packet_count);
+			ecm_db_connection_data_totals_update(ci, true, from_rx_byte_count, from_rx_packet_count);
 
 			/*
 			 * The amount of data *sent* by the ECM connection 'to' side is the amount the IPA has *received* in the 'return' direction.
 			 */
-			ecm_db_connection_data_totals_update(ci, false, sync->return_rx_byte_count, sync->return_rx_packet_count);
+			ecm_db_connection_data_totals_update(ci, false, to_rx_byte_count, to_rx_packet_count);
 
 			/*
 			 * Update interface statistics
 			 */
-			ecm_interface_stats_update(ci, sync->flow_tx_packet_count, sync->flow_tx_byte_count, sync->flow_rx_packet_count, sync->flow_rx_byte_count,
-						sync->return_tx_packet_count, sync->return_tx_byte_count, sync->return_rx_packet_count, sync->return_rx_byte_count);
+			ecm_interface_stats_update(ci, from_tx_packet_count, from_tx_byte_count, from_rx_packet_count, from_rx_byte_count,
+						to_tx_packet_count, to_tx_byte_count, to_rx_packet_count, to_rx_byte_count);
 		}
 
 		/*
@@ -365,7 +431,7 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 		 * When the CT is in destroy status, find ct could cause ct
 		 * destroyed again
 		 */
-		if ((!sync->flow_tx_packet_count && !sync->return_tx_packet_count)
+		if ((!from_tx_packet_count && !to_tx_packet_count)
 				|| (ci->flags & ECM_DB_CONNECTION_FLAGS_DEFUNCT_CT_DESTROYED)) {
 			ecm_front_end_connection_deref(feci);
 			ecm_db_connection_deref(ci);
@@ -391,14 +457,14 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 	default:
 		if (ecm_db_connection_is_routed_get(ci)) {
 			/*
-			 * Update the neighbour entry for source IP address
+			 * Update the neighbour entry for the ECM FROM IP address.
 			 */
-			neigh = ecm_interface_ipv6_neigh_get(feci, ECM_DB_OBJ_DIR_FROM, flow_ip);
+			neigh = ecm_interface_ipv6_neigh_get(feci, ECM_DB_OBJ_DIR_FROM, from_ip);
 			if (!neigh) {
-				IPAFEWARN("Neighbour entry for " ECM_IP_ADDR_OCTAL_FMT " not found\n", ECM_IP_ADDR_TO_OCTAL(flow_ip));
+				IPAFEWARN("Neighbour entry for " ECM_IP_ADDR_OCTAL_FMT " not found\n", ECM_IP_ADDR_TO_OCTAL(from_ip));
 			} else {
-				if (sync->flow_tx_packet_count) {
-					IPAFEDBG_LOW("Neighbour entry event send for " ECM_IP_ADDR_OCTAL_FMT ": %px\n", ECM_IP_ADDR_TO_OCTAL(flow_ip), neigh);
+				if (from_tx_packet_count) {
+					IPAFEDBG_LOW("Neighbour entry event send for " ECM_IP_ADDR_OCTAL_FMT ": %px\n", ECM_IP_ADDR_TO_OCTAL(from_ip), neigh);
 					neigh_event_send(neigh, NULL);
 				}
 
@@ -406,14 +472,14 @@ static void ecm_ipa_ipv6_process_one_conn_sync_msg(struct ipa_ipv6_conn_sync *sy
 			}
 
 			/*
-			 * Update the neighbour entry for destination IP address
+			 * Update the neighbour entry for the ECM TO IP address.
 			 */
-			neigh = ecm_interface_ipv6_neigh_get(feci, ECM_DB_OBJ_DIR_TO, return_ip);
+			neigh = ecm_interface_ipv6_neigh_get(feci, ECM_DB_OBJ_DIR_TO, to_ip);
 			if (!neigh) {
-				IPAFEWARN("Neighbour entry for " ECM_IP_ADDR_OCTAL_FMT " not found\n", ECM_IP_ADDR_TO_OCTAL(return_ip));
+				IPAFEWARN("Neighbour entry for " ECM_IP_ADDR_OCTAL_FMT " not found\n", ECM_IP_ADDR_TO_OCTAL(to_ip));
 			} else {
-				if (sync->return_tx_packet_count) {
-					IPAFEDBG_LOW("Neighbour entry event send for " ECM_IP_ADDR_OCTAL_FMT ": %px\n", ECM_IP_ADDR_TO_OCTAL(return_ip), neigh);
+				if (to_tx_packet_count) {
+					IPAFEDBG_LOW("Neighbour entry event send for " ECM_IP_ADDR_OCTAL_FMT ": %px\n", ECM_IP_ADDR_TO_OCTAL(to_ip), neigh);
 					neigh_event_send(neigh, NULL);
 				}
 
@@ -452,12 +518,11 @@ sync_conntrack:
 	tuple.dst.protonum = (uint8_t)sync->protocol;
 	tuple.dst.u.all = sync->return_ident;
 
-	IPAFEDBG_LOW("Conntrack sync, lookup conntrack connection using\n"
-			"Protocol: %d\n"
-			"src_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
-			"dest_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
-			(int)tuple.dst.protonum,
-			ECM_IP_ADDR_TO_OCTAL(flow_ip), (int)ntohs(tuple.src.u.all),
+	IPAFEDBG_LOW("Conntrack sync, lookup conntrack connection using proto:%d\n",
+			(int)tuple.dst.protonum);
+	IPAFEDBG_LOW(" src_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			ECM_IP_ADDR_TO_OCTAL(flow_ip), (int)ntohs(tuple.src.u.all));
+	IPAFEDBG_LOW(" dest_addr: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
 			ECM_IP_ADDR_TO_OCTAL(return_ip), (int)ntohs(tuple.dst.u.all));
 
 	/*
@@ -496,68 +561,84 @@ sync_conntrack:
 #endif
 	IPAFEDBG_LOW("%px: IPA Sync: conntrack connection\n", ct);
 
-	ecm_front_end_flow_and_return_directions_get(ct, flow_ip, 6, &flow_dir, &return_dir);
+	ecm_front_end_flow_and_return_directions_get(ct, from_ip, 6, &flow_dir, &return_dir);
 
 	/*
-	 * Only update if this is not a fixed timeout
+	 * sync->inc_ticks is (ts_live - ts_cached) for this entry's hardware
+	 * Time_Stamp. It is a per-entry activity flag with no direction semantics
+	 * baked in - the observed IPA behavior is that some entries (typically
+	 * TCP) may not have their Time_Stamp written back on every hit while
+	 * others (typically UDP) do. Byte/packet counters advance independently
+	 * of Time_Stamp. Gate only the ct->timeout bump on inc_ticks, and always
+	 * fall through to byte/packet accounting so we do not drop counts on
+	 * entries whose Time_Stamp did not move this sync interval.
 	 */
 	if (!test_bit(IPS_FIXED_TIMEOUT_BIT, &ct->status)) {
-
-		/*
-		 * Convert ms ticks from the IPA to jiffies. We know that inc_ticks is small
-		 * and we expect HZ to be small too so we can multiply without worrying about
-		 * wrap-around problems.  We add a rounding constant to ensure that the different
-		 * time bases don't cause truncation errors.
-		 */
-
-		spin_lock_bh(&ct->lock);
-                if (!(sync->inc_ticks)) {
-                        DEBUG_TRACE("sync_inc_ticks: %d\n", sync->inc_ticks);
-                        DEBUG_TRACE("udp timeouts not updated\n");
-                        spin_unlock_bh(&ct->lock);
-                        nf_ct_put(ct);
-                        return;
-                }
+		if (sync->inc_ticks) {
+			/*
+			 * Convert ms ticks from the IPA to jiffies. We know that inc_ticks is small
+			 * and we expect HZ to be small too so we can multiply without worrying about
+			 * wrap-around problems.  We add a rounding constant to ensure that the different
+			 * time bases don't cause truncation errors.
+			 */
+			spin_lock_bh(&ct->lock);
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0))
-		ct->timeout.expires += delta_jiffies;
+			ct->timeout.expires += delta_jiffies;
 #else
-		ct->timeout += delta_jiffies;
+			ct->timeout += delta_jiffies;
 #endif
-		spin_unlock_bh(&ct->lock);
+			spin_unlock_bh(&ct->lock);
+		} else {
+			DEBUG_TRACE("sync_inc_ticks: %d\n", sync->inc_ticks);
+			DEBUG_TRACE("udp timeouts not updated\n");
+		}
 	}
-	acct = nf_conn_acct_find(ct)->counter;
+	{
+		struct nf_conn_acct *ca = nf_conn_acct_find(ct);
+		acct = ca ? ca->counter : NULL;
+	}
 	if (acct) {
 		spin_lock_bh(&ct->lock);
-		atomic64_add(sync->flow_rx_packet_count, &acct[flow_dir].packets);
-		atomic64_add(sync->flow_rx_byte_count, &acct[flow_dir].bytes);
+		atomic64_add(from_rx_packet_count, &acct[flow_dir].packets);
+		atomic64_add(from_rx_byte_count, &acct[flow_dir].bytes);
 
-		atomic64_add(sync->return_rx_packet_count, &acct[return_dir].packets);
-		atomic64_add(sync->return_rx_byte_count, &acct[return_dir].bytes);
+		atomic64_add(to_rx_packet_count, &acct[return_dir].packets);
+		atomic64_add(to_rx_byte_count, &acct[return_dir].bytes);
 		spin_unlock_bh(&ct->lock);
 	}
 
 	switch (sync->protocol) {
 	case IPPROTO_TCP:
+	{
+		/*
+		 * sync->flow_ / sync->return_ TCP fields are IPA-convention (LAN side = flow).
+		 * flow_dir/return_dir are ECM-oriented; remap for DL so LAN-side values
+		 * land in the REPLY slot and WAN-side values in the ORIGINAL slot.
+		 */
+		int tcp_flow_dir = ipa_uplink_case ? flow_dir : return_dir;
+		int tcp_return_dir = ipa_uplink_case ? return_dir : flow_dir;
+
 		spin_lock_bh(&ct->lock);
-		if (ct->proto.tcp.seen[flow_dir].td_maxwin < sync->flow_max_window) {
-			ct->proto.tcp.seen[flow_dir].td_maxwin = sync->flow_max_window;
+		if (ct->proto.tcp.seen[tcp_flow_dir].td_maxwin < sync->flow_max_window) {
+			ct->proto.tcp.seen[tcp_flow_dir].td_maxwin = sync->flow_max_window;
 		}
-		if ((int32_t)(ct->proto.tcp.seen[flow_dir].td_end - sync->flow_end) < 0) {
-			ct->proto.tcp.seen[flow_dir].td_end = sync->flow_end;
+		if ((int32_t)(ct->proto.tcp.seen[tcp_flow_dir].td_end - sync->flow_end) < 0) {
+			ct->proto.tcp.seen[tcp_flow_dir].td_end = sync->flow_end;
 		}
-		if ((int32_t)(ct->proto.tcp.seen[flow_dir].td_maxend - sync->flow_max_end) < 0) {
-			ct->proto.tcp.seen[flow_dir].td_maxend = sync->flow_max_end;
+		if ((int32_t)(ct->proto.tcp.seen[tcp_flow_dir].td_maxend - sync->flow_max_end) < 0) {
+			ct->proto.tcp.seen[tcp_flow_dir].td_maxend = sync->flow_max_end;
 		}
-		if (ct->proto.tcp.seen[return_dir].td_maxwin < sync->return_max_window) {
-			ct->proto.tcp.seen[return_dir].td_maxwin = sync->return_max_window;
+		if (ct->proto.tcp.seen[tcp_return_dir].td_maxwin < sync->return_max_window) {
+			ct->proto.tcp.seen[tcp_return_dir].td_maxwin = sync->return_max_window;
 		}
-		if ((int32_t)(ct->proto.tcp.seen[return_dir].td_end - sync->return_end) < 0) {
-			ct->proto.tcp.seen[return_dir].td_end = sync->return_end;
+		if ((int32_t)(ct->proto.tcp.seen[tcp_return_dir].td_end - sync->return_end) < 0) {
+			ct->proto.tcp.seen[tcp_return_dir].td_end = sync->return_end;
 		}
-		if ((int32_t)(ct->proto.tcp.seen[return_dir].td_maxend - sync->return_max_end) < 0) {
-			ct->proto.tcp.seen[return_dir].td_maxend = sync->return_max_end;
+		if ((int32_t)(ct->proto.tcp.seen[tcp_return_dir].td_maxend - sync->return_max_end) < 0) {
+			ct->proto.tcp.seen[tcp_return_dir].td_maxend = sync->return_max_end;
 		}
 		spin_unlock_bh(&ct->lock);
+	}
 		break;
 	case IPPROTO_UDP:
 		/*
@@ -627,42 +708,6 @@ static void ecm_ipa_ipv6_stats_sync_callback(void *app_data, struct ipa_ipv6_msg
 
 	ecm_ipa_ipv6_process_one_conn_sync_msg(sync);
 }
-/*
- * ecm_ipa_ipv6_get_accel_limit_mode()
- */
-static int ecm_ipa_ipv6_get_accel_limit_mode(void *data, u64 *val)
-{
-	*val = ecm_ipa_ipv6_accel_limit_mode;
-
-	return 0;
-}
-
-/*
- * ecm_ipa_ipv6_set_accel_limit_mode()
- */
-static int ecm_ipa_ipv6_set_accel_limit_mode(void *data, u64 val)
-{
-	IPAFEDBG_LOW("ecm_ipa_ipv6_accel_limit_mode = %x\n", (int)val);
-
-	/*
-	 * Check that only valid bits are set.
-	 * It's fine for no bits to be set as that suggests no modes are wanted.
-	 */
-	if (val && (val ^ (ECM_FRONT_END_ACCEL_LIMIT_MODE_FIXED | ECM_FRONT_END_ACCEL_LIMIT_MODE_UNLIMITED))) {
-		IPAFEWARN("ecm_ipa_ipv6_accel_limit_mode = %x bad\n", (int)val);
-		return -EINVAL;
-	}
-
-	ecm_ipa_ipv6_accel_limit_mode = (int)val;
-
-	return 0;
-}
-
-/*
- * Debugfs attribute for accel limit mode.
- */
-DEFINE_SIMPLE_ATTRIBUTE(ecm_ipa_ipv6_accel_limit_mode_fops, ecm_ipa_ipv6_get_accel_limit_mode, ecm_ipa_ipv6_set_accel_limit_mode, "%llu\n");
-
 /*
  * ecm_ipa_ipv6_get_accel_cmd_average_millis()
  */
@@ -855,7 +900,7 @@ static void ecm_ipa_ipv6_stats_sync_req_work(struct work_struct *work)
 	spin_lock_bh(&ecm_ipa_ipv6_lock);
 	if (ecm_ipa_ipv6_accelerated_count == 0) {
 		spin_unlock_bh(&ecm_ipa_ipv6_lock);
-		IPAFEDBG_LOW("There is no accelerated IPv4 connection\n");
+		IPAFEDBG_LOW("There is no accelerated IPv6 connection\n");
 		goto reschedule;
 	}
 	spin_unlock_bh(&ecm_ipa_ipv6_lock);
@@ -890,8 +935,16 @@ static void ecm_ipa_ipv6_stats_sync_req_work(struct work_struct *work)
         		for (i = 0; i < nicsm_req->count; i++) {
 				ecm_ipa_ipv6_process_one_conn_sync_msg(&nicsm_req->conn_sync[i]);
         		}
-        		ecm_ipa_ipv6_sync_req_msg->msg.conn_stats_many.index = nicsm_req->next;
-			break;
+
+			nicsm_req->count = 0;
+			if (nicsm_req->next != 0) {
+				nicsm_req->index = nicsm_req->next;
+				queue_delayed_work(ecm_ipa_ipv6_workqueue, &ecm_ipa_ipv6_work, 0);
+			} else {
+				nicsm_req->index = 0;
+				queue_delayed_work(ecm_ipa_ipv6_workqueue, &ecm_ipa_ipv6_work, ECM_IPA_IPV6_STATS_SYNC_PERIOD);
+			}
+			return;
 		} else {
         		ecm_ipa_ipv6_stats_request_fail++;
         		retry--;
@@ -965,6 +1018,168 @@ static void ecm_ipa_ipv6_sync_queue_exit(void)
 }
 
 /*
+ * ecm_ipa_ipv6_accel_limit_mode_handler()
+ *	Proc handler for accel_limit_mode.
+ */
+static int ecm_ipa_ipv6_accel_limit_mode_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	uint32_t current_val;
+
+	current_val = ecm_ipa_ipv6_accel_limit_mode;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if (ecm_ipa_ipv6_accel_limit_mode & ~(ECM_FRONT_END_ACCEL_LIMIT_MODE_FIXED | ECM_FRONT_END_ACCEL_LIMIT_MODE_UNLIMITED)) {
+		IPAFEERR("ecm_ipa_ipv6_accel_limit_mode = %x bad\n", ecm_ipa_ipv6_accel_limit_mode);
+		ecm_ipa_ipv6_accel_limit_mode = current_val;
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+/*
+ * ecm_ipa_ipv6_driver_fail_limit_default_handler()
+ *	Proc handler for driver_fail_limit_default.
+ */
+static int ecm_ipa_ipv6_driver_fail_limit_default_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_val;
+
+	current_val = ecm_ipa_ipv6_driver_fail_limit_default;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if (ecm_ipa_ipv6_driver_fail_limit_default < 0) {
+		ecm_ipa_ipv6_driver_fail_limit_default = current_val;
+		IPAFEERR("Invalid input, valid input is a positive integer\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+/*
+ * ecm_ipa_ipv6_nack_limit_default_handler()
+ *	Proc handler for nack_limit_default.
+ */
+static int ecm_ipa_ipv6_nack_limit_default_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_val;
+
+	current_val = ecm_ipa_ipv6_nack_limit_default;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if (ecm_ipa_ipv6_nack_limit_default < 0) {
+		ecm_ipa_ipv6_nack_limit_default = current_val;
+		IPAFEERR("Invalid input, valid input is a positive integer\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+/*
+ * ecm_ipa_ipv6_no_action_limit_default_handler()
+ *	Proc handler for no_action_limit_default.
+ */
+static int ecm_ipa_ipv6_no_action_limit_default_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_val;
+
+	current_val = ecm_ipa_ipv6_no_action_limit_default;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if (ecm_ipa_ipv6_no_action_limit_default < 0) {
+		ecm_ipa_ipv6_no_action_limit_default = current_val;
+		IPAFEERR("Invalid input, valid input is a positive integer\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+#ifdef CONFIG_XFRM
+/*
+ * ecm_ipa_ipv6_reject_acceleration_for_ipsec_handler()
+ *	Proc handler for reject_acceleration_for_ipsec.
+ */
+static int ecm_ipa_ipv6_reject_acceleration_for_ipsec_handler(ECM_CTL_TABLE_CONST struct ctl_table *ctl, int write, void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+	int current_val;
+
+	current_val = ecm_ipa_ipv6_reject_acceleration_for_ipsec;
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	if (ret || (!write)) {
+		return ret;
+	}
+
+	if ((ecm_ipa_ipv6_reject_acceleration_for_ipsec != 0) && (ecm_ipa_ipv6_reject_acceleration_for_ipsec != 1)) {
+		ecm_ipa_ipv6_reject_acceleration_for_ipsec = current_val;
+		IPAFEERR("Invalid input, valid input 0/1\n");
+		return -EINVAL;
+	}
+
+	return ret;
+}
+#endif
+
+static struct ctl_table ecm_ipa_ipv6_ctl_table[] = {
+	{
+		.procname	= "accel_limit_mode",
+		.data		= &ecm_ipa_ipv6_accel_limit_mode,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv6_accel_limit_mode_handler,
+	},
+	{
+		.procname	= "driver_fail_limit_default",
+		.data		= &ecm_ipa_ipv6_driver_fail_limit_default,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv6_driver_fail_limit_default_handler,
+	},
+	{
+		.procname	= "nack_limit_default",
+		.data		= &ecm_ipa_ipv6_nack_limit_default,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv6_nack_limit_default_handler,
+	},
+	{
+		.procname	= "no_action_limit_default",
+		.data		= &ecm_ipa_ipv6_no_action_limit_default,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv6_no_action_limit_default_handler,
+	},
+#ifdef CONFIG_XFRM
+	{
+		.procname	= "reject_acceleration_for_ipsec",
+		.data		= &ecm_ipa_ipv6_reject_acceleration_for_ipsec,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &ecm_ipa_ipv6_reject_acceleration_for_ipsec_handler,
+	},
+#endif
+};
+
+/*
  * ecm_ipa_ipv6_init()
  */
 int ecm_ipa_ipv6_init(struct dentry *dentry)
@@ -998,18 +1213,11 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 		return result;
 	}
 
-#ifdef CONFIG_XFRM
-	ecm_debugfs_create_u32("reject_acceleration_for_ipsec", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_reject_acceleration_for_ipsec);
-#endif
-
-	ecm_debugfs_create_u32("no_action_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_no_action_limit_default);
-	ecm_debugfs_create_u32("driver_fail_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_driver_fail_limit_default);
-
-	ecm_debugfs_create_u32("nack_limit_default", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					(u32 *)&ecm_ipa_ipv6_nack_limit_default);
+	ecm_ipa_ipv6_ctl_table_header = register_sysctl(ECM_IPA_IPV6_PATH, ecm_ipa_ipv6_ctl_table);
+	if (!ecm_ipa_ipv6_ctl_table_header) {
+		IPAFEERR("Failed to create ecm ipa ipv6 directory in sysctl\n");
+		goto task_cleanup;
+	}
 
 	ecm_debugfs_create_u32("accelerated_count", S_IRUGO, ecm_ipa_ipv6_dentry,
 					(u32 *)&ecm_ipa_ipv6_accelerated_count);
@@ -1019,12 +1227,6 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 
 	ecm_debugfs_create_u32("pending_decel_count", S_IRUGO, ecm_ipa_ipv6_dentry,
 					(u32 *)&ecm_ipa_ipv6_pending_decel_count);
-
-	if (!ecm_debugfs_create_file("accel_limit_mode", S_IRUGO | S_IWUSR, ecm_ipa_ipv6_dentry,
-					NULL, &ecm_ipa_ipv6_accel_limit_mode_fops)) {
-		IPAFEERR("Failed to create ecm ipa ipv6 accel_limit_mode file in debugfs\n");
-		goto task_cleanup;
-	}
 
 	if (!ecm_debugfs_create_file("accel_cmd_avg_millis", S_IRUGO, ecm_ipa_ipv6_dentry,
 					NULL, &ecm_ipa_ipv6_accel_cmd_avg_millis_fops)) {
@@ -1089,6 +1291,10 @@ int ecm_ipa_ipv6_init(struct dentry *dentry)
 
 task_cleanup:
 
+	if (ecm_ipa_ipv6_ctl_table_header) {
+		unregister_sysctl_table(ecm_ipa_ipv6_ctl_table_header);
+		ecm_ipa_ipv6_ctl_table_header = NULL;
+	}
 	ecm_debugfs_remove_recursive(ecm_ipa_ipv6_dentry);
 	return result;
 }
@@ -1117,6 +1323,11 @@ void ecm_ipa_ipv6_exit(void)
 	 */
 	ipa_ipv6_notify_unregister();
 	ecm_ipa_ipv6_sync_queue_exit();
+
+	if (ecm_ipa_ipv6_ctl_table_header) {
+		unregister_sysctl_table(ecm_ipa_ipv6_ctl_table_header);
+		ecm_ipa_ipv6_ctl_table_header = NULL;
+	}
 
 	/*
 	 * Remove the debugfs files recursively.

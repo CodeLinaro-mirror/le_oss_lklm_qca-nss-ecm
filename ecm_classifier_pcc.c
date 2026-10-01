@@ -220,7 +220,7 @@ void ecm_classifier_pcc_decel_by_dev(struct net_device *dev)
 		return;
 
 	if (ecm_front_end_is_bridge_port(dev)) {
-		ecm_interface_defunct_connections_by_bridge_port(dev);
+		ecm_interface_defunct_connections_by_netdev(dev);
 	} else {
 		ecm_interface_dev_defunct_connections(dev);
 	}

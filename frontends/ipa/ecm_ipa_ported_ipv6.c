@@ -1399,114 +1399,94 @@ static void ecm_ipa_ported_ipv6_connection_accelerate(struct ecm_front_end_conne
 	ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 	ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 
-	IPAFEDBG("%px: IPv6 ported accel conn:%px serial:%u proto:%d\n"
-			"  flow: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d iface:%u->%u\n"
-			"  xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d mac:%pM->%pM rule=%x valid=%x\n",
+	/* Split: ipc_log_string() per-entry limit ~256 bytes. */
+	IPAFEDBG("%px: IPv6 ported accel conn:%px serial:%u proto:%d\n",
 			feci, feci->ci,
-			nircm->tuple.flow_rule_id, nircm->tuple.protocol,
+			nircm->tuple.flow_rule_id, nircm->tuple.protocol);
+	IPAFEDBG("%px: flow: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d iface:%u->%u\n",
+			feci,
 			ECM_IP_ADDR_TO_OCTAL(src_ip), ntohs(nircm->tuple.flow_ident),
 			ECM_IP_ADDR_TO_OCTAL(dest_ip), ntohs(nircm->tuple.return_ident),
-			nircm->conn_rule.flow_interface_num, nircm->conn_rule.return_interface_num,
+			nircm->conn_rule.flow_interface_num, nircm->conn_rule.return_interface_num);
+	IPAFEDBG("%px: xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			feci,
 			ECM_IP_ADDR_TO_OCTAL(src_nat_ip), ntohs(nircm->conn_rule.flow_ident_xlate),
-			ECM_IP_ADDR_TO_OCTAL(dest_nat_ip), ntohs(nircm->conn_rule.return_ident_xlate),
+			ECM_IP_ADDR_TO_OCTAL(dest_nat_ip), ntohs(nircm->conn_rule.return_ident_xlate));
+	IPAFEDBG("%px: mac:%pM->%pM rule=%x valid=%x\n",
+			feci,
 			nircm->conn_rule.flow_mac, nircm->conn_rule.return_mac,
 			nircm->rule_flags, nircm->valid_flags);
 	IPAFEDBG_LOW("%px: Ported Accelerate connection %px\n"
-			"Protocol: %d\n"
-			"serial:%u\n"
-			"from_mtu: %u\n"
-			"to_mtu: %u\n"
-			"from_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
-			"to_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
-			"from_ip_xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
-			"to_ip_xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
-			"from_mac: %pM\n"
-			"to_mac: %pM\n"
-			"from_src_mac: %pM\n"
-			"to_src_mac: %pM\n"
-			"from_iface_num: %u\n"
-			"to_iface_num: %u\n"
-			"from_top_interface_num: %d\n"
-			"to_top_interface_num: %d\n"
-			"primary_ingress_vlan_tag: %x\n"
-			"primary_egress_vlan_tag: %x\n"
-			"secondary_ingress_vlan_tag: %x\n"
-			"secondary_egress_vlan_tag: %x\n"
-			"flags: rule=%x valid=%x src_mac_valid=%x\n"
-			"return_pppoe_session_id: %u\n"
-			"return_pppoe_remote_mac: %pM\n"
-			"flow_pppoe_session_id: %u\n"
-			"flow_pppoe_remote_mac: %pM\n"
-			"flow_qos_tag: %x (%u)\n"
-			"return_qos_tag: %x (%u)\n"
-			"flow_int_pri: %x (%u)\n"
-			"return_int_pri: %x (%u)\n"
-			"flow_dscp: %x\n"
-			"return_dscp: %x\n"
-			"flow_mark:%x\n"
-			"return_mark:%x\n",
+			" Protocol: %d serial:%u\n"
+			" from_mtu: %u to_mtu: %u\n",
+			feci, feci->ci,
+			nircm->tuple.protocol, nircm->tuple.flow_rule_id,
+			nircm->conn_rule.flow_mtu, nircm->conn_rule.return_mtu);
+	IPAFEDBG_LOW("%px: from_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
+			" to_ip: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
 			feci,
-			feci->ci,
-			nircm->tuple.protocol,
-			nircm->tuple.flow_rule_id,
-			nircm->conn_rule.flow_mtu,
-			nircm->conn_rule.return_mtu,
 			ECM_IP_ADDR_TO_OCTAL(src_ip), ntohs(nircm->tuple.flow_ident),
-			ECM_IP_ADDR_TO_OCTAL(dest_ip), ntohs(nircm->tuple.return_ident),
+			ECM_IP_ADDR_TO_OCTAL(dest_ip), ntohs(nircm->tuple.return_ident));
+	IPAFEDBG_LOW("%px: from_ip_xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d\n"
+			" to_ip_xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			feci,
 			ECM_IP_ADDR_TO_OCTAL(src_nat_ip), ntohs(nircm->conn_rule.flow_ident_xlate),
-			ECM_IP_ADDR_TO_OCTAL(dest_nat_ip), ntohs(nircm->conn_rule.return_ident_xlate),
-			nircm->conn_rule.flow_mac,
-			nircm->conn_rule.return_mac,
-			nircm->src_mac_rule.flow_src_mac,
-			nircm->src_mac_rule.return_src_mac,
-			nircm->conn_rule.flow_interface_num,
-			nircm->conn_rule.return_interface_num,
-			nircm->conn_rule.flow_top_interface_num,
-			nircm->conn_rule.return_top_interface_num,
-			nircm->vlan_primary_rule.ingress_vlan_tag,
-			nircm->vlan_primary_rule.egress_vlan_tag,
-			nircm->vlan_secondary_rule.ingress_vlan_tag,
-			nircm->vlan_secondary_rule.egress_vlan_tag,
-			nircm->rule_flags,
-			nircm->valid_flags,
-			nircm->src_mac_rule.mac_valid_flags,
-			nircm->pppoe_rule.return_pppoe_session_id,
-			nircm->pppoe_rule.return_pppoe_remote_mac,
-			nircm->pppoe_rule.flow_pppoe_session_id,
-			nircm->pppoe_rule.flow_pppoe_remote_mac,
+			ECM_IP_ADDR_TO_OCTAL(dest_nat_ip), ntohs(nircm->conn_rule.return_ident_xlate));
+	IPAFEDBG_LOW("%px: from_mac: %pM to_mac: %pM\n"
+			" from_src_mac: %pM to_src_mac: %pM\n",
+			feci,
+			nircm->conn_rule.flow_mac, nircm->conn_rule.return_mac,
+			nircm->src_mac_rule.flow_src_mac, nircm->src_mac_rule.return_src_mac);
+	IPAFEDBG_LOW("%px: from_iface_num: %u to_iface_num: %u\n"
+			" from_top_interface_num: %d to_top_interface_num: %d\n",
+			feci,
+			nircm->conn_rule.flow_interface_num, nircm->conn_rule.return_interface_num,
+			nircm->conn_rule.flow_top_interface_num, nircm->conn_rule.return_top_interface_num);
+	IPAFEDBG_LOW("%px: primary_ingress_vlan_tag: %x primary_egress_vlan_tag: %x\n"
+			" secondary_ingress_vlan_tag: %x secondary_egress_vlan_tag: %x\n",
+			feci,
+			nircm->vlan_primary_rule.ingress_vlan_tag, nircm->vlan_primary_rule.egress_vlan_tag,
+			nircm->vlan_secondary_rule.ingress_vlan_tag, nircm->vlan_secondary_rule.egress_vlan_tag);
+	IPAFEDBG_LOW("%px: flags: rule=%x valid=%x src_mac_valid=%x\n",
+			feci,
+			nircm->rule_flags, nircm->valid_flags, nircm->src_mac_rule.mac_valid_flags);
+	IPAFEDBG_LOW("%px: return_pppoe_session_id: %u return_pppoe_remote_mac: %pM\n"
+			" flow_pppoe_session_id: %u flow_pppoe_remote_mac: %pM\n",
+			feci,
+			nircm->pppoe_rule.return_pppoe_session_id, nircm->pppoe_rule.return_pppoe_remote_mac,
+			nircm->pppoe_rule.flow_pppoe_session_id, nircm->pppoe_rule.flow_pppoe_remote_mac);
+	IPAFEDBG_LOW("%px: flow_qos_tag: %x (%u) return_qos_tag: %x (%u)\n"
+			" flow_int_pri: %x (%u) return_int_pri: %x (%u)\n",
+			feci,
 			nircm->qos_rule.flow_qos_tag, nircm->qos_rule.flow_qos_tag,
 			nircm->qos_rule.return_qos_tag, nircm->qos_rule.return_qos_tag,
 			nircm->qos_rule.flow_int_pri, nircm->qos_rule.flow_int_pri,
-			nircm->qos_rule.return_int_pri, nircm->qos_rule.return_int_pri,
-			nircm->dscp_rule.flow_dscp,
-			nircm->dscp_rule.return_dscp,
-			nircm->mark_rule.flow_mark,
-			nircm->mark_rule.return_mark);
+			nircm->qos_rule.return_int_pri, nircm->qos_rule.return_int_pri);
+	IPAFEDBG_LOW("%px: flow_dscp: %x return_dscp: %x flow_mark: %x return_mark: %x\n",
+			feci,
+			nircm->dscp_rule.flow_dscp, nircm->dscp_rule.return_dscp,
+			nircm->mark_rule.flow_mark, nircm->mark_rule.return_mark);
 
 #ifdef ECM_BRIDGE_VLAN_FILTERING_ENABLE
 	IPAFEDBG_LOW("flow_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
-			"flow_vlan_filter_egress_vlan_tag: %x, flags: %x\n"
-			"return_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
-			"return_vlan_filter_egress_vlan_tag: %x, flags: %x\n",
+			"flow_vlan_filter_egress_vlan_tag: %x, flags: %x\n",
 			nircm->flow_vlan_filter_rule.ingress_vlan_tag, nircm->flow_vlan_filter_rule.ingress_flags,
-			nircm->flow_vlan_filter_rule.egress_vlan_tag, nircm->flow_vlan_filter_rule.egress_flags,
+			nircm->flow_vlan_filter_rule.egress_vlan_tag, nircm->flow_vlan_filter_rule.egress_flags);
+	IPAFEDBG_LOW("return_vlan_filter_ingress_vlan_tag: %x, flags: %x\n"
+			"return_vlan_filter_egress_vlan_tag: %x, flags: %x\n",
 			nircm->return_vlan_filter_rule.ingress_vlan_tag, nircm->return_vlan_filter_rule.ingress_flags,
 			nircm->return_vlan_filter_rule.egress_vlan_tag, nircm->return_vlan_filter_rule.egress_flags);
 #endif
 
 	if (protocol == IPPROTO_TCP) {
-		IPAFEDBG_LOW("flow_window_scale: %u\n"
-			"flow_max_window: %u\n"
-			"flow_end: %u\n"
-			"flow_max_end: %u\n"
-			"return_window_scale: %u\n"
-			"return_max_window: %u\n"
-			"return_end: %u\n"
-			"return_max_end: %u\n",
+		IPAFEDBG_LOW("flow_window_scale: %u flow_max_window: %u\n"
+			"flow_end: %u flow_max_end: %u\n",
 			nircm->tcp_rule.flow_window_scale,
 			nircm->tcp_rule.flow_max_window,
 			nircm->tcp_rule.flow_end,
-			nircm->tcp_rule.flow_max_end,
+			nircm->tcp_rule.flow_max_end);
+		IPAFEDBG_LOW("return_window_scale: %u return_max_window: %u\n"
+			"return_end: %u return_max_end: %u\n",
 			nircm->tcp_rule.return_window_scale,
 			nircm->tcp_rule.return_max_window,
 			nircm->tcp_rule.return_end,
@@ -2389,15 +2369,19 @@ static bool ecm_ipa_ported_ipv6_connection_decelerate_msg_send(struct ecm_front_
 	ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
 	ecm_db_connection_interfaces_deref(to_ifaces, to_ifaces_first);
 
-	IPAFEDBG("%px: IPv6 ported decel conn:%px serial:%u proto:%d\n"
-			"  flow: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d iface:%u->%u\n"
-			"  xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d mac:%pM->%pM\n",
-			feci, feci->ci, nirdm->tuple.flow_rule_id, nirdm->tuple.protocol,
+	IPAFEDBG("%px: IPv6 ported decel conn:%px serial:%u proto:%d\n",
+			feci, feci->ci, nirdm->tuple.flow_rule_id, nirdm->tuple.protocol);
+	IPAFEDBG("%px: flow: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d iface:%u->%u\n",
+			feci,
 			ECM_IP_ADDR_TO_OCTAL(src_ip), ntohs(nirdm->tuple.flow_ident),
 			ECM_IP_ADDR_TO_OCTAL(dest_ip), ntohs(nirdm->tuple.return_ident),
-			nirdm->conn_rule.flow_interface_num, nirdm->conn_rule.return_interface_num,
+			nirdm->conn_rule.flow_interface_num, nirdm->conn_rule.return_interface_num);
+	IPAFEDBG("%px: xlate: " ECM_IP_ADDR_OCTAL_FMT ":%d -> " ECM_IP_ADDR_OCTAL_FMT ":%d\n",
+			feci,
 			ECM_IP_ADDR_TO_OCTAL(src_nat_ip), ntohs(nirdm->conn_rule.flow_ident_xlate),
-			ECM_IP_ADDR_TO_OCTAL(dest_nat_ip), ntohs(nirdm->conn_rule.return_ident_xlate),
+			ECM_IP_ADDR_TO_OCTAL(dest_nat_ip), ntohs(nirdm->conn_rule.return_ident_xlate));
+	IPAFEDBG("%px: mac:%pM->%pM\n",
+			feci,
 			nirdm->conn_rule.flow_mac, nirdm->conn_rule.return_mac);
 	IPAFEDBG_LOW("%px: Ported Connection %px decelerate\n"
 			"protocol: %d\n"

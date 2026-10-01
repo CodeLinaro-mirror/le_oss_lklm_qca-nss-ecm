@@ -434,6 +434,22 @@ static bool ecm_ae_select_test_rule_buffer(char *buf)
 		return false;
 	}
 
+	/*
+	 * Defunct any existing connection matching this 5-tuple so that
+	 * the next packet causes a DB miss and ae_get() re-evaluates the
+	 * updated rule list.  ecm_db_connection_decel_v4/v6() expect
+	 * ports in network byte order and convert internally via ntohs().
+	 * A return value of false means no matching connection was found,
+	 * which is a valid no-op (rule written before traffic starts).
+	 */
+	if (ip_version == IPV6) {
+		ecm_ae_classifier_decelerate_v6_connection(src_addr.v6_addr, htons(src_port),
+							   dest_addr.v6_addr, htons(dest_port), proto);
+	} else {
+		ecm_ae_classifier_decelerate_v4_connection(src_addr.v4_addr, htons(src_port),
+							   dest_addr.v4_addr, htons(dest_port), proto);
+	}
+
 	return true;
 
 sscanf_read_error:
@@ -705,7 +721,6 @@ static struct ctl_table ecm_ae_select_test_ctl_table[] = {
 		.mode		= 0644,
 		.proc_handler	= &ecm_ae_select_test_rule_handler,
 	},
-	{ }
 };
 
 /*

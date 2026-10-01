@@ -199,25 +199,6 @@ static void ecm_sdx_pcc_registrant_deref(struct ecm_classifier_pcc_registrant *r
 }
 
 /*
- * __ecm_sdx_pcc_rule_find_by_name()
- *	Find rule by rule name.
- *	Note: Caller has to take and release lock on this API.
- */
-static struct ecm_sdx_pcc_rule *__ecm_sdx_pcc_rule_find_by_name(char *name)
-{
-	struct ecm_sdx_pcc_rule *rule = NULL;
-
-	list_for_each_entry(rule , &ecm_sdx_pcc_rules, list) {
-		if (strcmp(name, rule->name) == 0) {
-			pr_debug("Rule name matches! name=%s, rule->name=%s\n", name, rule->name);
-			return rule;
-		}
-	}
-	pr_warn("name=%s does NOT match any rules!\n", name);
-	return NULL;
-}
-
-/*
  * __ecm_sdx_pcc_check_mac_addr()
  *	Return true if mac_addr matches with the rule mac_addr
  */
@@ -269,6 +250,64 @@ static bool __ecm_sdx_pcc_check_ip_addr(struct in6_addr *ip_addr,
 
 	pr_warn("Not in ip range: start=%pI6, ip_addr=%pI6, end=%pI6\n", &rule->ip_addr_start, ip_addr, &rule->ip_addr_end);
 	return false;
+}
+
+/*
+ * __ecm_sdx_pcc_rule_match_param()
+ *	Return true if rule matches the given mac_addr, ip segment range, or iface.
+ *	Only one of mac_addr/ip_addr range/iface is expected to be set per call,
+ *	matching the convention already used by ecm_sdx_pcc_add_rule().
+ */
+static bool __ecm_sdx_pcc_rule_match_param(struct ecm_sdx_pcc_rule *rule,
+				uint8_t *mac_addr,
+				struct in6_addr *ip_addr_start,
+				struct in6_addr *ip_addr_end,
+				char *iface)
+{
+	if (!is_zero_ether_addr(mac_addr)) {
+		return __ecm_sdx_pcc_check_mac_addr(mac_addr, rule);
+	}
+
+	if (!ipv6_addr_any(ip_addr_start) || !ipv6_addr_any(ip_addr_end)) {
+		return !ipv6_addr_any(&rule->ip_addr_start) &&
+			ipv6_addr_equal(&rule->ip_addr_start, ip_addr_start) &&
+			ipv6_addr_equal(&rule->ip_addr_end, ip_addr_end);
+	}
+
+	if (strlen(iface) > 0) {
+		return strcmp(rule->iface, iface) == 0;
+	}
+
+	pr_warn("No mac_addr/ip_addr/iface provided to match against rule name=%s\n", rule->name);
+	return false;
+}
+
+/*
+ * __ecm_sdx_pcc_rule_find_by_name_and_param()
+ *	Find rule by rule name and matching mac_addr, ip segment range, or iface.
+ *	Note: Caller has to take and release lock on this API.
+ */
+static struct ecm_sdx_pcc_rule *__ecm_sdx_pcc_rule_find_by_name_and_param(char *name,
+				uint8_t *mac_addr,
+				struct in6_addr *ip_addr_start,
+				struct in6_addr *ip_addr_end,
+				char *iface)
+{
+	struct ecm_sdx_pcc_rule *rule = NULL;
+
+	list_for_each_entry(rule, &ecm_sdx_pcc_rules, list) {
+		if (strcmp(name, rule->name) != 0) {
+			continue;
+		}
+
+		if (__ecm_sdx_pcc_rule_match_param(rule, mac_addr, ip_addr_start, ip_addr_end, iface)) {
+			pr_debug("Rule name and param match! name=%s, rule->name=%s\n", name, rule->name);
+			return rule;
+		}
+	}
+
+	pr_warn("name=%s does NOT match any rule with the given mac_addr/ip_addr/iface!\n", name);
+	return NULL;
 }
 
 /*
@@ -550,31 +589,36 @@ static void ecm_sdx_pcc_defunct_connections(uint8_t *mac_addr,
 
 /*
  * ecm_sdx_pcc_delete_rule()
- *	Delete a rule, return true for success.
+ *	Delete a rule matched by rule name and mac_addr/ip segment range/iface,
+ *	return true for success.
  */
-static bool ecm_sdx_pcc_delete_rule(char *name)
+static bool ecm_sdx_pcc_delete_rule(char *name,
+				uint8_t *mac_addr,
+				struct in6_addr *ip_addr_start,
+				struct in6_addr *ip_addr_end,
+				char *iface)
 {
 	struct ecm_sdx_pcc_rule *rule = NULL;
-	uint8_t mac_addr[ETH_ALEN];
-	struct in6_addr ip_addr_start = IN6ADDR_ANY_INIT;
-	struct in6_addr ip_addr_end = IN6ADDR_ANY_INIT;
-	char iface[IFNAMSIZ] = {0};
+	uint8_t rule_mac_addr[ETH_ALEN];
+	struct in6_addr rule_ip_addr_start = IN6ADDR_ANY_INIT;
+	struct in6_addr rule_ip_addr_end = IN6ADDR_ANY_INIT;
+	char rule_iface[IFNAMSIZ] = {0};
 
 	/*
-	 * get rule by name
+	 * get rule by name and matching mac_addr/ip_addr range/iface
 	 */
 	spin_lock_bh(&ecm_sdx_pcc_rules_lock);
-	rule = __ecm_sdx_pcc_rule_find_by_name(name);
+	rule = __ecm_sdx_pcc_rule_find_by_name_and_param(name, mac_addr, ip_addr_start, ip_addr_end, iface);
 	if (!rule) {
 		spin_unlock_bh(&ecm_sdx_pcc_rules_lock);
-		pr_warn("Cannot find rule with name=%s\n", name);
+		pr_warn("Cannot find rule with name=%s matching the given mac_addr/ip_addr/iface\n", name);
 		return false;
 	}
 
-	ether_addr_copy(mac_addr, rule->mac_addr);
-	ip_addr_start = rule->ip_addr_start;
-	ip_addr_end = rule->ip_addr_end;
-	strscpy(iface, rule->iface, sizeof(iface));
+	ether_addr_copy(rule_mac_addr, rule->mac_addr);
+	rule_ip_addr_start = rule->ip_addr_start;
+	rule_ip_addr_end = rule->ip_addr_end;
+	strscpy(rule_iface, rule->iface, sizeof(rule_iface));
 
 	list_del(&rule->list);
 	spin_unlock_bh(&ecm_sdx_pcc_rules_lock);
@@ -585,7 +629,7 @@ static bool ecm_sdx_pcc_delete_rule(char *name)
 	/*
 	 * defunct connections
 	 */
-	ecm_sdx_pcc_defunct_connections(mac_addr, &ip_addr_start, &ip_addr_end, iface);
+	ecm_sdx_pcc_defunct_connections(rule_mac_addr, &rule_ip_addr_start, &rule_ip_addr_end, rule_iface);
 
 	return true;
 }
@@ -702,8 +746,12 @@ static int ecm_sdx_pcc_rule_write(void *buffer, size_t *lenp, loff_t *ppos)
 	 * iface: echo "my_rule3/1/1/00:00:00:00:00:00///eth0" > /proc/sys/net/ecm/ecm_sdx_pcc_rule
 	 * cat /proc/sys/net/ecm/ecm_sdx_pcc_rule (shows all rules)
 	 *
-	 * Deleting Rules (delete by rule name - provide the correct rule name)
-	 * mac_addr: echo "my_rule/0/1/00:1b:22:32:27:2b/0/0/0" > /proc/sys/net/ecm/ecm_sdx_pcc_rule
+	 * Deleting Rules (delete by rule name AND matching mac_addr/ip segment range/iface -
+	 * provide the same field value used to add the rule; do not mix mac_addr, ip segment,
+	 * and iface into one delete entry)
+	 * mac_addr: echo "my_rule/0/1/00:1b:22:32:27:2b///" > /proc/sys/net/ecm/ecm_sdx_pcc_rule
+	 * ip segment range: echo "my_rule2/0/1/00:00:00:00:00:00/192.168.224.100/192.168.224.110/" > /proc/sys/net/ecm/ecm_sdx_pcc_rule
+	 * iface: echo "my_rule3/0/1/00:00:00:00:00:00///eth0" > /proc/sys/net/ecm/ecm_sdx_pcc_rule
 	 *
 	 * Clearing Rules
 	 * echo "my_rule/2/1/00:00:00:00:00:00/0/0/0" > /proc/sys/net/ecm/ecm_sdx_pcc_rule
@@ -795,7 +843,7 @@ static int ecm_sdx_pcc_rule_write(void *buffer, size_t *lenp, loff_t *ppos)
 	switch(action) {
 	case ECM_SDX_PCC_RULE_ACTION_DELETE:
 		pr_debug("Delete\n");
-		if (!ecm_sdx_pcc_delete_rule(name)) {
+		if (!ecm_sdx_pcc_delete_rule(name, mac_addr, &ip_addr_start, &ip_addr_end, iface)) {
 			return -EINVAL;
 		}
 		break;
